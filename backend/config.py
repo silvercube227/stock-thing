@@ -16,10 +16,14 @@ class Settings(BaseSettings):
     )
 
     supabase_url: str = Field(default="")
-    supabase_anon_key: str = Field(default="")
-    supabase_service_key: str = Field(default="")
-    supabase_jwt_secret: str = Field(default="")
+    supabase_publishable_key: str = Field(default="")  # sb_publishable_... (browser-safe, RLS applies)
+    supabase_secret_key: str = Field(default="")       # sb_secret_... (server-only, bypasses RLS)
     database_url: str = Field(default="")
+
+    @property
+    def supabase_jwks_url(self) -> str:
+        """Public JWKS endpoint for verifying Supabase-issued JWTs."""
+        return f"{self.supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json"
 
     sec_edgar_user_agent: str = Field(default="stock-thing local dev contact@example.com")
 

@@ -12,12 +12,16 @@ env/
 build/
 dist/
 
-# --- Node / Vite ---
+# --- Node / Next.js ---
 frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
 frontend/dist/
-frontend/.vite/
+frontend/next-env.d.ts
 frontend/*.local
 frontend/npm-debug.log*
+frontend/.vercel/
 
 # --- Env / secrets ---
 .env
