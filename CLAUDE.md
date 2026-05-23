@@ -6,12 +6,12 @@ Personal long-only stock and ETF trend prediction app. Not for active trading â€
 - **Frontend:** React (Vercel)
 - **Backend:** FastAPI
 - **Database:** Postgres (Supabase)
-- **ML:** PyTorch LSTM, trained and served locally on M4 Mac via Metal backend
+- **ML:** PyTorch transformer (PatchTST-style encoder, ~1M params), trained and served locally on M4 Mac via Metal backend
 - **Sentiment:** FinBERT running locally, daily cron pushes scores to cloud Postgres
 
 ### Architecture
 - Sentiment pipeline runs locally on a daily schedule, scores stored as 7-14 day rolling averages per ticker
-- LSTM retrains automatically when new data arrives, triggered locally
+- Transformer retrains automatically when new data arrives, triggered locally
 - Model versions stored in DB with metadata (training date, data window, val loss, directional accuracy) â€” best performing version stays in production
 - FastAPI handles inference requests, data queries, and orchestration
 - React dashboard shows portfolio holdings, trend projections per ticker, and daily sentiment gauge
