@@ -90,6 +90,9 @@ create table if not exists headlines (
     headline_id         bigserial primary key,
     ticker_id           bigint not null references tickers(ticker_id) on delete restrict,
     published_at        timestamptz not null,
+    -- NYSE close-bucketed date: if published_at > 16:00 ET, score_date = ET date + 1.
+    -- Computed in Python (bucket_score_date) and stored for efficient aggregation.
+    score_date          date not null,
     source              text,
     url                 text not null unique,    -- dedupe key
     title               text,
@@ -103,6 +106,8 @@ create table if not exists headlines (
 
 create index if not exists headlines_ticker_published_idx
     on headlines (ticker_id, published_at);
+create index if not exists headlines_ticker_score_date_idx
+    on headlines (ticker_id, score_date);
 
 -- =============================================================
 -- sentiment_daily

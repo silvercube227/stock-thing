@@ -1,6 +1,6 @@
 # stock-thing — progress & resume notes
 
-> Last updated: 2026-05-22. Resume this build from **step 5 (FinBERT sentiment)**.
+> Last updated: 2026-05-23. Resume this build from **step 7 (transformer + training loop)**.
 
 The full architectural plan lives at `/Users/bennettye/.claude/plans/you-are-helping-me-dreamy-narwhal.md`. This file tracks execution state — what's done, what's next, and the non-obvious decisions made along the way.
 
@@ -14,9 +14,9 @@ The full architectural plan lives at `/Users/bennettye/.claude/plans/you-are-hel
 | 2 | Supabase schema, RLS, seed | ✅ done | 35 tickers (4 ETFs + 31 equities), all CIKs backfilled |
 | 3 | Price ingestion (yfinance) | ✅ done | 43,960 rows over 5y for the universe |
 | 4 | Fundamentals (SEC EDGAR) | ✅ done | 2,014 filings (2009-Q2 → 2026-Q1); look-ahead-clean |
-| 5 | FinBERT sentiment | ⏭️ **next** | Local-only (M4 MPS); pushes daily aggregates to Supabase |
-| 6 | Feature builder | ⏳ | Point-in-time correct; look-ahead unit test before code |
-| 7 | Transformer (PatchTST) | ⏳ | LSTM was rejected — see plan §4. PyTorch + MPS needed |
+| 5 | FinBERT sentiment | ✅ done | `headlines.py` + `backfill_sentiment.py`; 13 tests pass; apply migration 001 before running |
+| 6 | Feature builder | ✅ done | `ml/features.py`; 12 tests pass; look-ahead + forward-fill + z-score |
+| 7 | Transformer (PatchTST) | ⏭️ **next** | LSTM was rejected — see plan §4. PyTorch + MPS needed |
 | 8 | Model registry + promotion | ⏳ | Promotion rule baked into plan §5 |
 | 9 | Daily inference job | ⏳ | Writes to `predictions` |
 | 10 | FastAPI endpoints | ⏳ | Smaller surface than originally planned — see "Architecture clarifications" |
@@ -90,21 +90,25 @@ backend/
     schema.sql                       # 9 tables + sequence + triggers
     rls.sql                          # 4 policies + grants
     seed_tickers.sql                 # 35 ticker bootstrap
-    migrations/                      # empty
+    migrations/
+      001_headlines_score_date.sql   # adds score_date date NOT NULL + index to headlines
   ingestion/
     db.py                            # asyncpg pool helper (statement_cache_size=0 for pgbouncer)
     calendar.py                      # NYSE schedule + HORIZON_TRADING_DAYS table
     prices.py                        # yfinance fetch, drift detection, NYSE gap log, upsert
     fundamentals.py                  # EDGAR companyfacts, two-pass parser, derived ratios
+    headlines.py                     # FinBERT pipeline; two-phase fetch→score→upsert; rolling sentiment_daily
   ml/                                # empty (step 7+)
   jobs/                              # empty (step 13)
     tasks/                           # empty
   tests/
     test_prices_drift.py             # 8 tests — drift detection (pure)
     test_fundamentals_parser.py      # 12 tests — concept fallback, period filter, look-ahead
+    test_sentiment_bucketing.py      # 13 tests — NYSE close bucketing rule (DST, UTC, boundaries)
 
 scripts/
   backfill_ciks.py                   # one-time SEC ticker→CIK fill
+  backfill_sentiment.py              # bootstrap headlines + sentiment_daily (--symbols, --dry-run)
   backfill_prices.py                 # CLI for 5y price backfill (--years, --symbols)
   backfill_fundamentals.py           # CLI for fundamentals backfill (--symbols)
   _inspect_prices.py                 # health check utility
@@ -148,19 +152,31 @@ frontend/                            # Next.js 16 + App Router + TS + Tailwind
    ```
 3. **Run tests:**
    ```bash
-   python -m pytest backend/tests -v   # 20/20 pass as of last run
+   python -m pytest backend/tests -v   # 33/33 pass as of last run
    ```
-4. **Start step 5.** Open the plan at `/Users/bennettye/.claude/plans/you-are-helping-me-dreamy-narwhal.md` §3 (look for "Headlines + Sentiment") for the spec. Brief outline:
-   - `backend/ingestion/headlines.py` — pull `yf.Ticker(sym).news` per ticker, dedupe by URL, batch-score via FinBERT on MPS (batch 32), upsert into `headlines`, recompute `sentiment_daily` rolling 7d/14d for the last 14 days.
-   - Time-bucket rule: headlines with `published_at` after 16:00 ET roll into the NEXT trading day's score.
-   - `scripts/backfill_sentiment.py` — initial bootstrap (yfinance only returns recent news per ticker, typically the last ~30-50 headlines; don't expect 5-year history here).
-   - Add to `pyproject.toml [ml]` extra: `transformers`, ensure FinBERT model identifier is `ProsusAI/finbert`.
-   - Unit test on the time-bucketing rule (synthetic 15:00 ET vs 17:00 ET headlines).
-
-5. **Step 5 gotchas to plan for:**
-   - FinBERT inference on MPS: first run will download ~440MB of weights. Set a cache dir under repo root or `~/.cache/huggingface/`.
-   - yfinance news is sparse — for backfill purposes we only get recent items, so this isn't a 5-year backfill. Going forward the daily cron is what populates history.
-   - The `headlines` table is NOT granted to `authenticated` in RLS — the dashboard reads aggregates from `sentiment_daily` instead. If you want article drill-downs, expose them via FastAPI rather than direct PostgREST.
+4. **Apply migration 001** (one-time, via Supabase SQL Editor):
+   ```sql
+   -- from backend/db/migrations/001_headlines_score_date.sql
+   alter table headlines add column if not exists score_date date;
+   alter table headlines alter column score_date set not null;
+   create index if not exists headlines_ticker_score_date_idx on headlines (ticker_id, score_date);
+   ```
+5. **Install ML deps** (needed for FinBERT):
+   ```bash
+   pip install -e ".[ml]"
+   # If this fails on Python 3.14 (PyTorch wheel gap), use a 3.12 venv just for ML work.
+   ```
+6. **Seed headlines with backfill:**
+   ```bash
+   python -m scripts.backfill_sentiment
+   # First run downloads ~440MB of FinBERT weights to ~/.cache/huggingface/
+   # yfinance returns ~30-50 headlines per ticker (last ~30 days), not 5-year history.
+   ```
+7. **Start step 6 (feature builder).** See plan §4. Key points:
+   - `backend/ml/features.py` — point-in-time-correct feature assembly
+   - Write `test_features_no_lookahead.py` FIRST and make it pass before coding features
+   - Fundamentals join uses `filed_at <= sample_date`, never `period_end`
+   - Sentiment forward-fills ≤3 days, else fills with 0
 
 ---
 
