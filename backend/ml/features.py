@@ -25,6 +25,7 @@ The look-ahead tests in test_features_no_lookahead.py enforce this invariant.
 from __future__ import annotations
 
 import bisect
+import calendar
 import math
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -74,11 +75,9 @@ def _prior_year_revenue(
     sorted_filings: list[dict], current_period_end: date, filing_type: str
 ) -> float | None:
     """Find revenue from a filing of the same type whose period_end is ≈ 1 year prior."""
-    target = date(
-        current_period_end.year - 1,
-        current_period_end.month,
-        current_period_end.day,
-    )
+    prior_year = current_period_end.year - 1
+    max_day = calendar.monthrange(prior_year, current_period_end.month)[1]
+    target = date(prior_year, current_period_end.month, min(current_period_end.day, max_day))
     best: dict | None = None
     best_delta = 999
     for f in sorted_filings:

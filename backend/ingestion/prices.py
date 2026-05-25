@@ -1,7 +1,7 @@
 """Price/volume ingestion from yfinance.
 
 Two entry points:
-  - ingest_full_history(...)   one-shot 5y backfill (initial or after a drift)
+  - ingest_full_history(...)   one-shot backfill from 2010-01-01 (initial or after a drift)
   - ingest_recent(...)         daily incremental, with drift detection
 
 Both write to price_history (idempotent upsert on (ticker_id, trade_date))
@@ -308,10 +308,10 @@ async def _ingest_one(
 async def ingest_full_history(
     pool: asyncpg.Pool,
     tickers: Iterable[tuple[int, str]] | None = None,
-    years: int = 5,
+    start_date: date = date(2010, 1, 1),
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> IngestionResult:
-    """Pull `years` of daily history for each ticker and overwrite price_history.
+    """Pull history from `start_date` for each ticker and overwrite price_history.
 
     Use this for the initial bootstrap and as the recovery path after drift.
     """
@@ -326,7 +326,7 @@ async def ingest_full_history(
 
     async def _wrapped(tid: int, sym: str) -> TickerResult:
         async with sem:
-            return await _ingest_one(pool, tid, sym, period=f"{years}y")
+            return await _ingest_one(pool, tid, sym, start=start_date)
 
     per_ticker = await asyncio.gather(*(_wrapped(t, s) for t, s in tickers))
     finished = datetime.now(timezone.utc)

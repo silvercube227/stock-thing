@@ -1,6 +1,6 @@
 # stock-thing — progress & resume notes
 
-> Last updated: 2026-05-23. Resume this build from **step 7 (transformer + training loop)**.
+> Last updated: 2026-05-24. Step 7 code is complete + tested; resume by running the **first full-universe training candidate**, then **step 8 (registry + promotion)**.
 
 The full architectural plan lives at `/Users/bennettye/.claude/plans/you-are-helping-me-dreamy-narwhal.md`. This file tracks execution state — what's done, what's next, and the non-obvious decisions made along the way.
 
@@ -16,7 +16,7 @@ The full architectural plan lives at `/Users/bennettye/.claude/plans/you-are-hel
 | 4 | Fundamentals (SEC EDGAR) | ✅ done | 2,014 filings (2009-Q2 → 2026-Q1); look-ahead-clean |
 | 5 | FinBERT sentiment | ✅ done | `headlines.py` + `backfill_sentiment.py`; 13 tests pass; apply migration 001 before running |
 | 6 | Feature builder | ✅ done | `ml/features.py`; 12 tests pass; look-ahead + forward-fill + z-score |
-| 7 | Transformer (PatchTST) | ⏭️ **next** | LSTM was rejected — see plan §4. PyTorch + MPS needed |
+| 7 | Transformer (PatchTST) | ✅ code done | `ml/{model,dataset,train}.py`; multi-task (class + return reg) + feature gate; 78 tests; torch 2.12 MPS in `stockproject/`. AAPL sanity OK. **Full-universe candidate run pending.** |
 | 8 | Model registry + promotion | ⏳ | Promotion rule baked into plan §5 |
 | 9 | Daily inference job | ⏳ | Writes to `predictions` |
 | 10 | FastAPI endpoints | ⏳ | Smaller surface than originally planned — see "Architecture clarifications" |
@@ -35,6 +35,9 @@ These came out of mid-build discussions and supersede earlier plan drafts:
 2. **Next.js owns the dashboard read/write path; FastAPI is ML-only.** Next.js Server Components read Supabase directly via `@supabase/ssr`. FastAPI only handles retrain, promote, rollback, and the `POST /tickers` auto-add (which kicks off backfill of a new symbol). This was changed from the original plan after the user pushed back on routing everything through FastAPI.
 3. **`POST /tickers` is the auto-add path.** When the user types a symbol in the dashboard's "add holding" form that doesn't exist in the universe yet, the API auto-creates the ticker, allocates the next `embedding_idx`, and kicks off a backfill. Predictions show `cold_start=true` until the next retrain.
 4. **Supabase key terminology was updated** — `anon`/`service_role` are now called `publishable`/`secret` (and prefixed `sb_publishable_*` / `sb_secret_*`). JWTs are verified via JWKS (`<URL>/auth/v1/.well-known/jwks.json`), no shared secret.
+5. **Model is multi-task with a feature gate (step 7).** Beyond plan §4: (a) a `FeatureGate` (mini-VSN, softmax per-feature weights, ~1k params) sits before patching — borrowed from TFT, which was considered and rejected for full adoption; (b) each horizon has BOTH a classification head (calibrated up/down) AND a regression head predicting the horizon **log-return** (dashboard derives price = last_close·exp(r̂) → `predictions.predicted_return`). This overrides §4's classification-only stance per the user's request. Mitigations for §4's "regression fits to noise": Huber loss, per-horizon residual scaling by train-set return std (stored in `model_versions.config.return_scale`), holdout `ret_rmse` recorded for price intervals.
+6. **Sentiment is deferred; baseline is price + fundamentals.** yfinance news only returns ~30 days, so it can't populate the 5y training history (sentiment cols ≈ 0). FinBERT pipeline runs daily and will accumulate going forward; a paid historical-news source was considered and deferred. Measured label balance 2021–2026: up-fraction 1M=0.57 / 3M=0.61 / 6M=0.65 / 1Y=0.69 — long horizons are base-rate-biased, so `horizon_metrics` records **`base_rate` + `lift`** (acc over majority-class) per horizon, persisted in `directional_accuracy`/`holdout_metrics`. Judge candidates on `lift`, not raw `acc`, at 6M/1Y.
+7. **Step-7 sharp edges:** ML venv is `stockproject/` (NOT `.stockproject/`). Labels/returns use index-shift on each ticker's own price series, not the NYSE calendar (self-consistent, no gap issues). Time split: train < T−18mo, val [T−18mo, T−6mo), holdout ≥ T−6mo. Known tuning gap: cosine LR is calibrated to `epochs=100` but early-stop fires ~ep 30–40, so decay is mostly unused — consider calibrating to a realistic horizon.
 
 ---
 

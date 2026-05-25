@@ -16,7 +16,7 @@ from backend.ml.dataset import (
     SplitConfig,
     TickerFrame,
     assemble_ticker_samples,
-    compute_labels,
+    compute_targets,
     months_before,
     split_samples,
     to_arrays,
@@ -63,26 +63,38 @@ def test_months_before_day_clamp_and_leap():
 
 
 def test_labels_up_when_price_rises():
-    adj = [float(i) for i in range(300)]      # strictly increasing
-    labels, mask = compute_labels(adj, end_idx=0)
+    adj = [float(i + 1) for i in range(300)]   # strictly increasing, all positive
+    labels, returns, mask = compute_targets(adj, end_idx=0)
     for h in HORIZONS:
         assert mask[h] is True
         assert labels[h] == 1
+        assert returns[h] > 0
 
 
 def test_labels_down_when_price_falls():
     adj = [float(300 - i) for i in range(300)]  # strictly decreasing
-    labels, mask = compute_labels(adj, end_idx=0)
+    labels, returns, mask = compute_targets(adj, end_idx=0)
     for h in HORIZONS:
         assert labels[h] == 0
+        assert returns[h] < 0
+
+
+def test_return_target_is_log_ratio():
+    import math
+    adj = [2.0] * 300
+    adj[21] = 2.0 * math.e          # 1M horizon (21 bars) -> log(e) = 1.0
+    labels, returns, mask = compute_targets(adj, end_idx=0)
+    assert mask["1M"] and abs(returns["1M"] - 1.0) < 1e-9 and labels["1M"] == 1
+    assert returns["3M"] == 0.0 and labels["3M"] == 0   # flat -> non-positive
 
 
 def test_labels_mask_beyond_available_bars():
-    adj = [float(i) for i in range(300)]
+    adj = [float(i + 1) for i in range(300)]
     # end_idx=100: 1Y (252) lands at 352 >= 300 -> masked; shorter horizons fine.
-    labels, mask = compute_labels(adj, end_idx=100)
+    labels, returns, mask = compute_targets(adj, end_idx=100)
     assert mask["1M"] and mask["3M"] and mask["6M"]
     assert mask["1Y"] is False
+    assert returns["1Y"] == 0.0
 
 
 # =============================================================
@@ -102,6 +114,7 @@ def test_assemble_shapes_and_label_direction():
     # First valid window has full forward history -> all 4 horizons present & up.
     assert all(earliest.mask[h] for h in HORIZONS)
     assert all(earliest.labels[h] == 1 for h in HORIZONS)
+    assert all(earliest.returns[h] > 0 for h in HORIZONS)
 
 
 def test_assemble_skips_when_too_little_history():
@@ -128,7 +141,8 @@ def test_assemble_drops_samples_with_no_available_label():
 
 def _dummy_sample(d: date) -> Sample:
     return Sample(1, 1, d, np.zeros((SEQUENCE_LENGTH, FEATURE_DIM), np.float32),
-                  {h: 1 for h in HORIZONS}, {h: True for h in HORIZONS})
+                  {h: 1 for h in HORIZONS}, {h: 0.05 for h in HORIZONS},
+                  {h: True for h in HORIZONS})
 
 
 def test_split_boundaries():
@@ -164,5 +178,6 @@ def test_to_arrays_shapes_and_dtypes():
     assert arr["x"].dtype == np.float32
     assert arr["ticker_idx"].shape == (n,) and arr["ticker_idx"].dtype == np.int64
     assert arr["y"].shape == (n, 4) and arr["y"].dtype == np.int64
+    assert arr["r"].shape == (n, 4) and arr["r"].dtype == np.float32
     assert arr["mask"].shape == (n, 4) and arr["mask"].dtype == np.float32
     assert set(np.unique(arr["mask"])).issubset({0.0, 1.0})

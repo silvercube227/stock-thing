@@ -59,16 +59,27 @@ def test_forward_shapes():
     model = PatchTST(cfg, num_tickers=36).eval()
     x, idx = _batch(cfg, b=4, num_tickers=36)
     out = model(x, idx)
-    assert set(out) == set(HORIZONS)
+    assert set(out.logits) == set(HORIZONS)
+    assert set(out.returns) == set(HORIZONS)
     for h in HORIZONS:
-        assert out[h].shape == (4, cfg.n_classes)
+        assert out.logits[h].shape == (4, cfg.n_classes)
+        assert out.returns[h].shape == (4,)   # one predicted log-return per sample
+
+
+def test_return_heads_can_be_disabled():
+    cfg = PatchTSTConfig(predict_returns=False)
+    model = PatchTST(cfg, num_tickers=36).eval()
+    assert model.return_heads is None
+    out = model(*_batch(cfg, b=2, num_tickers=36))
+    assert out.returns is None
+    assert set(out.logits) == set(HORIZONS)
 
 
 def test_return_gate_shape_and_normalization():
     cfg = PatchTSTConfig()
     model = PatchTST(cfg, num_tickers=36).eval()
     x, idx = _batch(cfg, b=4, num_tickers=36)
-    _, gate = model(x, idx, return_gate=True)
+    gate = model(x, idx, return_gate=True).gate
     assert gate.shape == (4, cfg.n_features)
     # softmax * n_features → each row sums to n_features (mean weight 1).
     assert torch.allclose(gate.sum(dim=1), torch.full((4,), float(cfg.n_features)), atol=1e-4)
@@ -80,8 +91,7 @@ def test_gate_can_be_disabled():
     model = PatchTST(cfg, num_tickers=36).eval()
     assert model.feature_gate is None
     x, idx = _batch(cfg, b=2, num_tickers=36)
-    _, gate = model(x, idx, return_gate=True)
-    assert gate is None
+    assert model(x, idx, return_gate=True).gate is None
 
 
 def test_patchify_rejects_wrong_shape():
@@ -163,7 +173,7 @@ def test_overfits_single_batch():
     for _ in range(400):
         opt.zero_grad()
         out = model(x, idx)
-        loss = sum(loss_fn(out[h], labels[h]) for h in HORIZONS)
+        loss = sum(loss_fn(out.logits[h], labels[h]) for h in HORIZONS)
         if first_loss is None:
             first_loss = loss.item()
         loss.backward()
@@ -175,7 +185,7 @@ def test_overfits_single_batch():
     # Loss collapsed and every horizon is perfectly classified on the train batch.
     assert loss.item() < 0.05 * first_loss
     for h in HORIZONS:
-        acc = (out[h].argmax(dim=1) == labels[h]).float().mean().item()
+        acc = (out.logits[h].argmax(dim=1) == labels[h]).float().mean().item()
         assert acc == 1.0, f"{h} train accuracy {acc} != 1.0"
 
 

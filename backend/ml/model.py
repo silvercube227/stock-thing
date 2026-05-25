@@ -45,6 +45,18 @@ HORIZONS: tuple[str, ...] = tuple(
 
 
 @dataclass
+class ModelOutput:
+    """Forward output. `returns` is per-horizon predicted log-return (B,), in
+    real return space (predicted price = last_close * exp(r̂)); None if the
+    model is classification-only. `gate` is the (B, n_features) feature-
+    importance vector when requested, else None."""
+
+    logits: dict[str, torch.Tensor]
+    returns: dict[str, torch.Tensor] | None = None
+    gate: torch.Tensor | None = None
+
+
+@dataclass
 class PatchTSTConfig:
     """Hyperparameters. Serialized verbatim into model_versions.config for
     reproducibility, so keep it JSON-friendly (plain scalars + lists)."""
@@ -61,6 +73,7 @@ class PatchTSTConfig:
     ticker_embed_dim: int = 16
     head_hidden: int = 64
     n_classes: int = 2                    # binary direction per horizon
+    predict_returns: bool = True          # add a regression head per horizon (log-return)
     use_feature_gate: bool = True         # variable-selection gate before patching
     gate_hidden: int = 32
     horizons: tuple[str, ...] = field(default_factory=lambda: HORIZONS)
@@ -220,6 +233,12 @@ class PatchTST(nn.Module):
         self.heads = nn.ModuleDict(
             {h: nn.Linear(cfg.head_hidden, cfg.n_classes) for h in cfg.horizons}
         )
+        # Regression heads predict the horizon log-return (one scalar each).
+        self.return_heads = (
+            nn.ModuleDict({h: nn.Linear(cfg.head_hidden, 1) for h in cfg.horizons})
+            if cfg.predict_returns
+            else None
+        )
 
         self._init_weights()
 
@@ -249,16 +268,17 @@ class PatchTST(nn.Module):
         x: torch.Tensor,
         ticker_idx: torch.Tensor,
         return_gate: bool = False,
-    ) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], torch.Tensor | None]:
+    ) -> ModelOutput:
         """
         Args:
             x:           (B, seq_len, n_features) float feature window.
             ticker_idx:  (B,) long tensor of embedding_idx values.
-            return_gate: also return the (B, n_features) feature-importance
-                         weights (None if the gate is disabled).
+            return_gate: attach the (B, n_features) feature-importance weights
+                         to the output (None if the gate is disabled).
 
         Returns:
-            dict horizon -> (B, n_classes) logits, or (logits, gate_weights).
+            ModelOutput with per-horizon class logits (B, n_classes), per-horizon
+            predicted log-returns (B,) when enabled, and optionally the gate.
         """
         gate_weights: torch.Tensor | None = None
         if self.feature_gate is not None:
@@ -278,10 +298,16 @@ class PatchTST(nn.Module):
         pooled = tokens.mean(dim=1)                        # (B, d_model)
         trunk = self.head_trunk(pooled)                    # (B, head_hidden)
         logits = {h: head(trunk) for h, head in self.heads.items()}
-
-        if return_gate:
-            return logits, gate_weights
-        return logits
+        returns = (
+            {h: head(trunk).squeeze(-1) for h, head in self.return_heads.items()}
+            if self.return_heads is not None
+            else None
+        )
+        return ModelOutput(
+            logits=logits,
+            returns=returns,
+            gate=gate_weights if return_gate else None,
+        )
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

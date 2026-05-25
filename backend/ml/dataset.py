@@ -26,6 +26,7 @@ in tests/test_dataset.py with synthetic frames.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -70,7 +71,8 @@ class Sample:
     sample_end: date
     features: np.ndarray              # (SEQUENCE_LENGTH, FEATURE_DIM) float32
     labels: dict[str, int]            # horizon -> 0/1 (meaningless where masked)
-    mask: dict[str, bool]             # horizon -> label available?
+    returns: dict[str, float]         # horizon -> log-return target (0.0 where masked)
+    mask: dict[str, bool]             # horizon -> target available?
 
 
 # =============================================================
@@ -94,25 +96,34 @@ def months_before(d: date, months: int) -> date:
 # =============================================================
 
 
-def compute_labels(adj_close: list[float], end_idx: int) -> tuple[dict[str, int], dict[str, bool]]:
-    """Direction labels for each horizon at series position `end_idx`.
+def compute_targets(
+    adj_close: list[float], end_idx: int
+) -> tuple[dict[str, int], dict[str, float], dict[str, bool]]:
+    """Direction labels and log-return targets for each horizon at `end_idx`.
 
-    `adj_close` is ascending by trade_date. A horizon is available iff the bar
-    `end_idx + H` exists; otherwise it is masked.
+    `adj_close` is ascending by trade_date. For horizon H the target is
+    `log(adj_close[end+H] / adj_close[end])` and the label is its sign. A horizon
+    is available iff the bar `end_idx + H` exists with positive prices; otherwise
+    it is masked (label 0, return 0.0).
     """
     base = adj_close[end_idx]
     labels: dict[str, int] = {}
+    returns: dict[str, float] = {}
     mask: dict[str, bool] = {}
     n = len(adj_close)
     for h in HORIZONS:
         j = end_idx + HORIZON_TRADING_DAYS[h]
-        if j < n and adj_close[j] is not None and base is not None:
-            labels[h] = 1 if adj_close[j] > base else 0
+        future = adj_close[j] if j < n else None
+        if future is not None and base is not None and base > 0 and future > 0:
+            r = math.log(future / base)
+            labels[h] = 1 if r > 0 else 0
+            returns[h] = r
             mask[h] = True
         else:
             labels[h] = 0
+            returns[h] = 0.0
             mask[h] = False
-    return labels, mask
+    return labels, returns, mask
 
 
 # =============================================================
@@ -142,7 +153,7 @@ def assemble_ticker_samples(frame: TickerFrame, stride: int = 1) -> list[Sample]
         )
         if feats is None:
             continue
-        labels, mask = compute_labels(adj_close, end_idx)
+        labels, returns, mask = compute_targets(adj_close, end_idx)
         if not any(mask.values()):
             continue
         samples.append(
@@ -152,6 +163,7 @@ def assemble_ticker_samples(frame: TickerFrame, stride: int = 1) -> list[Sample]
                 sample_end=sample_end,
                 features=feats,
                 labels=labels,
+                returns=returns,
                 mask=mask,
             )
         )
@@ -207,7 +219,8 @@ def to_arrays(samples: list[Sample]) -> dict[str, np.ndarray]:
     Returns:
         x:          (N, 252, 12) float32
         ticker_idx: (N,)         int64
-        y:          (N, 4)       int64   (horizon order = HORIZONS)
+        y:          (N, 4)       int64   (direction labels; horizon order = HORIZONS)
+        r:          (N, 4)       float32 (log-return targets; 0.0 where masked)
         mask:       (N, 4)       float32 (1.0 valid, 0.0 masked)
     """
     n = len(samples)
@@ -215,14 +228,16 @@ def to_arrays(samples: list[Sample]) -> dict[str, np.ndarray]:
         np.empty((0, SEQUENCE_LENGTH, 0), dtype=np.float32)
     ticker_idx = np.empty(n, dtype=np.int64)
     y = np.empty((n, len(HORIZONS)), dtype=np.int64)
+    r = np.empty((n, len(HORIZONS)), dtype=np.float32)
     mask = np.empty((n, len(HORIZONS)), dtype=np.float32)
     for i, s in enumerate(samples):
         x[i] = s.features
         ticker_idx[i] = s.embedding_idx
         for j, h in enumerate(HORIZONS):
             y[i, j] = s.labels[h]
+            r[i, j] = s.returns[h]
             mask[i, j] = 1.0 if s.mask[h] else 0.0
-    return {"x": x, "ticker_idx": ticker_idx, "y": y, "mask": mask}
+    return {"x": x, "ticker_idx": ticker_idx, "y": y, "r": r, "mask": mask}
 
 
 # =============================================================
