@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from datetime import date, timedelta
 
 from backend.ingestion.db import pool_context
 from backend.ingestion.prices import ingest_full_history
@@ -22,11 +23,12 @@ from backend.ingestion.prices import ingest_full_history
 log = logging.getLogger(__name__)
 
 
-async def amain(years: int, symbols: list[str] | None) -> int:
+async def amain(start_date: date, symbols: list[str] | None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
+    log.info("pulling price history from %s", start_date.isoformat())
 
     async with pool_context() as pool:
         tickers: list[tuple[int, str]] | None = None
@@ -47,7 +49,7 @@ async def amain(years: int, symbols: list[str] | None) -> int:
                 print(f"No matching active tickers for: {', '.join(symbols_upper)}", file=sys.stderr)
                 return 1
 
-        result = await ingest_full_history(pool, tickers=tickers, years=years)
+        result = await ingest_full_history(pool, tickers=tickers, start_date=start_date)
 
     print()
     print(f"Status:         {result.status}")
@@ -65,13 +67,23 @@ def main() -> int:
     p = argparse.ArgumentParser(description="Backfill price_history from yfinance.")
     p.add_argument("--years", type=int, default=5, help="years of history to pull (default: 5)")
     p.add_argument(
+        "--start",
+        default=None,
+        help="explicit start date YYYY-MM-DD (overrides --years)",
+    )
+    p.add_argument(
         "--symbols",
         nargs="*",
         default=None,
         help="optional subset of symbols; default = all active tickers",
     )
     args = p.parse_args()
-    return asyncio.run(amain(years=args.years, symbols=args.symbols))
+    start_date = (
+        date.fromisoformat(args.start)
+        if args.start
+        else date.today() - timedelta(days=365 * args.years)
+    )
+    return asyncio.run(amain(start_date=start_date, symbols=args.symbols))
 
 
 if __name__ == "__main__":
