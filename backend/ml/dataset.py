@@ -26,7 +26,9 @@ in tests/test_dataset.py with synthetic frames.
 
 from __future__ import annotations
 
+import bisect
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -35,6 +37,7 @@ import numpy as np
 from backend.ingestion.calendar import HORIZON_TRADING_DAYS
 from backend.ml.features import SEQUENCE_LENGTH, build_sample
 from backend.ml.model import HORIZONS
+from collections import defaultdict
 
 Split = str  # "train" | "val" | "holdout"
 
@@ -130,6 +133,21 @@ def compute_targets(
 # Sample assembly (pure)
 # =============================================================
 
+def build_calendar_grid(frames: TickerFrame):
+    #make set of all dates
+    all_dates: set[date] = set()
+    #iterate through frames, add each date with a non none close 
+    for f in frames:
+        for r in f.prices:
+            if r["adj_close"] is not None:
+                all_dates.add(_as_date(r["trade_date"]))
+    #dictionary of every trading month and year as tuple, plus the list for that month 
+    by_month: dict[tuple[int, int], list[date]] = defaultdict(list)
+    for d in all_dates:
+        by_month[(d.year, d.month)].append(d)
+    #find largest date per month as the end point
+    return sorted(max(v) for v in by_month.values())
+
 
 def assemble_ticker_samples(frame: TickerFrame, stride: int = 1) -> list[Sample]:
     """Build every valid (window, labels) sample for one ticker.
@@ -175,6 +193,115 @@ def assemble_samples(frames: list[TickerFrame], stride: int = 1) -> list[Sample]
     for frame in frames:
         out.extend(assemble_ticker_samples(frame, stride=stride))
     return out
+
+
+def assemble_ticker_samples_aligned(frame: TickerFrame, grid: list[date]) -> list[Sample]:
+    """Build one sample per grid date for one ticker.
+
+    Uses the ticker's last bar at or before each grid date. sample_end is set to
+    the grid date (not the actual bar date) so all tickers on the same month-end
+    land in the same cross-section for rank-IC grouping.
+    """
+    prices = sorted(frame.prices, key=lambda r: _as_date(r["trade_date"]))
+    if len(prices) <= SEQUENCE_LENGTH:
+        return []
+    trade_dates = [_as_date(r["trade_date"]) for r in prices]
+    adj_close = [
+        float(r["adj_close"]) if r["adj_close"] is not None else None for r in prices
+    ]
+    samples: list[Sample] = []
+    for g in grid:
+        pos = bisect.bisect_right(trade_dates, g) - 1
+        if pos < SEQUENCE_LENGTH:
+            continue
+        feats = build_sample(
+            frame.ticker_id, trade_dates[pos], prices, frame.fundamentals, frame.sentiment
+        )
+        if feats is None:
+            continue
+        labels, returns, mask = compute_targets(adj_close, pos)
+        if not any(mask.values()):
+            continue
+        samples.append(
+            Sample(
+                ticker_id=frame.ticker_id,
+                embedding_idx=frame.embedding_idx,
+                sample_end=g,
+                features=feats,
+                labels=labels,
+                returns=returns,
+                mask=mask,
+            )
+        )
+    return samples
+
+
+def assemble_calendar_aligned(frames: list[TickerFrame], grid: list[date]) -> list[Sample]:
+    out: list[Sample] = []
+    for frame in frames:
+        out.extend(assemble_ticker_samples_aligned(frame, grid))
+    return out
+
+
+# =============================================================
+# Cross-sectional relabeling (relative-to-universe target)
+# =============================================================
+
+
+def cross_sectional_medians(
+    frames: list[TickerFrame],
+) -> dict[str, dict[date, float]]:
+    """Per-horizon cross-sectional median log-return, keyed by end date.
+
+    Built densely (every trading day, every ticker) from a wide adj_close panel so
+    a strided sample can look up the universe median at its own end date — the
+    demeaning reference for cross-sectional labels. The H-day forward return uses a
+    panel row shift, which equals an H-bar shift on each ticker's own series since
+    all tickers share the NYSE calendar. Returns {horizon: {end_date: median}}.
+    """
+    import pandas as pd
+
+    series = {
+        f.ticker_id: pd.Series(
+            {_as_date(r["trade_date"]): float(r["adj_close"])
+             for r in f.prices if r["adj_close"] is not None}
+        )
+        for f in frames if f.prices
+    }
+    panel = pd.DataFrame(series).sort_index()        # index = date, cols = ticker
+    medians: dict[str, dict[date, float]] = {}
+    for h in HORIZONS:
+        H = HORIZON_TRADING_DAYS[h]
+        logret = np.log(panel.shift(-H) / panel)     # H trading days forward
+        med = logret.median(axis=1, skipna=True)     # cross-sectional median per date
+        medians[h] = {d: float(v) for d, v in med.items() if pd.notna(v)}
+    return medians
+
+
+def relabel_cross_sectional(
+    samples: list[Sample], medians: dict[str, dict[date, float]]
+) -> list[Sample]:
+    """Rewrite labels/returns in place to be relative to the universe.
+
+    For each unmasked (sample, horizon): the return target becomes the demeaned
+    (relative) log-return `r - median`, and the direction label becomes "did this
+    ticker beat the universe median?" (1/0). Samples whose end date has no median
+    are masked for that horizon. Labels are ~50/50 by construction, so class
+    weighting becomes a near no-op.
+    """
+    for s in samples:
+        for h in HORIZONS:
+            if not s.mask[h]:
+                continue
+            med = medians[h].get(s.sample_end)
+            if med is None:
+                s.mask[h] = False
+                s.labels[h], s.returns[h] = 0, 0.0
+                continue
+            rel = s.returns[h] - med
+            s.returns[h] = rel
+            s.labels[h] = 1 if rel > 0 else 0
+    return samples
 
 
 # =============================================================

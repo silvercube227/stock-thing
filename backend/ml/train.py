@@ -38,8 +38,12 @@ from backend.ingestion.db import pool_context
 from backend.ml.dataset import (
     Sample,
     SplitConfig,
+    assemble_calendar_aligned,
     assemble_samples,
+    build_calendar_grid,
+    cross_sectional_medians,
     load_frames,
+    relabel_cross_sectional,
     split_samples,
     to_arrays,
 )
@@ -74,6 +78,9 @@ class TrainConfig:
     seed: int = 1337
     reg_loss_weight: float = 1.0        # weight of the return-regression term vs classification
     horizon_weights: dict[str, float] = field(default_factory=lambda: dict(HORIZON_LOSS_WEIGHTS))
+    class_weight_power: float = 1.0     # 1=inverse-frequency class weights, 0=uniform/off
+    shuffle_labels: bool = False        # permutation control: randomize labels (noise floor)
+    cross_sectional: bool = False       # select on rank IC instead of directional lift
 
 
 @dataclass
@@ -178,14 +185,19 @@ def compute_return_scale(samples: list[Sample]) -> dict[str, float]:
     return scale
 
 
-def compute_class_weights(samples: list[Sample]) -> dict[str, list[float]]:
-    """Per-horizon inverse-frequency class weights over valid training samples.
+def compute_class_weights(
+    samples: list[Sample], power: float = 1.0
+) -> dict[str, list[float]]:
+    """Per-horizon class weights over valid training samples.
 
-    The universe (esp. long horizons) is up-biased, so unweighted CE collapses to
-    "always predict up" (lift 0). Weighting each class by `n / (2 * n_class)` makes
-    a down-error and an up-error cost the same; the frequency-weighted mean weight
-    is exactly 1, so the overall loss scale is unchanged. Returned as [w_down, w_up]
-    per horizon and stored in the registry config for reproducibility.
+    The universe (esp. long horizons) is up-biased, so unweighted CE can collapse
+    to "always predict up" (lift 0). `power` controls how hard that's corrected:
+      power=1.0 -> full inverse-frequency (a down-error and an up-error cost equally)
+      power=0.0 -> uniform [1, 1] (no correction)
+      between   -> softened.
+    Weights are `w_c ∝ freq_c**(-power)`, normalized so the frequency-weighted mean
+    weight is exactly 1 for any power (loss scale unchanged). Returned as
+    [w_down, w_up] per horizon and stored in the registry config for reproducibility.
     """
     arr = to_arrays(samples)
     y, m = arr["y"], arr["mask"].astype(bool)
@@ -196,9 +208,10 @@ def compute_class_weights(samples: list[Sample]) -> dict[str, list[float]]:
         if n == 0:
             weights[h] = [1.0, 1.0]
             continue
-        n_up = int(yj.sum())
-        n_down = n - n_up
-        weights[h] = [n / (2 * max(n_down, 1)), n / (2 * max(n_up, 1))]
+        f_up = max(int(yj.sum()), 1) / n
+        f_down = max(n - int(yj.sum()), 1) / n
+        z = f_down ** (1.0 - power) + f_up ** (1.0 - power)
+        weights[h] = [f_down ** (-power) / z, f_up ** (-power) / z]
     return weights
 
 
@@ -214,6 +227,57 @@ def _class_weight_tensors(
     }
 
 
+def shuffle_labels(samples: list[Sample], seed: int) -> list[Sample]:
+    """Permutation control: destroy the feature->label association.
+
+    For each horizon independently, permute the (label, return) values among the
+    samples where that horizon is unmasked. Base rates and mask structure are
+    preserved, so the only thing removed is learnable signal. A model that still
+    beats baseline lift on shuffled labels reveals leakage or a metric bug.
+    """
+    rng = np.random.default_rng(seed)
+    out = [
+        Sample(s.ticker_id, s.embedding_idx, s.sample_end, s.features,
+               dict(s.labels), dict(s.returns), s.mask)
+        for s in samples
+    ]
+    for h in HORIZONS:
+        idx = [i for i, s in enumerate(out) if s.mask[h]]
+        if len(idx) < 2:
+            continue
+        labels = np.array([out[i].labels[h] for i in idx])
+        returns = np.array([out[i].returns[h] for i in idx])
+        perm = rng.permutation(len(idx))
+        for k, i in enumerate(idx):
+            out[i].labels[h] = int(labels[perm[k]])
+            out[i].returns[h] = float(returns[perm[k]])
+    return out
+
+
+def _rank_ic(
+    scores: np.ndarray, targets: np.ndarray, dates: np.ndarray, min_names: int = 10
+) -> tuple[float, int]:
+    """Mean per-date Spearman rank IC between `scores` and `targets`.
+
+    Groups by date (the cross-section), Spearman-correlates predicted score vs
+    realized return within each date that has at least `min_names` names, and
+    averages over dates. Returns (mean_ic, n_dates_used) — the cross-sectional
+    analogue of directional lift.
+    """
+    import pandas as pd
+
+    if scores.size == 0:
+        return float("nan"), 0
+    df = pd.DataFrame({"d": dates, "s": scores, "t": targets})
+    ics = [
+        g["s"].corr(g["t"], method="spearman")
+        for _, g in df.groupby("d")
+        if len(g) >= min_names
+    ]
+    ics = [v for v in ics if v == v]  # drop NaN (zero-variance dates)
+    return (float(np.mean(ics)), len(ics)) if ics else (float("nan"), 0)
+
+
 @torch.no_grad()
 def horizon_metrics(
     logits: dict[str, torch.Tensor],
@@ -221,6 +285,7 @@ def horizon_metrics(
     y: torch.Tensor,
     r: torch.Tensor,
     mask: torch.Tensor,
+    dates: np.ndarray | None = None,
 ) -> dict[str, dict[str, float]]:
     """Per-horizon classification + regression metrics over valid samples.
 
@@ -233,6 +298,11 @@ def horizon_metrics(
     Regression (when `returns` is given): `ret_rmse` / `ret_mae` of the predicted
     log-return in real return space. `ret_rmse` doubles as a price-interval width
     (predicted_price × exp(±ret_rmse)) on the dashboard.
+
+    Rank IC (when `dates` is given): mean per-date Spearman correlation between the
+    predicted score (relative-return head if present, else P(up)) and the realized
+    return — the cross-sectional ranking metric. `ic_n` is the count of dates that
+    cleared the minimum-names threshold.
     """
     out: dict[str, dict[str, float]] = {}
     for j, h in enumerate(HORIZONS):
@@ -242,7 +312,8 @@ def horizon_metrics(
             out[h] = {
                 "acc": float("nan"), "brier": float("nan"),
                 "base_rate": float("nan"), "lift": float("nan"),
-                "ret_rmse": float("nan"), "ret_mae": float("nan"), "n": 0,
+                "ret_rmse": float("nan"), "ret_mae": float("nan"),
+                "ic": float("nan"), "ic_n": 0, "n": 0,
             }
             continue
         lg = logits[h][m]
@@ -258,10 +329,15 @@ def horizon_metrics(
             resid = returns[h][m].float() - r[m, j].float()
             ret_rmse = resid.pow(2).mean().sqrt().item()
             ret_mae = resid.abs().mean().item()
+        ic, ic_n = float("nan"), 0
+        if dates is not None:
+            score = (returns[h][m].float() if returns is not None else p_up).cpu().numpy()
+            ic, ic_n = _rank_ic(score, r[m, j].float().cpu().numpy(), dates[m.cpu().numpy()])
         out[h] = {
             "acc": acc, "brier": brier,
             "base_rate": base_rate, "lift": lift,
-            "ret_rmse": ret_rmse, "ret_mae": ret_mae, "n": n,
+            "ret_rmse": ret_rmse, "ret_mae": ret_mae,
+            "ic": ic, "ic_n": ic_n, "n": n,
         }
     return out
 
@@ -279,6 +355,12 @@ def mean_lift(metrics: dict[str, dict[str, float]]) -> float:
     """
     lifts = [m["lift"] for m in metrics.values() if m["n"] > 0]
     return float(np.mean(lifts)) if lifts else float("nan")
+
+
+def mean_ic(metrics: dict[str, dict[str, float]]) -> float:
+    """Mean per-horizon rank IC over horizons with a usable cross-section."""
+    ics = [m["ic"] for m in metrics.values() if m.get("ic_n", 0) > 0 and m["ic"] == m["ic"]]
+    return float(np.mean(ics)) if ics else float("nan")
 
 
 # =============================================================
@@ -337,8 +419,10 @@ def _evaluate_samples(
             masks.append(mask.cpu())
     cat_logits = {h: torch.cat(all_logits[h]) for h in HORIZONS}
     cat_returns = {h: torch.cat(all_returns[h]) for h in HORIZONS} if has_returns else None
+    # Loader is shuffle=False, so concat order matches `samples` order — dates align.
+    dates = np.array([s.sample_end.toordinal() for s in samples], dtype=np.int64)
     metrics = horizon_metrics(
-        cat_logits, cat_returns, torch.cat(ys), torch.cat(rs), torch.cat(masks)
+        cat_logits, cat_returns, torch.cat(ys), torch.cat(rs), torch.cat(masks), dates=dates
     )
     return (losses / max(n_batches, 1)), metrics
 
@@ -365,10 +449,17 @@ def train(
     if not train_samples:
         raise ValueError("no training samples")
 
+    # Permutation control: randomize labels so any beat-the-baseline lift can only
+    # come from leakage or a metric bug. Holdout (scored in run()) stays real.
+    if train_cfg.shuffle_labels:
+        log("shuffle_labels: permuting train/val labels (noise-floor control)")
+        train_samples = shuffle_labels(train_samples, train_cfg.seed)
+        val_samples = shuffle_labels(val_samples, train_cfg.seed + 1)
+
     # Per-horizon return std (from train only) scales the regression residuals.
     return_scale = compute_return_scale(train_samples)
     # Per-horizon class weights (from train only) offset the up-bias in CE.
-    class_weights = compute_class_weights(train_samples)
+    class_weights = compute_class_weights(train_samples, train_cfg.class_weight_power)
     class_weight_t = _class_weight_tensors(class_weights, device)
 
     model = PatchTST(model_cfg, num_tickers=num_tickers).to(device)
@@ -427,20 +518,23 @@ def train(
             )
             val_mean_acc = mean_accuracy(val_metrics)
             val_mean_lift = mean_lift(val_metrics)
-            select_metric = val_mean_lift
+            val_mean_ic = mean_ic(val_metrics)
+            # Cross-sectional runs select on rank IC; absolute runs on directional lift.
+            select_metric = val_mean_ic if train_cfg.cross_sectional else val_mean_lift
         else:  # no val (tiny single-ticker run): select on negative train loss
             val_loss, val_metrics = train_loss, {}
-            val_mean_acc = val_mean_lift = float("nan")
+            val_mean_acc = val_mean_lift = val_mean_ic = float("nan")
             select_metric = -train_loss
 
         history.append(
             {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss,
              "val_mean_acc": val_mean_acc, "val_mean_lift": val_mean_lift,
-             "lr": sched.get_last_lr()[0]}
+             "val_mean_ic": val_mean_ic, "lr": sched.get_last_lr()[0]}
         )
         log(
             f"epoch {epoch:3d}  train {train_loss:.4f}  val {val_loss:.4f}  "
-            f"acc {val_mean_acc:.4f}  lift {val_mean_lift:+.4f}  lr {sched.get_last_lr()[0]:.2e}"
+            f"acc {val_mean_acc:.4f}  lift {val_mean_lift:+.4f}  ic {val_mean_ic:+.4f}  "
+            f"lr {sched.get_last_lr()[0]:.2e}"
         )
 
         if select_metric > best_metric + 1e-5:
@@ -452,7 +546,8 @@ def train(
         else:
             epochs_since_best += 1
             if epochs_since_best >= train_cfg.patience:
-                log(f"early stop at epoch {epoch} (best {best_epoch}, lift {best_metric:+.4f})")
+                metric_name = "ic" if train_cfg.cross_sectional else "lift"
+                log(f"early stop at epoch {epoch} (best {best_epoch}, {metric_name} {best_metric:+.4f})")
                 break
 
     if best_state is not None:
@@ -558,7 +653,11 @@ def _clip(samples: list[Sample], start: date | None, end: date | None) -> list[S
 
 async def run(args) -> None:
     model_cfg = PatchTSTConfig()
-    train_cfg = TrainConfig(epochs=args.epochs, batch_size=args.batch_size, seed=args.seed)
+    train_cfg = TrainConfig(
+        epochs=args.epochs, batch_size=args.batch_size, seed=args.seed,
+        class_weight_power=args.class_weight_power, shuffle_labels=args.shuffle_labels,
+        cross_sectional=args.cross_sectional,
+    )
     split_cfg = SplitConfig()
     start, end = _parse_window(args.window)
 
@@ -572,8 +671,16 @@ async def run(args) -> None:
             else await pool.fetchval("select max(embedding_idx) + 1 from tickers")
         )
 
-        print(f"loaded {len(frames)} tickers; assembling samples (stride={args.stride}) ...")
-        samples = assemble_samples(frames, stride=args.stride)
+        if args.calendar_aligned:
+            grid = build_calendar_grid(frames)
+            print(f"loaded {len(frames)} tickers; assembling calendar-aligned samples ({len(grid)} months) ...")
+            samples = assemble_calendar_aligned(frames, grid)
+        else:
+            print(f"loaded {len(frames)} tickers; assembling samples (stride={args.stride}) ...")
+            samples = assemble_samples(frames, stride=args.stride)
+        if args.cross_sectional:
+            print("cross-sectional: relabeling vs per-date universe median ...")
+            samples = relabel_cross_sectional(samples, cross_sectional_medians(frames))
         samples = _clip(samples, start, end)
         T = end or max(s.sample_end for s in samples)
         splits = split_samples(samples, split_cfg, T=T)
@@ -596,7 +703,8 @@ async def run(args) -> None:
             if m:
                 print(
                     f"  holdout {h}: acc={m['acc']:.3f} lift={m['lift']:+.3f} "
-                    f"base={m['base_rate']:.3f} ret_rmse={m['ret_rmse']:.4f} n={m['n']}"
+                    f"ic={m['ic']:+.4f}(d={m['ic_n']}) base={m['base_rate']:.3f} "
+                    f"ret_rmse={m['ret_rmse']:.4f} n={m['n']}"
                 )
 
         if args.dry_run:
@@ -618,6 +726,14 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--stride", type=int, default=21, help="subsample end dates (thins overlap)")
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--class-weight-power", type=float, default=1.0,
+                   help="class-weight strength: 1.0=inverse-frequency, 0.0=uniform/off")
+    p.add_argument("--shuffle-labels", action="store_true",
+                   help="permutation control: randomize labels to measure the no-signal floor")
+    p.add_argument("--cross-sectional", action="store_true",
+                   help="relabel vs per-date universe median; select on rank IC")
+    p.add_argument("--calendar-aligned", action="store_true",
+                   help="one sample per month-end per ticker; thick cross-sections for walk-forward IC")
     p.add_argument("--dry-run", action="store_true", help="train but do not write model_versions")
     args = p.parse_args()
     asyncio.run(run(args))
