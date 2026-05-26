@@ -404,13 +404,12 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     if symbols:
         ticker_rows = await pool.fetch(
             "select ticker_id, symbol, embedding_idx from tickers "
-            "where active and symbol = any($1::text[]) order by ticker_id",
+            "where symbol = any($1::text[]) order by ticker_id",
             symbols,
         )
     else:
         ticker_rows = await pool.fetch(
-            "select ticker_id, symbol, embedding_idx from tickers "
-            "where active order by ticker_id"
+            "select ticker_id, symbol, embedding_idx from tickers order by ticker_id"
         )
     ids = [r["ticker_id"] for r in ticker_rows]
     if not ids:

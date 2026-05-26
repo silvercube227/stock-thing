@@ -33,6 +33,7 @@ frontend/.vercel/
 models/*.pt
 models/*.pth
 models/*.bin
+models/*.pkl
 !models/.gitkeep
 
 # --- Data caches ---
