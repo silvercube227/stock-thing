@@ -65,6 +65,9 @@ class TickerFrame:
     prices: list[dict]        # trade_date, adj_close, volume
     fundamentals: list[dict]  # filed_at, period_end, filing_type, revenue, ...
     sentiment: list[dict]     # score_date, rolling_7d, rolling_14d
+    shares_outstanding: int | None = None  # from tickers table; used for log_market_cap
+    sector: str | None = None
+    industry: str | None = None
 
 
 @dataclass
@@ -380,7 +383,7 @@ select ticker_id, trade_date, adj_close, volume
 """
 
 _FUND_SQL = """
-select ticker_id, filed_at, period_end, filing_type, revenue, gross_margin,
+select ticker_id, filed_at, period_end, filing_type, revenue, net_income, gross_margin,
        operating_margin, total_debt, total_equity, fcf
   from fundamentals
  where ticker_id = any($1::bigint[])
@@ -403,13 +406,15 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     """
     if symbols:
         ticker_rows = await pool.fetch(
-            "select ticker_id, symbol, embedding_idx from tickers "
+            "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, industry "
+            "from tickers "
             "where symbol = any($1::text[]) order by ticker_id",
             symbols,
         )
     else:
         ticker_rows = await pool.fetch(
-            "select ticker_id, symbol, embedding_idx from tickers order by ticker_id"
+            "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, industry "
+            "from tickers order by ticker_id"
         )
     ids = [r["ticker_id"] for r in ticker_rows]
     if not ids:
@@ -434,6 +439,9 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 prices=by_ticker_prices.get(tid, []),
                 fundamentals=by_ticker_fund.get(tid, []),
                 sentiment=by_ticker_sent.get(tid, []),
+                shares_outstanding=r["shares_outstanding"],
+                sector=r["sector"],
+                industry=r["industry"],
             )
         )
     return frames

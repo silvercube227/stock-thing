@@ -52,6 +52,7 @@ from backend.ml.dataset import (
 )
 from backend.ml.features import (
     SEQUENCE_LENGTH,
+    _annotate_fundamentals,
     _build_fundamental_series,
     _build_sentiment_series,
 )
@@ -60,6 +61,7 @@ from backend.ml.model import HORIZONS
 # Tabular factor columns the model trains on (order is informational only).
 PRICE_FEATURES = [
     "mom_1m", "mom_3m", "mom_6m", "mom_12_1",   # momentum (12_1 skips the last month)
+    "log_market_cap",                           # log(adj_close × shares_outstanding)
     "vol_20d", "vol_60d", "vol_120d",           # realized vol
     "dist_high_252", "dist_low_252",            # distance to 52w extremes
     "ma_gap_50", "ma_gap_200",                  # gap vs moving averages
@@ -68,8 +70,18 @@ PRICE_FEATURES = [
 FUNDAMENTAL_FEATURES = [
     "revenue_growth", "gross_margin", "operating_margin", "debt_equity", "fcf_revenue",
 ]
+VALUATION_FEATURES = [
+    "earnings_yield", "book_to_market", "sales_to_price", "fcf_yield",
+]
+QUALITY_FEATURES = [
+    "roe_ttm", "net_margin_ttm", "fcf_margin_ttm",
+    "gross_margin_stability_4q", "operating_margin_stability_4q",
+    "revenue_growth_stability_4q",
+]
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + SENTIMENT_FEATURES
+EXPERIMENTAL_FEATURES = VALUATION_FEATURES + QUALITY_FEATURES
+INDUSTRY_RELATIVE_FEATURES = PRICE_FEATURES + FUNDAMENTAL_FEATURES + EXPERIMENTAL_FEATURES
 
 
 # =============================================================
@@ -117,8 +129,16 @@ def _log_ratio(a: float | None, b: float | None) -> float:
     return math.log(a / b)
 
 
+def _safe_ratio(num: float | None, den: float | None) -> float:
+    if num is None or den is None or abs(den) <= 1e-9:
+        return 0.0
+    return float(num / den)
+
+
 def _price_features(
-    adj_close: list[float | None], volume: list[float], pos: int
+    adj_close: list[float | None], volume: list[float], trade_dates: list, pos: int,
+    shares_outstanding: int | None = None,
+    market_returns: dict | None = None,
 ) -> dict[str, float]:
     """Factor features computed from the ticker's own series up to bar `pos`.
 
@@ -126,12 +146,36 @@ def _price_features(
     have full lookback — the same minimum the aligned assembler enforces.
     """
     P = adj_close[pos]
+    log_mcap = (
+        math.log(P * shares_outstanding)
+        if P and shares_outstanding and P > 0 and shares_outstanding > 0
+        else 0.0
+    )
     feats = {
         "mom_1m": _log_ratio(P, adj_close[pos - 21]),
         "mom_3m": _log_ratio(P, adj_close[pos - 63]),
         "mom_6m": _log_ratio(P, adj_close[pos - 126]),
         "mom_12_1": _log_ratio(adj_close[pos - 21], adj_close[pos - 252]),
+        "log_market_cap": log_mcap,
     }
+
+    stock_daily: list[float] = []
+    market_daily: list[float] = []
+    if market_returns:
+        for i in range(pos - 251 + 1, pos + 1):
+            r_stock = _log_ratio(adj_close[i], adj_close[i - 1])
+            r_mkt = market_returns.get(trade_dates[i])
+            if r_mkt is None or not np.isfinite(r_mkt):
+                continue
+            stock_daily.append(r_stock)
+            market_daily.append(float(r_mkt))
+    if len(stock_daily) >= 60:
+        x = np.asarray(stock_daily, dtype=float)
+        y = np.asarray(market_daily, dtype=float)
+        var_y = float(y.var())
+        feats["beta_252d"] = float(np.cov(x, y, ddof=0)[0, 1] / var_y) if var_y > 1e-12 else 0.0
+    else:
+        feats["beta_252d"] = 0.0
 
     window = np.array(
         [np.nan if v is None or v <= 0 else v for v in adj_close[pos - 251 : pos + 1]],
@@ -161,7 +205,193 @@ def _price_features(
     return feats
 
 
-def build_ticker_rows(frame: TickerFrame, grid: list, max_stale_days: int = 7) -> list[dict]:
+def _ttm_net_income_asof(fund_rows: list[dict], as_of_dates: list) -> list[float]:
+    """Most recent point-in-time TTM net income for each as-of date.
+
+    10-K rows contribute their annual `net_income` directly. 10-Q rows use the
+    trailing four quarterly `net_income` values when available; otherwise we
+    fall back to the most recent annual filing already on file.
+    """
+    import bisect
+
+    rows_sorted = sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))
+    annotated: list[dict] = []
+    quarterly_history: list[tuple] = []
+    annual_history: list[tuple] = []
+
+    for row in rows_sorted:
+        filed_at = _as_date(row["filed_at"])
+        period_end = _as_date(row["period_end"])
+        try:
+            net_income = float(row["net_income"]) if row.get("net_income") is not None else None
+        except (TypeError, ValueError):
+            net_income = None
+
+        filing_type = row.get("filing_type")
+        ttm_net_income: float | None = None
+
+        if filing_type == "10-Q" and net_income is not None:
+            quarterly_history.append((period_end, net_income))
+            recent: list[tuple] = []
+            seen_periods: set = set()
+            for pe, ni in reversed(quarterly_history):
+                if pe in seen_periods:
+                    continue
+                seen_periods.add(pe)
+                recent.append((pe, ni))
+                if len(recent) == 4:
+                    break
+            if len(recent) == 4 and (period_end - recent[-1][0]).days <= 380:
+                ttm_net_income = float(sum(ni for _pe, ni in recent))
+        elif filing_type == "10-K" and net_income is not None:
+            annual_history.append((period_end, net_income))
+            ttm_net_income = net_income
+
+        if ttm_net_income is None:
+            for pe, ni in reversed(annual_history):
+                if abs((period_end - pe).days) <= 380:
+                    ttm_net_income = float(ni)
+                    break
+
+        annotated.append({"filed_at": filed_at, "ttm_net_income": float(ttm_net_income or 0.0)})
+
+    filed_ats = [r["filed_at"] for r in annotated]
+    out: list[float] = []
+    for d in as_of_dates:
+        idx = bisect.bisect_right(filed_ats, d) - 1
+        out.append(float(annotated[idx]["ttm_net_income"]) if idx >= 0 else 0.0)
+    return out
+
+
+def _fundamental_context_asof(fund_rows: list[dict], as_of_dates: list) -> dict[str, list[float]]:
+    """Point-in-time valuation + quality snapshots for each as-of date."""
+    import bisect
+
+    rows_sorted = sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))
+    if not rows_sorted:
+        return {
+            "ttm_revenue": [0.0] * len(as_of_dates),
+            "ttm_net_income": [0.0] * len(as_of_dates),
+            "ttm_fcf": [0.0] * len(as_of_dates),
+            "total_equity": [0.0] * len(as_of_dates),
+            "gross_margin": [0.0] * len(as_of_dates),
+            "operating_margin": [0.0] * len(as_of_dates),
+            "revenue_growth": [0.0] * len(as_of_dates),
+            "gross_margin_stability_4q": [0.0] * len(as_of_dates),
+            "operating_margin_stability_4q": [0.0] * len(as_of_dates),
+            "revenue_growth_stability_4q": [0.0] * len(as_of_dates),
+        }
+
+    annotated_core = _annotate_fundamentals(rows_sorted)
+    annotated: list[dict] = []
+    quarter_hist: dict[str, list[tuple]] = {"revenue": [], "net_income": [], "fcf": []}
+    annual_hist: dict[str, list[tuple]] = {"revenue": [], "net_income": [], "fcf": []}
+
+    def _safe_num(val) -> float | None:
+        try:
+            return float(val) if val is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _compute_ttm(metric: str, period_end, filing_type: str) -> float:
+        q_hist = quarter_hist[metric]
+        a_hist = annual_hist[metric]
+        ttm_val: float | None = None
+        if filing_type == "10-Q":
+            recent: list[tuple] = []
+            seen_periods: set = set()
+            for pe, v in reversed(q_hist):
+                if pe in seen_periods:
+                    continue
+                seen_periods.add(pe)
+                recent.append((pe, v))
+                if len(recent) == 4:
+                    break
+            if len(recent) == 4 and (period_end - recent[-1][0]).days <= 380:
+                ttm_val = float(sum(v for _pe, v in recent))
+        elif filing_type == "10-K" and a_hist:
+            ttm_val = float(a_hist[-1][1])
+
+        if ttm_val is None:
+            for pe, v in reversed(a_hist):
+                if abs((period_end - pe).days) <= 380:
+                    ttm_val = float(v)
+                    break
+        return float(ttm_val or 0.0)
+
+    def _stability(field: str) -> float:
+        vals = [float(r[field]) for r in annotated[-4:] if field in r]
+        return float(-np.std(np.asarray(vals, dtype=float))) if len(vals) >= 2 else 0.0
+
+    for row, core in zip(rows_sorted, annotated_core, strict=False):
+        period_end = _as_date(row["period_end"])
+        filing_type = str(row.get("filing_type") or "")
+        for metric in ("revenue", "net_income", "fcf"):
+            val = _safe_num(row.get(metric))
+            if val is None:
+                continue
+            if filing_type == "10-Q":
+                quarter_hist[metric].append((period_end, val))
+            elif filing_type == "10-K":
+                annual_hist[metric].append((period_end, val))
+
+        current = {
+            "filed_at": _as_date(row["filed_at"]),
+            "ttm_revenue": _compute_ttm("revenue", period_end, filing_type),
+            "ttm_net_income": _compute_ttm("net_income", period_end, filing_type),
+            "ttm_fcf": _compute_ttm("fcf", period_end, filing_type),
+            "total_equity": float(_safe_num(row.get("total_equity")) or 0.0),
+            "gross_margin": float(core["gross_margin"]),
+            "operating_margin": float(core["operating_margin"]),
+            "revenue_growth": float(core["revenue_growth"]),
+        }
+        annotated.append(current)
+        current["gross_margin_stability_4q"] = _stability("gross_margin")
+        current["operating_margin_stability_4q"] = _stability("operating_margin")
+        current["revenue_growth_stability_4q"] = _stability("revenue_growth")
+
+    filed_ats = [r["filed_at"] for r in annotated]
+    out = {
+        "ttm_revenue": [],
+        "ttm_net_income": [],
+        "ttm_fcf": [],
+        "total_equity": [],
+        "gross_margin": [],
+        "operating_margin": [],
+        "revenue_growth": [],
+        "gross_margin_stability_4q": [],
+        "operating_margin_stability_4q": [],
+        "revenue_growth_stability_4q": [],
+    }
+    for d in as_of_dates:
+        idx = bisect.bisect_right(filed_ats, d) - 1
+        snap = annotated[idx] if idx >= 0 else None
+        for k in out:
+            out[k].append(float(snap[k]) if snap is not None else 0.0)
+    return out
+
+
+def build_universe_return_map(frames: list[TickerFrame]) -> dict:
+    """Equal-weight universe daily log return by trade date."""
+    by_date: dict = {}
+    for frame in frames:
+        prices = sorted(frame.prices, key=lambda r: _as_date(r["trade_date"]))
+        prev: float | None = None
+        for row in prices:
+            cur = float(row["adj_close"]) if row["adj_close"] is not None else None
+            if prev is not None and cur is not None and prev > 0 and cur > 0:
+                d = _as_date(row["trade_date"])
+                by_date.setdefault(d, []).append(math.log(cur / prev))
+            prev = cur
+    return {d: float(np.mean(vals)) for d, vals in by_date.items() if vals}
+
+
+def build_ticker_rows(
+    frame: TickerFrame,
+    grid: list,
+    max_stale_days: int = 7,
+    market_returns: dict | None = None,
+) -> list[dict]:
     """One feature+target row per grid date for a single ticker (raw, pre-demean).
 
     Mirrors dataset.assemble_ticker_samples_aligned: use the ticker's last bar at
@@ -180,6 +410,7 @@ def build_ticker_rows(frame: TickerFrame, grid: list, max_stale_days: int = 7) -
     trade_dates = [_as_date(r["trade_date"]) for r in prices]
     adj_close = [float(r["adj_close"]) if r["adj_close"] is not None else None for r in prices]
     volume = [float(r.get("volume") or 0.0) for r in prices]
+    shares = frame.shares_outstanding
 
     entries = []  # (grid_date, pos, bar_date)
     for g in grid:
@@ -197,16 +428,48 @@ def build_ticker_rows(frame: TickerFrame, grid: list, max_stale_days: int = 7) -
     bar_dates = [e[2] for e in entries]
     fund = _build_fundamental_series(bar_dates, frame.fundamentals)  # (k, 5)
     sent = _build_sentiment_series(bar_dates, frame.sentiment)       # (k, 2)
+    fund_ctx = _fundamental_context_asof(frame.fundamentals, bar_dates)
 
     rows: list[dict] = []
     for j, (g, pos, _bd) in enumerate(entries):
-        feats = _price_features(adj_close, volume, pos)
+        feats = _price_features(
+            adj_close,
+            volume,
+            trade_dates,
+            pos,
+            shares_outstanding=shares,
+            market_returns=market_returns,
+        )
         for i, name in enumerate(FUNDAMENTAL_FEATURES):
             feats[name] = float(fund[j, i])
+        # Keep experimental factors on the row for quick ablations, but don't
+        # feed them into the default production baseline unless they win.
+        price = adj_close[pos]
+        market_cap = (
+            float(price * shares)
+            if price is not None and shares is not None and price > 0 and shares > 0
+            else 0.0
+        )
+        feats["earnings_yield"] = _safe_ratio(fund_ctx["ttm_net_income"][j], market_cap)
+        feats["book_to_market"] = _safe_ratio(fund_ctx["total_equity"][j], market_cap)
+        feats["sales_to_price"] = _safe_ratio(fund_ctx["ttm_revenue"][j], market_cap)
+        feats["fcf_yield"] = _safe_ratio(fund_ctx["ttm_fcf"][j], market_cap)
+        feats["roe_ttm"] = _safe_ratio(fund_ctx["ttm_net_income"][j], fund_ctx["total_equity"][j])
+        feats["net_margin_ttm"] = _safe_ratio(fund_ctx["ttm_net_income"][j], fund_ctx["ttm_revenue"][j])
+        feats["fcf_margin_ttm"] = _safe_ratio(fund_ctx["ttm_fcf"][j], fund_ctx["ttm_revenue"][j])
+        feats["gross_margin_stability_4q"] = fund_ctx["gross_margin_stability_4q"][j]
+        feats["operating_margin_stability_4q"] = fund_ctx["operating_margin_stability_4q"][j]
+        feats["revenue_growth_stability_4q"] = fund_ctx["revenue_growth_stability_4q"][j]
         feats["sentiment_7d"] = float(sent[j, 0])
         feats["sentiment_14d"] = float(sent[j, 1])
         _labels, returns, mask = compute_targets(adj_close, pos)
-        row = {"date": g, "ticker_id": frame.ticker_id, **feats}
+        row = {
+            "date": g,
+            "ticker_id": frame.ticker_id,
+            "sector": frame.sector,
+            "industry": frame.industry,
+            **feats,
+        }
         for h in HORIZONS:
             row[f"r_{h}"] = returns[h]
             row[f"mask_{h}"] = mask[h]
@@ -219,13 +482,25 @@ def build_ticker_rows(frame: TickerFrame, grid: list, max_stale_days: int = 7) -
 # =============================================================
 
 
-def assemble_panel(frames: list[TickerFrame], grid: list, max_stale_days: int = 7):
+def assemble_panel(
+    frames: list[TickerFrame],
+    grid: list,
+    max_stale_days: int = 7,
+    market_returns: dict | None = None,
+):
     """Stack every ticker's rows into one tidy panel DataFrame (raw features)."""
     import pandas as pd
 
     rows: list[dict] = []
     for frame in frames:
-        rows.extend(build_ticker_rows(frame, grid, max_stale_days=max_stale_days))
+        rows.extend(
+            build_ticker_rows(
+                frame,
+                grid,
+                max_stale_days=max_stale_days,
+                market_returns=market_returns,
+            )
+        )
     return pd.DataFrame(rows)
 
 
@@ -244,7 +519,13 @@ def demean_cross_sectional(panel, medians: dict[str, dict]):
     return out
 
 
-def rank_normalize_features(panel, cols: list[str] = FEATURE_COLS):
+def rank_normalize_features(
+    panel,
+    cols: list[str] = FEATURE_COLS,
+    *,
+    industry_relative: bool = False,
+    min_group_size: int = 5,
+):
     """Map each feature to its within-date cross-sectional rank in [-1, 1].
 
     Point-in-time safe (only same-date rows) and robust to the heavy tails in raw
@@ -252,11 +533,31 @@ def rank_normalize_features(panel, cols: list[str] = FEATURE_COLS):
     """
     out = panel.copy()
     g = out.groupby("date")
+
+    def _norm(rank_s, count_s):
+        denom = (count_s - 1).clip(lower=1)
+        return np.where(count_s > 1, (rank_s - 1) / denom * 2 - 1, 0.0)
+
     for c in cols:
         r = g[c].rank(method="average")
         n = g[c].transform("count")
-        denom = (n - 1).clip(lower=1)
-        out[c] = np.where(n > 1, (r - 1) / denom * 2 - 1, 0.0)
+        out[c] = _norm(r, n)
+        if not industry_relative or c not in INDUSTRY_RELATIVE_FEATURES:
+            continue
+
+        sector_groups = out.groupby(["date", "sector"], dropna=False)
+        sr = sector_groups[c].rank(method="average")
+        sn = sector_groups[c].transform("count")
+        sector_norm = _norm(sr, sn)
+        use_sector = out["sector"].notna() & (sn >= min_group_size)
+        out[c] = np.where(use_sector, sector_norm, out[c])
+
+        industry_groups = out.groupby(["date", "industry"], dropna=False)
+        ir = industry_groups[c].rank(method="average")
+        inn = industry_groups[c].transform("count")
+        industry_norm = _norm(ir, inn)
+        use_industry = out["industry"].notna() & (inn >= min_group_size)
+        out[c] = np.where(use_industry, industry_norm, out[c])
     return out
 
 
@@ -291,15 +592,32 @@ def apply_target_modes(panel, n_buckets: int = 5):
 
 
 def prepare_panel(
-    frames: list[TickerFrame], grid: list, n_buckets: int = 5, max_stale_days: int = 7
+    frames: list[TickerFrame],
+    grid: list,
+    n_buckets: int = 5,
+    max_stale_days: int = 7,
+    rank_cols: list[str] | None = None,
+    industry_relative: bool = False,
+    min_group_size: int = 5,
 ):
     """Full pipeline: assemble → demean target → rank-normalize features → targets."""
-    panel = assemble_panel(frames, grid, max_stale_days=max_stale_days)
+    market_returns = build_universe_return_map(frames)
+    panel = assemble_panel(
+        frames,
+        grid,
+        max_stale_days=max_stale_days,
+        market_returns=market_returns,
+    )
     if panel.empty:
         return panel
     medians = cross_sectional_medians(frames)
     panel = demean_cross_sectional(panel, medians)
-    panel = rank_normalize_features(panel)
+    panel = rank_normalize_features(
+        panel,
+        cols=rank_cols or FEATURE_COLS,
+        industry_relative=industry_relative,
+        min_group_size=min_group_size,
+    )
     panel = apply_target_modes(panel, n_buckets)
     return panel
 

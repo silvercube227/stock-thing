@@ -15,11 +15,13 @@ import pandas as pd
 
 from backend.ml.dataset import TickerFrame, build_calendar_grid
 from backend.ml.gbm_baseline import (
+    EXPERIMENTAL_FEATURES,
     FEATURE_COLS,
     LGBMConfig,
     WalkForwardConfig,
     block_bootstrap_summary,
     build_ticker_rows,
+    build_universe_return_map,
     demean_cross_sectional,
     prepare_panel,
     rank_normalize_features,
@@ -94,6 +96,41 @@ def test_build_ticker_rows_skips_stale_grid_dates():
     assert max(r["date"] for r in rows) < date(2022, 1, 31)
 
 
+def test_build_ticker_rows_computes_beta_and_earnings_yield():
+    frame_a = make_frame(n_days=900, trend=0.0006, tid=1, vol_seed=1)
+    frame_b = make_frame(n_days=900, trend=0.0003, tid=2, vol_seed=2)
+    frame_a.shares_outstanding = 1_000_000
+    frame_a.sector = "Technology"
+    frame_a.industry = "Software"
+    frame_b.sector = "Technology"
+    frame_b.industry = "Hardware"
+    frame_a.fundamentals = [
+        {
+            "filed_at": date(2018, 3, 31),
+            "period_end": date(2017, 12, 31),
+            "filing_type": "10-K",
+            "net_income": 5_000_000,
+            "revenue": 20_000_000,
+            "gross_margin": 0.4,
+            "operating_margin": 0.2,
+            "total_debt": 1_000_000,
+            "total_equity": 10_000_000,
+            "fcf": 2_000_000,
+        }
+    ]
+    market_returns = build_universe_return_map([frame_a, frame_b])
+    rows = build_ticker_rows(frame_a, build_calendar_grid([frame_a, frame_b]), market_returns=market_returns)
+
+    assert rows
+    assert any(abs(r["beta_252d"]) > 1e-6 for r in rows)
+    assert any(r["earnings_yield"] > 0 for r in rows)
+    assert any(r["book_to_market"] > 0 for r in rows)
+    assert any(r["roe_ttm"] > 0 for r in rows)
+    for r in rows:
+        for c in EXPERIMENTAL_FEATURES:
+            assert np.isfinite(r[c]), f"{c} not finite"
+
+
 # =============================================================
 # Cross-sectional transforms
 # =============================================================
@@ -113,6 +150,23 @@ def test_rank_normalize_in_range_and_centered():
     assert abs(vals.mean()) < 1e-9          # symmetric ranks center at 0
     # Order is preserved (largest input -> largest normalized rank).
     assert np.argmax(vals) == 0 and np.argmin(vals) == 1
+
+
+def test_rank_normalize_can_use_industry_relative_groups():
+    df = pd.DataFrame({
+        "date": [date(2020, 1, 31)] * 4,
+        "sector": ["Tech"] * 4,
+        "industry": ["Software", "Software", "Hardware", "Hardware"],
+        "mom_1m": [1.0, 2.0, 100.0, 200.0],
+    })
+    out = rank_normalize_features(
+        df,
+        ["mom_1m"],
+        industry_relative=True,
+        min_group_size=2,
+    )
+    vals = out["mom_1m"].to_numpy()
+    assert np.allclose(vals, np.array([-1.0, 1.0, -1.0, 1.0]))
 
 
 def test_demean_subtracts_median_and_masks_missing():

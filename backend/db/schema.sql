@@ -29,7 +29,8 @@ create table if not exists tickers (
     active          boolean not null default true,
     added_at        timestamptz not null default now(),
     removed_at      timestamptz,
-    embedding_idx   integer not null unique default nextval('ticker_embedding_seq'),
+    embedding_idx        integer not null unique default nextval('ticker_embedding_seq'),
+    shares_outstanding   bigint,                     -- current shares; with adj_close gives historical market cap
     created_at      timestamptz not null default now(),
     updated_at      timestamptz not null default now()
 );
