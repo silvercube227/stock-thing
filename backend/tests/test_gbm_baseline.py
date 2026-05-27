@@ -195,7 +195,20 @@ def test_score_current_cross_section_clips_rank_predictions():
 
     assert [r["ticker_id"] for r in rows] == [1, 3]
     assert [r["relative_rank"] for r in rows] == [0.0, 1.0]
-    assert [r["confidence"] for r in rows] == [1.0, 1.0]
+    # Confidence is no longer computed here — it's rank stability, filled in run()
+    # from the DB history of prior scoring dates.
+    assert "confidence" not in rows[0]
+
+
+def test_rank_stability():
+    from backend.ml.gbm_inference import rank_stability
+
+    assert rank_stability([]) is None           # no history
+    assert rank_stability([0.5]) is None         # single scoring date -> undefined
+    assert rank_stability([0.8, 0.8, 0.8]) < 1e-9  # perfectly consistent
+    assert abs(rank_stability([0.2, 0.8]) - 0.3) < 1e-9  # population std = 0.3
+    # higher dispersion => larger std
+    assert rank_stability([0.1, 0.9, 0.5]) > rank_stability([0.45, 0.55, 0.5])
 
 
 # =============================================================

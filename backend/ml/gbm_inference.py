@@ -104,9 +104,53 @@ def score_current_cross_section(
                 "ticker_id": int(ticker_id),
                 "horizon": h,
                 "relative_rank": float(rank),
-                "confidence": float(abs(rank - 0.5) * 2.0),
             })
     return rows
+
+
+def rank_stability(ranks: list[float]) -> float | None:
+    """Std of predicted percentile rank across the last few scoring dates.
+
+    Low std => the model has been ranking this name consistently; high std => its
+    relative view of the name has been moving around. Returns None when fewer than
+    two scoring dates are available (stability undefined). This is stored in
+    predictions.confidence in place of the old distance-from-median heuristic.
+    Population std (ddof=0) so it stays defined for two points.
+    """
+    vals = [float(r) for r in ranks if r is not None]
+    if len(vals) < 2:
+        return None
+    return float(np.std(np.asarray(vals, dtype=float)))
+
+
+async def fetch_prior_ranks(
+    pool, ticker_ids, horizons, before: date, n_prior: int = 2
+) -> dict[tuple[int, str], list[float]]:
+    """Most-recent prior predicted ranks per (ticker_id, horizon), newest first.
+
+    One value per distinct prior scoring date (the latest model that scored that
+    date), at most `n_prior` of them, all strictly before `before`.
+    """
+    rows = await pool.fetch(
+        """
+        select distinct on (ticker_id, horizon, as_of_date)
+               ticker_id, horizon, as_of_date, direction_prob
+          from predictions
+         where horizon = any($1::text[]) and ticker_id = any($2::bigint[])
+           and as_of_date < $3
+         order by ticker_id, horizon, as_of_date desc, created_at desc
+        """,
+        list(horizons),
+        [int(t) for t in ticker_ids],
+        before,
+    )
+    out: dict[tuple[int, str], list[float]] = {}
+    for r in rows:
+        key = (int(r["ticker_id"]), r["horizon"])
+        lst = out.setdefault(key, [])
+        if len(lst) < n_prior and r["direction_prob"] is not None:
+            lst.append(float(r["direction_prob"]))
+    return out
 
 
 def save_bundle(path: Path, bundle: dict) -> str:
@@ -210,6 +254,10 @@ async def run(args) -> None:
         config = {
             "model_type": "lightgbm_gbdt_ranker",
             "score_semantics": "direction_prob stores clipped predicted percentile rank",
+            "confidence_semantics": (
+                "rank stability: std of predicted rank over the last up-to-3 scoring "
+                "dates (lower = steadier; null if <2 dates available)"
+            ),
             "horizons": list(horizons),
             "target_mode": args.target,
             "feature_cols": FEATURE_COLS,
@@ -217,6 +265,14 @@ async def run(args) -> None:
             "train_windows": train_windows_json,
             "as_of": as_of.isoformat(),
         }
+        # Rank stability: std of each name's predicted rank across the last
+        # up-to-3 scoring dates (this run + the two most recent prior dates).
+        ticker_ids = sorted({r["ticker_id"] for r in prediction_rows})
+        prior = await fetch_prior_ranks(pool, ticker_ids, horizons, as_of)
+        for r in prediction_rows:
+            series = prior.get((r["ticker_id"], r["horizon"]), []) + [r["relative_rank"]]
+            r["confidence"] = rank_stability(series)
+
         sha = save_bundle(weights_path, artifact)
         await insert_model_version_with_id(
             pool,
