@@ -38,6 +38,10 @@ models/*.pkl
 
 # --- Data caches ---
 data/
+
+# --- Runtime logs ---
+logs/*.log
+logs/*.err
 *.parquet
 *.feather
 

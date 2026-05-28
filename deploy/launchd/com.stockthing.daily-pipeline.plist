@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <key>Label</key>
+    <string>com.stockthing.daily-pipeline</string>
+
+    <!-- Run the daily orchestrator with the repo venv's Python.
+         WorkingDirectory is the repo root so `python -m backend.*` imports work. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/bennettye/Documents/GitHub/stock-thing/stockproject/bin/python</string>
+        <string>-m</string>
+        <string>backend.jobs.daily_pipeline</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/bennettye/Documents/GitHub/stock-thing</string>
+
+    <!-- Fire Mon–Fri at 17:30 local time (well after NYSE 16:00 ET close for any
+         US timezone). The script exits 0 immediately on non-trading days (holidays)
+         so launchd never treats a market holiday as a failure. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key><integer>1</integer>
+            <key>Hour</key><integer>17</integer>
+            <key>Minute</key><integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>2</integer>
+            <key>Hour</key><integer>17</integer>
+            <key>Minute</key><integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>3</integer>
+            <key>Hour</key><integer>17</integer>
+            <key>Minute</key><integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>4</integer>
+            <key>Hour</key><integer>17</integer>
+            <key>Minute</key><integer>30</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key><integer>5</integer>
+            <key>Hour</key><integer>17</integer>
+            <key>Minute</key><integer>30</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/bennettye/Documents/GitHub/stock-thing/logs/daily_pipeline.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/bennettye/Documents/GitHub/stock-thing/logs/daily_pipeline.err</string>
+
+    <!-- Do not run immediately when loaded. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Prevent rapid re-launch if the job exits non-zero repeatedly. -->
+    <key>ThrottleInterval</key>
+    <integer>3600</integer>
+
+</dict>
+</plist>

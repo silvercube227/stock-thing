@@ -1,6 +1,6 @@
 # stock-thing
 
-Personal long-only stock and ETF trend prediction app. See [CLAUDE.md](./CLAUDE.md) for high-level architecture.
+Personal long-only stock and ETF trend prediction app. 
 
 ## Repo layout
 
@@ -47,6 +47,27 @@ npm run dev  # http://localhost:3000
    select symbol, cik, embedding_idx from tickers
     where asset_type = 'equity' order by embedding_idx;     -- CIKs populated
    ```
+
+## Daily pipeline (launchd)
+
+The pipeline runs automatically after NYSE close via a macOS LaunchAgent.
+
+```bash
+# Activate (fires Mon–Fri at 17:30 local time)
+cp deploy/launchd/com.stockthing.daily-pipeline.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.stockthing.daily-pipeline.plist
+
+# Deactivate
+launchctl unload ~/Library/LaunchAgents/com.stockthing.daily-pipeline.plist
+
+# Run manually
+python -m backend.jobs.daily_pipeline
+
+# Watch logs
+tail -f logs/daily_pipeline.log
+```
+
+Holidays are handled automatically — the script checks the NYSE calendar and exits cleanly on non-trading days. Stages: prices (daily) → sentiment/FinBERT (daily) → EDGAR fundamentals (Fridays) → GBM re-score (Fridays + month-starts).
 
 ## Build sequence
 
