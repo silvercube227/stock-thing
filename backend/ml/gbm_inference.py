@@ -29,6 +29,8 @@ from backend.ingestion.db import pool_context
 from backend.ml.dataset import build_calendar_grid, load_frames
 from backend.ml.gbm_baseline import (
     FEATURE_COLS,
+    PRODUCTION_HORIZON_SPECS,
+    HorizonSpec,
     LGBMConfig,
     fit_lgbm_model,
     prepare_panel,
@@ -42,6 +44,11 @@ def _target_col(horizon: str, target_mode: str) -> str:
     return f"r_{horizon}" if target_mode == "return" else f"y_{horizon}_{target_mode}"
 
 
+def _spec_feature_cols(spec: HorizonSpec) -> list[str]:
+    """Per-horizon feature list — falls back to production FEATURE_COLS."""
+    return spec.feature_cols if spec.feature_cols is not None else list(FEATURE_COLS)
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -52,27 +59,37 @@ def _sha256(path: Path) -> str:
 
 def fit_horizon_models(
     panel,
-    horizons: tuple[str, ...],
-    target_mode: str,
-    lgb_cfg: LGBMConfig,
+    specs: dict[str, HorizonSpec],
     seed: int,
     as_of: date,
 ):
-    """Fit one LightGBM model per horizon on labeled rows before `as_of`."""
-    models = {}
-    train_windows = {}
+    """Fit one LightGBM model per horizon, each with its own spec.
+
+    `specs` maps horizon ("1M"/"3M"/"6M"/"1Y") to a `HorizonSpec` carrying its
+    target_mode, hyperparameters, and optional feature override. The horizons
+    keys define which models to fit — that's also the loop order. Each fit
+    filters the panel on `mask_{h}` and the per-spec target's `notna()`, so
+    horizons whose target is sparse won't pollute the training set of others.
+    """
+    models: dict[str, object] = {}
+    train_windows: dict[str, dict] = {}
     trained_ids: set[int] = set()
-    for i, h in enumerate(horizons):
+    for i, (h, spec) in enumerate(specs.items()):
         m_col = f"mask_{h}"
-        t_col = _target_col(h, target_mode)
+        t_col = _target_col(h, spec.target_mode)
+        cols = _spec_feature_cols(spec)
         train = panel[
             (panel["date"] < as_of)
             & panel[m_col].astype(bool)
             & panel[t_col].notna()
         ]
         if train.empty:
-            raise ValueError(f"no labeled training rows for {h} target={target_mode}")
-        models[h] = fit_lgbm_model(train, t_col, lgb_cfg, seed=seed + i, shuffle=False)
+            raise ValueError(
+                f"no labeled training rows for {h} target={spec.target_mode}"
+            )
+        models[h] = fit_lgbm_model(
+            train, t_col, spec.lgb_cfg, seed=seed + i, shuffle=False, feature_cols=cols
+        )
         train_windows[h] = {
             "start": min(train["date"]),
             "end": max(train["date"]),
@@ -86,19 +103,45 @@ def fit_horizon_models(
 def score_current_cross_section(
     panel,
     models: dict,
-    horizons: tuple[str, ...],
+    specs: dict[str, HorizonSpec] | tuple[str, ...],
     as_of: date,
     active_ids: set[int],
 ):
-    """Return prediction dicts for active tickers present in the `as_of` cross-section."""
+    """Return prediction dicts for active tickers present in the `as_of` cross-section.
+
+    `specs` accepts either the new per-horizon `HorizonSpec` mapping (so each
+    model predicts on its own `feature_cols`) or — for backward compatibility
+    with the existing test — a plain horizons tuple, in which case all horizons
+    predict on the default `FEATURE_COLS`.
+    """
     current = panel[(panel["date"] == as_of) & panel["ticker_id"].isin(active_ids)].copy()
     if current.empty:
         raise ValueError(f"no active ticker rows available for as_of={as_of}")
 
+    if isinstance(specs, dict):
+        iter_pairs = [(h, _spec_feature_cols(s)) for h, s in specs.items()]
+    else:
+        iter_pairs = [(h, list(FEATURE_COLS)) for h in specs]
+
+    import pandas as pd
+
     rows: list[dict] = []
-    for h in horizons:
-        preds = models[h].predict(current[FEATURE_COLS])
-        ranks = np.clip(np.asarray(preds, dtype=float), 0.0, 1.0)
+    n = len(current)
+    for h, cols in iter_pairs:
+        # Predictions are mapped to within-cross-section percentile rank in [0, 1]
+        # before storage. The previous "clip to [0,1]" path worked for `rank`-mode
+        # training where preds were already roughly in that range, but a
+        # regression target like `beta_resid` outputs log returns (~[-0.05, +0.1])
+        # which would mostly clip to 0 and destroy the ranking. Rank-transforming
+        # makes the dashboard semantics ("relative rank") consistent across all
+        # target modes — pandas average-rank handles ties; single-name
+        # cross-sections collapse to 0.5.
+        preds = np.asarray(models[h].predict(current[cols]), dtype=float)
+        if n > 1:
+            ranks_raw = pd.Series(preds).rank(method="average").to_numpy()
+            ranks = (ranks_raw - 1.0) / (n - 1)
+        else:
+            ranks = np.full_like(preds, 0.5, dtype=float)
         for ticker_id, rank in zip(current["ticker_id"].to_numpy(), ranks, strict=True):
             rows.append({
                 "ticker_id": int(ticker_id),
@@ -191,13 +234,46 @@ async def upsert_predictions(
     )
 
 
+def _serialize_spec(spec: HorizonSpec) -> dict:
+    """JSON-safe view of a HorizonSpec for the model-version `config` column."""
+    return {
+        "target_mode": spec.target_mode,
+        "lgb_cfg": asdict(spec.lgb_cfg),
+        "feature_cols": _spec_feature_cols(spec),
+    }
+
+
+def build_specs_from_args(args) -> dict[str, HorizonSpec]:
+    """Resolve per-horizon training specs from CLI args.
+
+    Resolution order:
+      1. Start from `PRODUCTION_HORIZON_SPECS` (the validated defaults).
+      2. If `--target X` is given, override target_mode for every requested
+         horizon (the legacy single-mode behavior, useful for ablations).
+      3. Restrict to `args.horizons` — only those models get trained today.
+    Per-horizon hyperparameter / feature overrides are not exposed on the CLI
+    yet; edit `PRODUCTION_HORIZON_SPECS` directly when promoting a sweep result.
+    """
+    base: dict[str, HorizonSpec] = {}
+    for h in args.horizons:
+        spec = PRODUCTION_HORIZON_SPECS.get(h, HorizonSpec())
+        if args.target is not None:
+            spec = HorizonSpec(
+                target_mode=args.target,
+                lgb_cfg=spec.lgb_cfg,
+                feature_cols=spec.feature_cols,
+            )
+        base[h] = spec
+    return base
+
+
 async def run(args) -> None:
     horizons = tuple(args.horizons)
     invalid = sorted(set(horizons) - set(HORIZONS))
     if invalid:
         raise SystemExit(f"invalid horizon(s): {', '.join(invalid)}")
 
-    lgb_cfg = LGBMConfig()
+    specs = build_specs_from_args(args)
     async with pool_context() as pool:
         frames = await load_frames(pool)
         if not frames:
@@ -214,19 +290,20 @@ async def run(args) -> None:
             raise SystemExit("empty panel (not enough history?)")
 
         models, train_windows, trained_ids = fit_horizon_models(
-            panel, horizons, args.target, lgb_cfg, args.seed, as_of
+            panel, specs, args.seed, as_of
         )
-        prediction_rows = score_current_cross_section(panel, models, horizons, as_of, active_ids)
+        prediction_rows = score_current_cross_section(panel, models, specs, as_of, active_ids)
 
+        targets_str = ",".join(f"{h}={specs[h].target_mode}" for h in horizons)
         print(
-            f"as_of={as_of} target={args.target} horizons={','.join(horizons)} "
-            f"predictions={len(prediction_rows)}"
+            f"as_of={as_of} targets={targets_str} predictions={len(prediction_rows)}"
         )
         for h in horizons:
             ranks = [r["relative_rank"] for r in prediction_rows if r["horizon"] == h]
             print(
-                f"  {h}: train_rows={train_windows[h]['rows']} "
-                f"train_end={train_windows[h]['end']} "
+                f"  {h}: target={specs[h].target_mode}  "
+                f"train_rows={train_windows[h]['rows']}  "
+                f"train_end={train_windows[h]['end']}  "
                 f"rank_range=[{min(ranks):.3f}, {max(ranks):.3f}]"
             )
 
@@ -241,27 +318,28 @@ async def run(args) -> None:
             h: {**v, "start": v["start"].isoformat(), "end": v["end"].isoformat()}
             for h, v in train_windows.items()
         }
+        serialized_specs = {h: _serialize_spec(s) for h, s in specs.items()}
         artifact = {
             "model_type": "lightgbm_gbdt_ranker",
             "models": models,
             "horizons": horizons,
-            "target_mode": args.target,
-            "feature_cols": FEATURE_COLS,
-            "lgbm_config": asdict(lgb_cfg),
+            "specs": serialized_specs,           # per-horizon target / cfg / features
             "train_windows": train_windows_json,
             "as_of": as_of.isoformat(),
         }
         config = {
             "model_type": "lightgbm_gbdt_ranker",
-            "score_semantics": "direction_prob stores clipped predicted percentile rank",
+            "score_semantics": (
+                "direction_prob stores within-cross-section percentile rank of the "
+                "model's prediction (rank-transformed at score time so semantics are "
+                "consistent across target modes)"
+            ),
             "confidence_semantics": (
                 "rank stability: std of predicted rank over the last up-to-3 scoring "
                 "dates (lower = steadier; null if <2 dates available)"
             ),
             "horizons": list(horizons),
-            "target_mode": args.target,
-            "feature_cols": FEATURE_COLS,
-            "lgbm_config": asdict(lgb_cfg),
+            "specs": serialized_specs,
             "train_windows": train_windows_json,
             "as_of": as_of.isoformat(),
         }
@@ -330,8 +408,14 @@ def main() -> None:
     p.add_argument("--as-of", help="score this date (default = latest month/grid date)")
     p.add_argument("--horizons", nargs="+", default=list(DEFAULT_INFERENCE_HORIZONS),
                    choices=list(HORIZONS))
-    p.add_argument("--target", default="rank", choices=["return", "rank", "quantile"],
-                   help="training target transform; rank is recommended for dashboard inference")
+    p.add_argument(
+        "--target", default=None,
+        choices=["return", "rank", "quantile", "sector_return", "beta_resid"],
+        help="legacy global target override — sets the training target for EVERY "
+             "horizon in --horizons to this mode. By default each horizon uses its "
+             "own validated target from PRODUCTION_HORIZON_SPECS in gbm_baseline.py "
+             "(currently 1M/3M/6M=rank, 1Y=beta_resid).",
+    )
     p.add_argument("--n-buckets", type=int, default=5)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--dry-run", action="store_true")

@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     sec_edgar_user_agent: str = Field(default="stock-thing local dev contact@example.com")
 
     models_dir: Path = MODELS_DIR
+    # On-disk cache of load_frames() pulls, so repeated local experiment/backtest
+    # runs read frames from disk instead of re-pulling full history through the
+    # Supabase pooler (the dominant Shared-Pooler egress source). Experiments
+    # only — production inference always pulls fresh.
+    frame_cache_dir: Path = REPO_ROOT / ".frame_cache"
     api_host: str = Field(default="127.0.0.1")
     api_port: int = Field(default=8000)
 

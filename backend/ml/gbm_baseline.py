@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -48,7 +48,7 @@ from backend.ml.dataset import (
     build_calendar_grid,
     compute_targets,
     cross_sectional_medians,
-    load_frames,
+    load_frames_cached,
 )
 from backend.ml.features import (
     SEQUENCE_LENGTH,
@@ -78,10 +78,32 @@ QUALITY_FEATURES = [
     "gross_margin_stability_4q", "operating_margin_stability_4q",
     "revenue_growth_stability_4q",
 ]
+# Test-4 phase-1 experimental packs (opt-in via CLI; not in production FEATURE_COLS).
+# resid_mom_*  : momentum after stripping out beta_252 * market move (structural mom)
+# mom_accel_3_6: 3M vs 6M momentum — captures inflection vs decay
+# mom_consistency_6m: fraction of last 6 monthly returns positive (smoothness)
+# industry_neutral_mom_12_1: mom_12_1 minus within-(date, industry) median (panel-level)
+RESIDUAL_MOM_FEATURES = [
+    "resid_mom_12_1", "resid_mom_6m", "mom_accel_3_6",
+    "mom_consistency_6m", "industry_neutral_mom_12_1",
+]
+# Filing-drift / surprise reaction features, derived purely from prices + filed_at.
+EARNINGS_REACTION_FEATURES = [
+    "filing_drift_30d", "filing_surprise_3d",
+    "filings_recency_days", "filings_in_90d",
+]
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + SENTIMENT_FEATURES
-EXPERIMENTAL_FEATURES = VALUATION_FEATURES + QUALITY_FEATURES
-INDUSTRY_RELATIVE_FEATURES = PRICE_FEATURES + FUNDAMENTAL_FEATURES + EXPERIMENTAL_FEATURES
+EXPERIMENTAL_FEATURES = (
+    VALUATION_FEATURES + QUALITY_FEATURES + RESIDUAL_MOM_FEATURES + EARNINGS_REACTION_FEATURES
+)
+# The industry-relative *normalization* sweep (which hurt in test 3); residual /
+# earnings-reaction features already adjust for market or filing context so they
+# stay out of this list — double-grouping would re-shrink whatever signal they
+# carry.
+INDUSTRY_RELATIVE_FEATURES = (
+    PRICE_FEATURES + FUNDAMENTAL_FEATURES + VALUATION_FEATURES + QUALITY_FEATURES
+)
 
 
 # =============================================================
@@ -115,6 +137,50 @@ class WalkForwardConfig:
     min_train_months: int = 36           # don't test until this much history exists
     max_train_months: int | None = None  # None = expanding window; int = rolling
     min_names: int = 30                  # skip a test cross-section thinner than this
+
+
+@dataclass
+class HorizonSpec:
+    """Per-horizon training spec — target, hyperparameters, optional feature override.
+
+    Each horizon trains its own LightGBM model (one regressor per H), so the spec
+    is what makes "tune each horizon separately" a real workflow. The defaults
+    here are deliberately the universe-relative baseline; production overrides
+    live in `PRODUCTION_HORIZON_SPECS` below, which is the single source of truth
+    consumed by the inference path.
+
+    `feature_cols=None` means "use the production FEATURE_COLS at fit and predict
+    time" — keeping per-horizon feature overrides optional so we only carry them
+    once an experiment promotes a non-default pack for a specific H.
+    """
+
+    target_mode: str = "return"
+    lgb_cfg: LGBMConfig = field(default_factory=LGBMConfig)
+    feature_cols: list[str] | None = None
+
+
+# Per-horizon production training defaults. Update this dict — and only this dict
+# — when a sweep promotes a new target / hyperparameter / feature pack. The
+# inference path reads it as its starting config; the walk-forward sweep tool
+# (this file's CLI) tests *one* horizon at a time and is unaffected.
+#
+# Source of current values:
+#   - 1M / 3M / 6M: `rank` — the historical inference default. NOT directly
+#     compared against `return`/`sector_return`/`beta_resid` in any sweep, so we
+#     preserve it rather than silently switch to a sweep-validated target. To
+#     change, sweep against `rank` baseline at these horizons first.
+#   - 1Y: `beta_resid` — test-4 phase-4 sweep: ICIR 0.552 → 0.685, Δ +0.133;
+#     hit rate 0.742 → 0.863. Stripping market beta from the training target
+#     forces the model away from cheap "high beta = high 1Y return" and toward
+#     idiosyncratic alpha. The asymmetry is structural: beta noise dominates 1Y
+#     return variance but is smaller relative to 3M dispersion, and beta_252 is
+#     noisier relative to short-horizon market moves.
+PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
+    "1M": HorizonSpec(target_mode="rank"),
+    "3M": HorizonSpec(target_mode="rank"),
+    "6M": HorizonSpec(target_mode="rank"),
+    "1Y": HorizonSpec(target_mode="beta_resid"),
+}
 
 
 # =============================================================
@@ -202,6 +268,40 @@ def _price_features(
     v_recent = float(v[-20:].mean()) if v[-20:].size else 0.0
     v_long = float(v.mean()) if v.size else 0.0
     feats["vol_trend"] = math.log(v_recent / v_long) if v_recent > 0 and v_long > 0 else 0.0
+
+    # --- Test-4 phase-1: residual / structural momentum (opt-in pack) ---
+    # market_mom_* is the universe cumulative log return over the same trailing
+    # window as the matching mom_* feature. When market_returns is missing we
+    # fall back to zero, which makes resid_mom_* collapse to mom_* — the test
+    # in test_gbm_baseline.py exercises that path.
+    def _sum_mkt(start_idx: int, end_idx: int) -> float:
+        """Sum of universe log returns over (start_idx, end_idx] in trade_dates."""
+        if market_returns is None or end_idx <= start_idx:
+            return 0.0
+        total = 0.0
+        for k in range(start_idx + 1, end_idx + 1):
+            r = market_returns.get(trade_dates[k])
+            if r is not None and np.isfinite(r):
+                total += float(r)
+        return total
+
+    mkt_12_1 = _sum_mkt(pos - 252, pos - 21)
+    mkt_6m = _sum_mkt(pos - 126, pos)
+    beta = feats["beta_252d"]
+    feats["resid_mom_12_1"] = feats["mom_12_1"] - beta * mkt_12_1
+    feats["resid_mom_6m"] = feats["mom_6m"] - beta * mkt_6m
+    feats["mom_accel_3_6"] = feats["mom_3m"] - feats["mom_6m"]
+
+    monthly_pos = 0
+    n_monthly = 0
+    for i in range(1, 7):
+        p_end = adj_close[pos - 21 * (i - 1)]
+        p_start = adj_close[pos - 21 * i]
+        if p_end and p_start and p_end > 0 and p_start > 0:
+            if math.log(p_end / p_start) > 0:
+                monthly_pos += 1
+            n_monthly += 1
+    feats["mom_consistency_6m"] = float(monthly_pos / n_monthly) if n_monthly else 0.0
     return feats
 
 
@@ -371,6 +471,106 @@ def _fundamental_context_asof(fund_rows: list[dict], as_of_dates: list) -> dict[
     return out
 
 
+def _earnings_reaction_asof(
+    fund_rows: list[dict],
+    bar_positions: list[int],
+    bar_dates: list,
+    trade_dates: list,
+    adj_close: list[float | None],
+    market_returns: dict | None,
+) -> dict[str, list[float]]:
+    """Per-grid-date filing-reaction features built from prices + filed_at only.
+
+    For each grid date we look back to the most recent filing on/before that date
+    and summarize a few aspects of its market reaction:
+      filing_surprise_3d  — abnormal return over [filed_at-1, filed_at+1] trading
+                            days (proxy for what the market thought of the print).
+      filing_drift_30d    — abnormal return from the trading day after filed_at
+                            out to +30 trading days (or up to the grid date, if
+                            fewer days have elapsed). Post-earnings drift signal.
+      filings_recency_days — calendar days since the latest filing.
+      filings_in_90d      — count of filings within the trailing 90 calendar days.
+
+    PIT-safe by construction: we only ever index `adj_close` up to `pos` (the
+    grid-date bar position).
+    """
+    import bisect
+    from datetime import timedelta
+
+    n = len(bar_dates)
+    out: dict[str, list[float]] = {
+        "filing_drift_30d": [0.0] * n,
+        "filing_surprise_3d": [0.0] * n,
+        "filings_recency_days": [0.0] * n,
+        "filings_in_90d": [0.0] * n,
+    }
+    if not fund_rows or not trade_dates:
+        return out
+
+    filings_sorted = sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))
+    filed_ats = [_as_date(r["filed_at"]) for r in filings_sorted]
+
+    def _sum_mkt(start_idx: int, end_idx: int) -> float:
+        if market_returns is None or end_idx <= start_idx:
+            return 0.0
+        total = 0.0
+        for k in range(start_idx + 1, end_idx + 1):
+            r = market_returns.get(trade_dates[k])
+            if r is not None and np.isfinite(r):
+                total += float(r)
+        return total
+
+    for j, g in enumerate(bar_dates):
+        pos = bar_positions[j]
+        idx = bisect.bisect_right(filed_ats, g) - 1
+        if idx < 0:
+            continue
+        filed_at = filed_ats[idx]
+        # First trading day on or after filed_at (bisect_left returns the next
+        # bar when filed_at falls on a weekend/holiday; if equal to a trading
+        # day, that day itself is selected). Bound by pos so we never peek past
+        # the grid-date bar — PIT guard.
+        file_pos = bisect.bisect_left(trade_dates, filed_at)
+        if file_pos > pos:
+            # Filing recorded ahead of the price series for this grid date — can't
+            # measure reaction yet; recency + count are still valid.
+            out["filings_recency_days"][j] = float((g - filed_at).days)
+            cutoff = g - timedelta(days=90)
+            lo = bisect.bisect_left(filed_ats, cutoff)
+            out["filings_in_90d"][j] = float(idx + 1 - lo)
+            continue
+
+        out["filings_recency_days"][j] = float((g - filed_at).days)
+        cutoff = g - timedelta(days=90)
+        lo = bisect.bisect_left(filed_ats, cutoff)
+        out["filings_in_90d"][j] = float(idx + 1 - lo)
+
+        # 3-day surprise window: log return [file_pos-1, file_pos+1], minus market.
+        start_s = max(file_pos - 1, 0)
+        end_s = min(file_pos + 1, pos)
+        if end_s > start_s:
+            p_a = adj_close[start_s]
+            p_b = adj_close[end_s]
+            if p_a and p_b and p_a > 0 and p_b > 0:
+                out["filing_surprise_3d"][j] = float(
+                    math.log(p_b / p_a) - _sum_mkt(start_s, end_s)
+                )
+
+        # Post-filing drift: [file_pos+1, file_pos+31] or shorter if too fresh.
+        start_d = file_pos + 1
+        end_d = min(start_d + 30, pos)
+        # Require ≥ 5 trading days of post-filing data so the value isn't noise.
+        if start_d < len(adj_close) and end_d - start_d >= 5:
+            p_a = adj_close[start_d]
+            p_b = adj_close[end_d]
+            if p_a and p_b and p_a > 0 and p_b > 0:
+                out["filing_drift_30d"][j] = float(
+                    math.log(p_b / p_a) - _sum_mkt(start_d, end_d)
+                )
+
+    return out
+
+
 def build_universe_return_map(frames: list[TickerFrame]) -> dict:
     """Equal-weight universe daily log return by trade date."""
     by_date: dict = {}
@@ -384,6 +584,48 @@ def build_universe_return_map(frames: list[TickerFrame]) -> dict:
                 by_date.setdefault(d, []).append(math.log(cur / prev))
             prev = cur
     return {d: float(np.mean(vals)) for d, vals in by_date.items() if vals}
+
+
+def build_market_horizon_returns(
+    market_returns: dict,
+    grid: list,
+    horizons: tuple[str, ...] = HORIZONS,
+) -> dict[str, dict]:
+    """For each (horizon, grid_date), the universe log return over the next H
+    trading days starting at the first trade_date on or after grid_date.
+
+    Used by the `beta_resid` target (`y_h = r_h - beta_252 * market_r_h`) — the
+    market-return leg must be sampled on the same calendar window the ticker's
+    horizon return spans. Cumsum over the sorted daily series and slice by
+    bisect index, so this is O(len(grid)) per horizon after a one-time sort.
+
+    Returns: `{horizon: {grid_date: float}}`. Grid dates whose forward window
+    runs past the last trade_date are dropped (NaN downstream where used).
+    """
+    import bisect
+
+    out: dict[str, dict] = {h: {} for h in horizons}
+    if not market_returns:
+        return out
+
+    sorted_dates = sorted(market_returns.keys())
+    daily = np.asarray([float(market_returns[d]) for d in sorted_dates], dtype=float)
+    # cumsum[i] = sum of daily[0..i-1]; cumsum[end] - cumsum[start] = window log return.
+    cumsum = np.concatenate(([0.0], np.cumsum(daily)))
+    n = len(sorted_dates)
+
+    for h in horizons:
+        H = HORIZON_TRADING_DAYS[h]
+        bucket = out[h]
+        for g in grid:
+            # First trade_date on or after g — beta_resid is computed forward from
+            # the grid date, just like the ticker's forward return.
+            start_idx = bisect.bisect_left(sorted_dates, g)
+            end_idx = start_idx + H
+            if end_idx >= n + 1:
+                continue
+            bucket[g] = float(cumsum[end_idx] - cumsum[start_idx])
+    return out
 
 
 def build_ticker_rows(
@@ -426,9 +668,18 @@ def build_ticker_rows(
         return []
 
     bar_dates = [e[2] for e in entries]
+    bar_positions = [e[1] for e in entries]
     fund = _build_fundamental_series(bar_dates, frame.fundamentals)  # (k, 5)
     sent = _build_sentiment_series(bar_dates, frame.sentiment)       # (k, 2)
     fund_ctx = _fundamental_context_asof(frame.fundamentals, bar_dates)
+    reaction = _earnings_reaction_asof(
+        frame.fundamentals,
+        bar_positions,
+        bar_dates,
+        trade_dates,
+        adj_close,
+        market_returns,
+    )
 
     rows: list[dict] = []
     for j, (g, pos, _bd) in enumerate(entries):
@@ -460,6 +711,12 @@ def build_ticker_rows(
         feats["gross_margin_stability_4q"] = fund_ctx["gross_margin_stability_4q"][j]
         feats["operating_margin_stability_4q"] = fund_ctx["operating_margin_stability_4q"][j]
         feats["revenue_growth_stability_4q"] = fund_ctx["revenue_growth_stability_4q"][j]
+        # Earnings-reaction features are precomputed once per ticker above.
+        for name in EARNINGS_REACTION_FEATURES:
+            feats[name] = reaction[name][j]
+        # Panel-level demean overwrites this in `prepare_panel`; until then leave
+        # it equal to mom_12_1 so single-ticker callers see a finite value.
+        feats["industry_neutral_mom_12_1"] = feats["mom_12_1"]
         feats["sentiment_7d"] = float(sent[j, 0])
         feats["sentiment_14d"] = float(sent[j, 1])
         _labels, returns, mask = compute_targets(adj_close, pos)
@@ -519,6 +776,32 @@ def demean_cross_sectional(panel, medians: dict[str, dict]):
     return out
 
 
+def add_industry_neutral_momentum(panel, min_group_size: int = 5):
+    """Subtract within-(date, industry) median from mom_12_1.
+
+    Run after `assemble_panel` and before `rank_normalize_features` so the
+    industry-neutral momentum factor still gets per-date rank-normalized in the
+    full universe — different failure mode than industry-relative *normalization*
+    (which hurt at every horizon), because the rest of the feature set stays in
+    universe space.
+    """
+    if panel.empty or "mom_12_1" not in panel.columns:
+        return panel
+    out = panel.copy()
+    if "industry" not in out.columns:
+        out["industry_neutral_mom_12_1"] = out["mom_12_1"].astype(float)
+        return out
+    grp = out.groupby(["date", "industry"], dropna=False)
+    medians = grp["mom_12_1"].transform("median")
+    counts = grp["mom_12_1"].transform("count")
+    use_group = out["industry"].notna() & (counts >= min_group_size)
+    base = out["mom_12_1"].astype(float)
+    out["industry_neutral_mom_12_1"] = np.where(
+        use_group, base - medians.fillna(0.0), base
+    )
+    return out
+
+
 def rank_normalize_features(
     panel,
     cols: list[str] = FEATURE_COLS,
@@ -561,20 +844,39 @@ def rank_normalize_features(
     return out
 
 
-def apply_target_modes(panel, n_buckets: int = 5):
+def apply_target_modes(
+    panel,
+    n_buckets: int = 5,
+    market_horizon_returns: dict | None = None,
+    sector_min_group_size: int = 5,
+):
     """Add per-horizon training-target variants computed cross-sectionally per date.
 
     For each horizon the demeaned forward return `r_{h}` (still the SCORING target)
-    gets three trainable transforms, all relabelings of the same future info (no
+    gets five trainable transforms, all relabelings of the same future info (no
     feature leak, same class as the existing median-demean):
-      y_{h}_return   = r_{h} (raw demeaned log return; outlier-heavy)
-      y_{h}_rank     = within-date percentile of r_{h} in (0,1]
-      y_{h}_quantile = within-date equal-count bucket index 0..n_buckets-1
-    Masked rows are NaN in the rank/quantile targets (fit filters them out anyway).
+      y_{h}_return        = r_{h} (raw demeaned log return; outlier-heavy)
+      y_{h}_rank          = within-date percentile of r_{h} in (0,1]
+      y_{h}_quantile      = within-date equal-count bucket index 0..n_buckets-1
+      y_{h}_sector_return = r_{h} minus within-(date, sector) median, with a
+                            universe-demean fallback when the sector group has
+                            fewer than `sector_min_group_size` names (test-4 §4).
+      y_{h}_beta_resid    = r_{h} − beta_252 × market_r_h, the alpha-residual
+                            target (test-4 §4). Falls back to NaN where either
+                            beta or the horizon-aggregated market return is
+                            missing — those rows are dropped at fit time.
+
+    Scoring stays Spearman IC against the realized r_{h}, so target modes are
+    apples-to-apples comparable: a sector-relative target trained model is judged
+    on universe-relative ranking, the same metric.
     """
     import pandas as pd
 
     out = panel.copy()
+    has_sector = "sector" in out.columns
+    has_beta = "beta_252d" in out.columns
+    mhr = market_horizon_returns or {}
+
     for h in HORIZONS:
         r, m = f"r_{h}", f"mask_{h}"
         valid = out[r].where(out[m].astype(bool))     # NaN where masked
@@ -588,6 +890,35 @@ def apply_target_modes(panel, n_buckets: int = 5):
             return pd.qcut(s, n_buckets, labels=False, duplicates="drop").astype(float)
 
         out[f"y_{h}_quantile"] = grp.transform(_bucket)
+
+        # --- Sector-relative target (test-4 phase 4) ---
+        # Since `valid` is already universe-demeaned, subtracting the within-
+        # (date, sector) median of `valid` is mathematically identical to
+        # subtracting the within-sector median of the raw returns — the cancel
+        # eats the universe median. Groups below the size threshold fall back
+        # to the universe-demeaned target.
+        if has_sector:
+            sec_grp = valid.groupby([out["date"], out["sector"]])
+            sec_med = sec_grp.transform("median")
+            sec_count = sec_grp.transform("count")
+            use_sector = out["sector"].notna() & (sec_count >= sector_min_group_size)
+            out[f"y_{h}_sector_return"] = np.where(use_sector, valid - sec_med, valid)
+        else:
+            out[f"y_{h}_sector_return"] = valid
+
+        # --- Beta-residual target (test-4 phase 4) ---
+        # If beta or market_r_h is missing for a row we deliberately emit NaN
+        # rather than passing through `valid` — silently substituting the
+        # universe-demean target would corrupt the ICIR comparison the user
+        # asked for. Fit-time row filtering drops those rows; if the dict is
+        # entirely empty for this horizon, the trainer will surface that as an
+        # empty-training-set error, which is the correct loud failure.
+        if has_beta:
+            mkt_r = out["date"].map(mhr.get(h, {})).astype(float)
+            beta = out["beta_252d"].astype(float)
+            out[f"y_{h}_beta_resid"] = valid - beta * mkt_r
+        else:
+            out[f"y_{h}_beta_resid"] = pd.Series(np.nan, index=out.index)
     return out
 
 
@@ -612,13 +943,17 @@ def prepare_panel(
         return panel
     medians = cross_sectional_medians(frames)
     panel = demean_cross_sectional(panel, medians)
+    panel = add_industry_neutral_momentum(panel, min_group_size=min_group_size)
     panel = rank_normalize_features(
         panel,
         cols=rank_cols or FEATURE_COLS,
         industry_relative=industry_relative,
         min_group_size=min_group_size,
     )
-    panel = apply_target_modes(panel, n_buckets)
+    market_horizon_returns = build_market_horizon_returns(market_returns, grid)
+    panel = apply_target_modes(
+        panel, n_buckets, market_horizon_returns=market_horizon_returns
+    )
     return panel
 
 
@@ -640,13 +975,26 @@ def walk_forward_folds(grid_dates: list, min_train_months: int, embargo_steps: i
     return folds
 
 
-def fit_lgbm_model(train_df, target_col: str, cfg: LGBMConfig, seed: int, shuffle: bool = False):
-    """Fit one LightGBM regressor on prepared panel rows and return the model."""
+def fit_lgbm_model(
+    train_df,
+    target_col: str,
+    cfg: LGBMConfig,
+    seed: int,
+    shuffle: bool = False,
+    feature_cols: list[str] | None = None,
+):
+    """Fit one LightGBM regressor on prepared panel rows and return the model.
+
+    `feature_cols` defaults to the production FEATURE_COLS so existing callers
+    (inference, compare_transformer_gbm) keep their behavior. Phase-1 packs flow
+    in via the explicit list.
+    """
     import lightgbm as lgb
 
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
     # Pass DataFrames (not bare arrays) so feature names flow into LightGBM and
     # sklearn doesn't warn at predict time.
-    X_tr = train_df[FEATURE_COLS]
+    X_tr = train_df[cols]
     y_tr = train_df[target_col].to_numpy(dtype=float)
     if shuffle:  # destroy feature->label link, preserve marginal => no-signal null
         y_tr = y_tr[np.random.default_rng(seed).permutation(len(y_tr))]
@@ -670,10 +1018,19 @@ def fit_lgbm_model(train_df, target_col: str, cfg: LGBMConfig, seed: int, shuffl
 
 
 def _fit_predict(
-    train_df, test_df, target_col: str, cfg: LGBMConfig, seed: int, shuffle: bool
+    train_df,
+    test_df,
+    target_col: str,
+    cfg: LGBMConfig,
+    seed: int,
+    shuffle: bool,
+    feature_cols: list[str] | None = None,
 ) -> np.ndarray:
-    model = fit_lgbm_model(train_df, target_col, cfg, seed=seed, shuffle=shuffle)
-    return model.predict(test_df[FEATURE_COLS])
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    model = fit_lgbm_model(
+        train_df, target_col, cfg, seed=seed, shuffle=shuffle, feature_cols=cols
+    )
+    return model.predict(test_df[cols])
 
 
 def _target_col(horizon: str, target_mode: str) -> str:
@@ -690,6 +1047,7 @@ def walk_forward_ic(
     shuffle: bool = False,
     target_mode: str = "return",
     log=lambda *_: None,
+    feature_cols: list[str] | None = None,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
 
@@ -717,7 +1075,9 @@ def walk_forward_ic(
         if test.shape[0] < wf_cfg.min_names or train.empty:
             continue
 
-        preds = _fit_predict(train, test, t_col, lgb_cfg, seed + fi, shuffle)
+        preds = _fit_predict(
+            train, test, t_col, lgb_cfg, seed + fi, shuffle, feature_cols=feature_cols
+        )
         ic = pd.Series(preds).corr(pd.Series(test[r_col].to_numpy(dtype=float)), method="spearman")
         if ic != ic:  # NaN (zero-variance cross-section)
             continue
@@ -818,6 +1178,7 @@ def single_split_ic(
     target_mode: str = "return",
     seed: int = 1337,
     min_names: int = 30,
+    feature_cols: list[str] | None = None,
 ) -> dict:
     """One fit on `date < fit_cutoff`, scored per holdout cross-section.
 
@@ -833,7 +1194,9 @@ def single_split_ic(
     if train.empty or holdout.empty:
         return {"summary": summarize([]), "folds": []}
 
-    preds = _fit_predict(train, holdout, t_col, lgb_cfg, seed, shuffle=False)
+    preds = _fit_predict(
+        train, holdout, t_col, lgb_cfg, seed, shuffle=False, feature_cols=feature_cols
+    )
     scored = holdout[["date", r_col]].copy()
     scored["pred"] = preds
     fold_rows = []
@@ -866,6 +1229,32 @@ def _print_bootstrap(tag: str, s: dict) -> None:
     )
 
 
+def _compose_feature_cols(args) -> list[str]:
+    """Build the active feature list for this run from CLI pack flags.
+
+    Order matters only for logging / model debugging; LightGBM is order-agnostic.
+    Production default (no flags) returns FEATURE_COLS unchanged so smoke runs
+    and the default reporting line still anchor the comparison.
+    """
+    cols: list[str] = list(FEATURE_COLS)
+    if args.with_valuation:
+        cols += list(VALUATION_FEATURES)
+    if args.with_quality:
+        cols += list(QUALITY_FEATURES)
+    if args.with_residual_mom:
+        cols += list(RESIDUAL_MOM_FEATURES)
+    if args.with_earnings_reaction:
+        cols += list(EARNINGS_REACTION_FEATURES)
+    # De-dupe while preserving order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cols:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 async def run(args) -> None:
     lgb_cfg = LGBMConfig()
     wf_cfg = WalkForwardConfig(
@@ -873,15 +1262,29 @@ async def run(args) -> None:
         max_train_months=args.max_train_months,
         min_names=args.min_names,
     )
+    feature_cols = _compose_feature_cols(args)
+    extras = [c for c in feature_cols if c not in FEATURE_COLS]
 
     async with pool_context() as pool:
-        frames = await load_frames(pool, symbols=args.symbols)
+        frames = await load_frames_cached(
+            pool, symbols=args.symbols, refresh=args.refresh_cache
+        )
         if not frames:
             raise SystemExit("no active tickers / frames loaded")
         grid = build_calendar_grid(frames)
         print(f"loaded {len(frames)} tickers; building monthly grid ({len(grid)} months) ...")
+        if extras:
+            print(f"feature packs active: +{', +'.join(extras)} (total={len(feature_cols)})")
+        if args.industry_relative:
+            print("industry-relative feature normalization: ON")
 
-        panel = prepare_panel(frames, grid, n_buckets=args.n_buckets)
+        panel = prepare_panel(
+            frames,
+            grid,
+            n_buckets=args.n_buckets,
+            rank_cols=feature_cols,
+            industry_relative=args.industry_relative,
+        )
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
         dates = sorted(panel["date"].unique())
@@ -892,7 +1295,8 @@ async def run(args) -> None:
 
         real = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                seed=args.seed, shuffle=False, target_mode=args.target,
-                               log=print if args.verbose else (lambda *_: None))
+                               log=print if args.verbose else (lambda *_: None),
+                               feature_cols=feature_cols)
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
               f"(expanding walk-forward, target={args.target}) ---")
         _print_summary("REAL", real["summary"])
@@ -914,7 +1318,7 @@ async def run(args) -> None:
             for rep in range(args.null_reps):
                 res = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                       seed=args.seed + 1000 * (rep + 1), shuffle=True,
-                                      target_mode=args.target)
+                                      target_mode=args.target, feature_cols=feature_cols)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 print(f"  null rep {rep}: mean_ic={m:+.4f}")
@@ -936,8 +1340,11 @@ def main() -> None:
     p.add_argument("--max-train-months", type=int, default=None,
                    help="rolling window length in months (default: expanding)")
     p.add_argument("--min-names", type=int, default=30, help="skip thinner test cross-sections")
-    p.add_argument("--target", default="return", choices=["return", "rank", "quantile"],
-                   help="training target transform (scoring is always vs realized return)")
+    p.add_argument("--target", default="return",
+                   choices=["return", "rank", "quantile", "sector_return", "beta_resid"],
+                   help="training target transform (scoring is always vs realized "
+                        "universe-demeaned return; sector_return / beta_resid are "
+                        "test-4 phase-4 alpha-residual modes)")
     p.add_argument(
         "--n-buckets", type=int, default=5,
         help="equal-count buckets for --target quantile",
@@ -951,8 +1358,23 @@ def main() -> None:
     p.add_argument("--block-size", type=int, default=None,
                    help="block length in monthly folds (default = horizon months)")
     p.add_argument("--symbols", nargs="*", help="restrict to these symbols")
+    p.add_argument("--refresh-cache", action="store_true",
+                   help="re-pull frames from Supabase and overwrite the local "
+                        "frame cache (do this after ingesting new data)")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--verbose", action="store_true", help="print every fold")
+    # --- Opt-in feature packs (test-3 + test-4). Production default unchanged. ---
+    p.add_argument("--with-valuation", action="store_true",
+                   help="add valuation pack (earnings_yield, book_to_market, ...)")
+    p.add_argument("--with-quality", action="store_true",
+                   help="add quality pack (roe_ttm, ttm margins, 4Q stability)")
+    p.add_argument("--with-residual-mom", action="store_true",
+                   help="add residual / structural momentum pack")
+    p.add_argument("--with-earnings-reaction", action="store_true",
+                   help="add filing-drift / surprise reaction pack")
+    p.add_argument("--industry-relative", action="store_true",
+                   help="rank-normalize price/fundamental/valuation/quality "
+                        "features within (date, industry) instead of universe-wide")
     args = p.parse_args()
     asyncio.run(run(args))
 

@@ -55,3 +55,6 @@ Thumbs.db
 *.swp
 
 stockproject/
+
+# local frame cache (load_frames_cached) — never commit
+.frame_cache/

@@ -15,11 +15,16 @@ import pandas as pd
 
 from backend.ml.dataset import TickerFrame, build_calendar_grid
 from backend.ml.gbm_baseline import (
+    EARNINGS_REACTION_FEATURES,
     EXPERIMENTAL_FEATURES,
     FEATURE_COLS,
     LGBMConfig,
+    RESIDUAL_MOM_FEATURES,
     WalkForwardConfig,
+    add_industry_neutral_momentum,
+    apply_target_modes,
     block_bootstrap_summary,
+    build_market_horizon_returns,
     build_ticker_rows,
     build_universe_return_map,
     demean_cross_sectional,
@@ -132,6 +137,218 @@ def test_build_ticker_rows_computes_beta_and_earnings_yield():
 
 
 # =============================================================
+# Test-4 phase-1 packs: residual momentum + earnings reaction
+# =============================================================
+
+
+def test_residual_momentum_collapses_when_ticker_equals_market():
+    # Single ticker -> market_returns == this ticker's returns -> resid_mom ≈ 0
+    # once beta_252d converges to 1.0. We additionally compare against a second
+    # ticker so the universe map is well-defined; both tickers track the same
+    # series so the market IS the ticker.
+    frame_a = make_frame(n_days=900, trend=0.0005, tid=1, vol_seed=11)
+    frame_b = TickerFrame(2, 2, "T2", list(frame_a.prices), [], [])
+    market_returns = build_universe_return_map([frame_a, frame_b])
+    rows = build_ticker_rows(
+        frame_a, build_calendar_grid([frame_a, frame_b]), market_returns=market_returns
+    )
+    assert rows
+    # Beta should be ~1 (ticker == market) and resid_mom ~ 0 on the late part of
+    # the series where the 252-day window has stabilized.
+    late = rows[len(rows) // 2 :]
+    assert all(abs(r["beta_252d"] - 1.0) < 0.05 for r in late), \
+        "single-ticker universe should yield beta≈1"
+    assert all(abs(r["resid_mom_12_1"]) < 0.02 for r in late), \
+        "resid_mom_12_1 should vanish when ticker == market"
+    assert all(abs(r["resid_mom_6m"]) < 0.02 for r in late)
+    # All RESIDUAL_MOM_FEATURES should be finite on every row.
+    for r in rows:
+        for c in RESIDUAL_MOM_FEATURES:
+            assert np.isfinite(r[c]), f"{c} not finite"
+
+
+def test_mom_consistency_6m_on_steady_uptrend_is_high():
+    # 0.001 daily drift vs 0.01 daily noise => ~70% positive monthly returns;
+    # so the *average* of mom_consistency_6m should land well above 0.5 but not
+    # be deterministic. We assert the central tendency rather than 1.0.
+    frame = make_frame(n_days=900, trend=0.001, tid=1)
+    rows = build_ticker_rows(frame, build_calendar_grid([frame]))
+    avg = float(np.mean([r["mom_consistency_6m"] for r in rows]))
+    # ~62% positive months in practice (Sharpe/month ≈ 0.5 with these params);
+    # well above the 0.5 random baseline, but not 1.0.
+    assert avg > 0.55, f"expected mostly-positive months on uptrend, got mean={avg:.3f}"
+    # Range stays within [0, 1].
+    for r in rows:
+        assert 0.0 <= r["mom_consistency_6m"] <= 1.0
+
+
+def test_earnings_reaction_detects_planted_jump_around_filing():
+    # Build a ticker whose price gaps +20% one trading day after a filing —
+    # filing_surprise_3d should pick up that abnormal return, and the drift
+    # window should remain finite.
+    rng = np.random.default_rng(0)
+    d0 = date(2018, 1, 2)
+    prices: list[dict] = []
+    p = 100.0
+    filing_idx = 400
+    for i in range(900):
+        # Tiny noise so the ±1d jump dominates the surprise window.
+        p *= 1.0 + 0.0001 + rng.normal(0, 0.001)
+        if i == filing_idx + 1:
+            p *= 1.20  # post-filing day jump
+        prices.append({
+            "trade_date": d0 + timedelta(days=i),
+            "adj_close": max(p, 1.0),
+            "volume": 1_000_000,
+        })
+    filed_at = prices[filing_idx]["trade_date"]
+    frame = TickerFrame(1, 1, "T1", prices, [], [])
+    frame.fundamentals = [
+        {
+            "filed_at": filed_at,
+            "period_end": filed_at - timedelta(days=30),
+            "filing_type": "10-Q",
+            "revenue": 1_000_000,
+            "net_income": 100_000,
+            "gross_margin": 0.4,
+            "operating_margin": 0.1,
+            "total_debt": 0,
+            "total_equity": 500_000,
+            "fcf": 80_000,
+        }
+    ]
+    # Need a second frame so build_universe_return_map yields something.
+    foil = make_frame(n_days=900, trend=0.0001, tid=2, vol_seed=5)
+    market_returns = build_universe_return_map([frame, foil])
+    rows = build_ticker_rows(
+        frame, build_calendar_grid([frame, foil]), market_returns=market_returns
+    )
+    assert rows
+
+    # All reaction features finite on every row.
+    for r in rows:
+        for c in EARNINGS_REACTION_FEATURES:
+            assert np.isfinite(r[c]), f"{c} not finite"
+    # Once the grid date passes the filing, the most recent reaction snapshot
+    # should still carry the planted abnormal return. The universe here is just
+    # this ticker + 1 foil, so the equal-weight market absorbs roughly half the
+    # jump (~10% of the planted +20% becomes market move); the abnormal return
+    # should still clear ~5% comfortably.
+    post_filing = [r for r in rows if r["filings_recency_days"] > 0]
+    assert post_filing, "expected at least one row after the planted filing"
+    assert max(r["filing_surprise_3d"] for r in post_filing) > 0.05, \
+        "filing_surprise_3d should pick up the planted +20% post-filing jump"
+
+
+def test_sector_return_target_subtracts_within_sector_median_above_threshold():
+    # 6 Tech names + 1 Energy; Tech has >= 5 so sector-demean applies, Energy
+    # has 1 so it falls back to the (already universe-demeaned) target.
+    d = date(2020, 1, 31)
+    df = pd.DataFrame({
+        "date": [d] * 7,
+        "sector": ["Tech"] * 6 + ["Energy"],
+        "r_1M": [0.10, 0.05, 0.00, -0.05, -0.10, 0.20, 0.30],
+        "mask_1M": [True] * 7,
+    })
+    for h in HORIZONS:
+        if f"r_{h}" not in df:
+            df[f"r_{h}"] = 0.0
+        if f"mask_{h}" not in df:
+            df[f"mask_{h}"] = False
+    df["r_1M"] = [0.10, 0.05, 0.00, -0.05, -0.10, 0.20, 0.30]
+    df["mask_1M"] = [True] * 7
+
+    out = apply_target_modes(df, sector_min_group_size=5)
+    tech = out[out["sector"] == "Tech"]
+    # Median of Tech r_1M = median([0.10, 0.05, 0.00, -0.05, -0.10, 0.20]) = 0.025.
+    expected_tech = np.array([0.10, 0.05, 0.00, -0.05, -0.10, 0.20]) - 0.025
+    assert np.allclose(
+        sorted(tech["y_1M_sector_return"].to_numpy()), sorted(expected_tech)
+    )
+    # Energy has 1 name -> below threshold -> passthrough (= universe-demeaned r_1M).
+    energy = out[out["sector"] == "Energy"]
+    assert float(energy["y_1M_sector_return"].iloc[0]) == 0.30
+
+
+def test_beta_resid_target_subtracts_beta_times_market_horizon_return():
+    d = date(2020, 1, 31)
+    df = pd.DataFrame({
+        "date": [d, d, d],
+        "beta_252d": [1.5, 1.0, 0.5],
+        "r_1M": [0.08, 0.05, 0.02],
+        "mask_1M": [True, True, True],
+    })
+    for h in HORIZONS:
+        if f"r_{h}" not in df:
+            df[f"r_{h}"] = 0.0
+        if f"mask_{h}" not in df:
+            df[f"mask_{h}"] = False
+    df["r_1M"] = [0.08, 0.05, 0.02]
+    df["mask_1M"] = [True, True, True]
+
+    # Universe earned 4% over the 1M horizon starting at d.
+    mhr = {h: {} for h in HORIZONS}
+    mhr["1M"][d] = 0.04
+    out = apply_target_modes(df, market_horizon_returns=mhr)
+    # y = r - beta * mkt_r => [0.08 - 1.5*0.04, 0.05 - 1.0*0.04, 0.02 - 0.5*0.04]
+    expected = np.array([0.08 - 0.06, 0.05 - 0.04, 0.02 - 0.02])
+    assert np.allclose(out["y_1M_beta_resid"].to_numpy(), expected)
+
+
+def test_beta_resid_target_falls_back_when_market_return_missing():
+    d = date(2020, 1, 31)
+    df = pd.DataFrame({
+        "date": [d, d],
+        "beta_252d": [1.0, 1.0],
+        "r_1M": [0.05, 0.03],
+        "mask_1M": [True, True],
+    })
+    for h in HORIZONS:
+        if f"r_{h}" not in df:
+            df[f"r_{h}"] = 0.0
+        if f"mask_{h}" not in df:
+            df[f"mask_{h}"] = False
+    df["r_1M"] = [0.05, 0.03]
+    df["mask_1M"] = [True, True]
+    # market_horizon_returns missing this date for 1M -> NaN; fit drops those rows.
+    mhr = {h: {} for h in HORIZONS}
+    out = apply_target_modes(df, market_horizon_returns=mhr)
+    assert out["y_1M_beta_resid"].isna().all()
+
+
+def test_build_market_horizon_returns_aggregates_over_trading_days():
+    # 25 fake trading days with constant +1% daily log return; H=21 trading days
+    # => market_r_h = 21 * 0.01 = 0.21 at any grid date with 21 days forward.
+    from backend.ingestion.calendar import HORIZON_TRADING_DAYS as HTD
+    dates = [date(2020, 1, 1) + timedelta(days=i) for i in range(25)]
+    market_returns = {d: 0.01 for d in dates}
+    grid = [dates[0], dates[3], dates[-2]]
+    out = build_market_horizon_returns(market_returns, grid, horizons=("1M",))
+    # 21 trading days forward from dates[0] and dates[3] both fit; dates[-2] does not.
+    assert abs(out["1M"][dates[0]] - HTD["1M"] * 0.01) < 1e-9
+    assert abs(out["1M"][dates[3]] - HTD["1M"] * 0.01) < 1e-9
+    assert dates[-2] not in out["1M"]  # window runs past end
+
+
+def test_industry_neutral_momentum_subtracts_within_date_industry_median():
+    df = pd.DataFrame({
+        "date": [date(2020, 1, 31)] * 6,
+        "industry": ["Software"] * 5 + ["Hardware"],  # Hardware group has < 5 names
+        "mom_12_1": [0.20, 0.10, 0.00, -0.10, -0.20, 1.00],
+    })
+    out = add_industry_neutral_momentum(df, min_group_size=5)
+    sw = out[out["industry"] == "Software"]
+    # Median of Software is 0; values pass through subtracted by 0 (no change).
+    assert np.allclose(
+        sorted(sw["industry_neutral_mom_12_1"].to_numpy()),
+        sorted(sw["mom_12_1"].to_numpy()),
+    )
+    # Hardware has only 1 name -> below min_group_size -> falls back to raw.
+    hw = out[out["industry"] == "Hardware"]
+    assert float(hw["industry_neutral_mom_12_1"].iloc[0]) == 1.0
+
+
+# =============================================================
 # Cross-sectional transforms
 # =============================================================
 
@@ -230,7 +447,10 @@ def test_block_bootstrap_summary_reports_ci_and_overlap_adjusted_t():
     assert 0 <= s["p_value"] <= 1
 
 
-def test_score_current_cross_section_clips_rank_predictions():
+def test_score_current_cross_section_rank_transforms_predictions():
+    # Predictions are mapped to within-cross-section percentile rank in [0, 1]
+    # regardless of the training target. Raw preds [-0.2, 1.3] over 2 active
+    # names => the lower goes to 0.0 and the higher to 1.0.
     class DummyModel:
         def predict(self, X):
             return np.array([-0.2, 1.3])
@@ -252,6 +472,93 @@ def test_score_current_cross_section_clips_rank_predictions():
     # Confidence is no longer computed here — it's rank stability, filled in run()
     # from the DB history of prior scoring dates.
     assert "confidence" not in rows[0]
+
+
+def test_score_current_cross_section_rank_transforms_regression_outputs():
+    # A `beta_resid`-trained model outputs log returns like [-0.05, +0.05]; the
+    # old "clip to [0, 1]" path would squash those to [0, 1] and lose the
+    # ranking. Rank-transforming preserves the order and produces evenly-spaced
+    # percentile ranks for the 5-name cross-section.
+    class DummyRegressionModel:
+        def predict(self, X):
+            # Negative numbers that the old clip path would all collapse to 0.0.
+            return np.array([-0.05, -0.03, -0.02, -0.04, -0.01])
+
+    as_of = date(2026, 5, 29)
+    df = pd.DataFrame({
+        "date": [as_of] * 5,
+        "ticker_id": [10, 20, 30, 40, 50],
+    })
+    for c in FEATURE_COLS:
+        df[c] = 0.0
+
+    rows = score_current_cross_section(
+        df, {"1Y": DummyRegressionModel()}, ("1Y",),
+        as_of=as_of, active_ids={10, 20, 30, 40, 50},
+    )
+
+    # Ordered by ticker_id (df row order) — preds: -0.05,-0.03,-0.02,-0.04,-0.01
+    # sorted ascending: -0.05 (10), -0.04 (40), -0.03 (20), -0.02 (30), -0.01 (50)
+    # => ranks: 10->0.00, 40->0.25, 20->0.50, 30->0.75, 50->1.00
+    by_tid = {r["ticker_id"]: r["relative_rank"] for r in rows}
+    assert np.allclose(by_tid[10], 0.00)
+    assert np.allclose(by_tid[40], 0.25)
+    assert np.allclose(by_tid[20], 0.50)
+    assert np.allclose(by_tid[30], 0.75)
+    assert np.allclose(by_tid[50], 1.00)
+
+
+def test_production_horizon_specs_promotes_beta_resid_for_1y():
+    # Locks in the test-4 phase-4 promotion so an accidental edit to the spec
+    # dict trips the test. Other horizons preserve the historical `rank` mode
+    # (intentionally — they were never compared against the new target modes).
+    from backend.ml.gbm_baseline import PRODUCTION_HORIZON_SPECS
+
+    assert PRODUCTION_HORIZON_SPECS["1Y"].target_mode == "beta_resid"
+    for h in ("1M", "3M", "6M"):
+        assert PRODUCTION_HORIZON_SPECS[h].target_mode == "rank", (
+            f"{h} default unexpectedly changed — re-sweep before promoting"
+        )
+
+
+def test_fit_horizon_models_uses_per_horizon_target_mode():
+    # End-to-end on a tiny synthetic panel: each horizon's model trains on the
+    # target column its spec selects (we sanity-check via the y_*_* columns that
+    # apply_target_modes produces). We don't assert on prediction values, only
+    # that fit succeeds and one model is produced per horizon key.
+    from backend.ml.gbm_baseline import HorizonSpec, LGBMConfig
+    from backend.ml.gbm_inference import fit_horizon_models
+
+    # Build a 3-date, 8-name panel with all required columns.
+    dates = [date(2020, 1, 31), date(2020, 2, 28), date(2020, 3, 31)]
+    rows = []
+    rng = np.random.default_rng(42)
+    for d in dates:
+        for tid in range(8):
+            row = {"date": d, "ticker_id": tid, "beta_252d": 1.0}
+            for c in FEATURE_COLS:
+                row[c] = float(rng.normal())
+            for h in HORIZONS:
+                row[f"r_{h}"] = float(rng.normal(0, 0.05))
+                row[f"mask_{h}"] = True
+                # apply_target_modes columns we feed directly
+                row[f"y_{h}_return"] = row[f"r_{h}"]
+                row[f"y_{h}_rank"] = float((tid + 1) / 8.0)
+                row[f"y_{h}_quantile"] = float(tid % 5)
+                row[f"y_{h}_sector_return"] = row[f"r_{h}"]
+                row[f"y_{h}_beta_resid"] = row[f"r_{h}"]
+            rows.append(row)
+    panel = pd.DataFrame(rows)
+
+    specs = {
+        "3M": HorizonSpec(target_mode="rank", lgb_cfg=LGBMConfig(n_estimators=20)),
+        "1Y": HorizonSpec(target_mode="beta_resid", lgb_cfg=LGBMConfig(n_estimators=20)),
+    }
+    as_of = date(2020, 3, 31)
+    models, train_windows, trained_ids = fit_horizon_models(panel, specs, seed=1, as_of=as_of)
+    assert set(models.keys()) == {"3M", "1Y"}
+    assert all(train_windows[h]["rows"] > 0 for h in models)
+    assert trained_ids
 
 
 def test_rank_stability():

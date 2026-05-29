@@ -1,6 +1,7 @@
 "use client";
 
 import type { HorizonPrediction } from "@/lib/api";
+import { percentileRank, topUniversePct } from "@/lib/format";
 
 function rankTone(rank: number): { bar: string; text: string } {
   if (rank >= 0.66) return { bar: "bg-up", text: "text-up" };
@@ -25,8 +26,8 @@ function RankGauge({
   rankStd: number | null;
   lowSignal?: boolean;
 }) {
-  const pctile = Math.round(rank * 100);
-  const topPct = Math.max(1, Math.round((1 - rank) * 100));
+  const pctile = percentileRank(rank);
+  const topPct = topUniversePct(rank);
   const tone = rankTone(rank);
 
   return (
@@ -48,11 +49,11 @@ function RankGauge({
       <div className="h-2 w-full overflow-hidden rounded-full bg-surface-2">
         <div
           className={`h-full rounded-full ${tone.bar} ${lowSignal ? "opacity-40" : ""}`}
-          style={{ width: `${pctile}%` }}
+          style={{ width: `${rank * 100}%` }}
         />
       </div>
       <div className="mt-1 flex justify-between text-[11px] text-faint">
-        <span>{pctile}th percentile vs universe</span>
+        <span>{pctile} percentile vs universe</span>
         {rankStd != null && (
           <span
             className="nums"

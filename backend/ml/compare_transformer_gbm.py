@@ -28,7 +28,7 @@ from backend.ml.dataset import (
     assemble_calendar_aligned,
     build_calendar_grid,
     cross_sectional_medians,
-    load_frames,
+    load_frames_cached,
     months_before,
     relabel_cross_sectional,
     split_samples,
@@ -40,7 +40,7 @@ from backend.ml.train import TrainConfig, _evaluate_samples, pick_device, train
 
 async def run(args) -> None:
     async with pool_context() as pool:
-        frames = await load_frames(pool)
+        frames = await load_frames_cached(pool, refresh=args.refresh_cache)
         if not frames:
             raise SystemExit("no active tickers / frames loaded")
         num_tickers = max(f.embedding_idx for f in frames) + 1
@@ -100,6 +100,8 @@ def main() -> None:
                    help="GBDT training target transform")
     p.add_argument("--n-buckets", type=int, default=5)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--refresh-cache", action="store_true",
+                   help="re-pull frames from Supabase and overwrite the local frame cache")
     args = p.parse_args()
     asyncio.run(run(args))
 

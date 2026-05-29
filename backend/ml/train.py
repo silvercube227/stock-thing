@@ -42,7 +42,7 @@ from backend.ml.dataset import (
     assemble_samples,
     build_calendar_grid,
     cross_sectional_medians,
-    load_frames,
+    load_frames_cached,
     relabel_cross_sectional,
     split_samples,
     to_arrays,
@@ -662,7 +662,7 @@ async def run(args) -> None:
     start, end = _parse_window(args.window)
 
     async with pool_context() as pool:
-        frames = await load_frames(pool, symbols=args.symbols)
+        frames = await load_frames_cached(pool, symbols=args.symbols, refresh=args.refresh_cache)
         if not frames:
             raise SystemExit("no active tickers / frames loaded")
         num_tickers = (
@@ -721,6 +721,8 @@ async def run(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description="Train the PatchTST trend model")
     p.add_argument("--symbols", nargs="*", help="restrict to these symbols (single-ticker sanity)")
+    p.add_argument("--refresh-cache", action="store_true",
+                   help="re-pull frames from Supabase and overwrite the local frame cache")
     p.add_argument("--window", help="START:END (ISO dates) to clip sample-end range")
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=256)

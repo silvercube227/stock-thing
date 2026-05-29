@@ -27,13 +27,16 @@ in tests/test_dataset.py with synthetic frames.
 from __future__ import annotations
 
 import bisect
+import hashlib
 import math
+import pickle
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 
 import numpy as np
 
+from backend.config import get_settings
 from backend.ingestion.calendar import HORIZON_TRADING_DAYS
 from backend.ml.features import SEQUENCE_LENGTH, build_sample
 from backend.ml.model import HORIZONS
@@ -444,6 +447,49 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 industry=r["industry"],
             )
         )
+    return frames
+
+
+def _frame_cache_key(symbols: list[str] | None) -> str:
+    """Stable cache filename stem for a symbol set ("all" when unrestricted)."""
+    if not symbols:
+        return "all"
+    digest = hashlib.sha1(",".join(sorted(symbols)).encode()).hexdigest()[:16]
+    return f"sym-{digest}"
+
+
+async def load_frames_cached(
+    pool, symbols: list[str] | None = None, refresh: bool = False
+) -> list[TickerFrame]:
+    """load_frames() with an on-disk pickle cache, for local experiments only.
+
+    Every walk-forward / sweep / backtest invocation otherwise re-pulls the full
+    price+fundamentals+sentiment history through the Supabase pooler (~tens of MB
+    each) — the dominant Shared-Pooler egress source. Historical frames are
+    static, so we cache them per symbol set under `settings.frame_cache_dir` and
+    reuse on subsequent runs. Pass `refresh=True` after ingesting new data to
+    re-pull and overwrite the cache.
+
+    Production inference (`gbm_inference.py`) deliberately does NOT use this — it
+    calls `load_frames` so it always scores on fresh data.
+    """
+    cache_dir = get_settings().frame_cache_dir
+    path = cache_dir / f"frames_{_frame_cache_key(symbols)}.pkl"
+    if path.exists() and not refresh:
+        with path.open("rb") as f:
+            frames = pickle.load(f)
+        print(f"[frame-cache] hit: {path} ({len(frames)} tickers) — no Supabase egress")
+        return frames
+
+    why = "refresh" if refresh else "miss"
+    print(f"[frame-cache] {why}: pulling full history from Supabase ...")
+    frames = await load_frames(pool, symbols=symbols)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".pkl.tmp")
+    with tmp.open("wb") as f:
+        pickle.dump(frames, f)
+    tmp.replace(path)  # atomic: never leave a half-written cache file
+    print(f"[frame-cache] wrote {path} ({len(frames)} tickers)")
     return frames
 
 

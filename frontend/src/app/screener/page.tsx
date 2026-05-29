@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
 import { AppHeader } from "@/components/AppHeader";
 import { getRankings, type RankingResponse } from "@/lib/api";
+import { percentileRank } from "@/lib/format";
 import { usePortfolio } from "@/hooks/usePortfolio";
 
 const HORIZONS = ["3M", "6M", "1Y"];
@@ -149,7 +150,7 @@ export default function ScreenerPage() {
               </thead>
               <tbody>
                 {visible.map((r) => {
-                  const pctile = Math.round(r.percentile_rank * 100);
+                  const pctile = percentileRank(r.percentile_rank);
                   const held = heldIds.has(r.ticker_id);
                   return (
                     <tr
@@ -179,7 +180,7 @@ export default function ScreenerPage() {
                         <div className="h-2 w-full max-w-[14rem] overflow-hidden rounded-full bg-surface-2">
                           <div
                             className={`h-full rounded-full ${barTone(r.percentile_rank)}`}
-                            style={{ width: `${pctile}%` }}
+                            style={{ width: `${r.percentile_rank * 100}%` }}
                           />
                         </div>
                       </td>

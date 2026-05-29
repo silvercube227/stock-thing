@@ -37,3 +37,21 @@ export function changeColor(n: number | null | undefined): string {
   if (n === null || n === undefined || n === 0) return "text-muted";
   return n > 0 ? "text-up" : "text-down";
 }
+
+/** Cross-sectional rank on a 0–100 scale (input is 0–1). */
+export function percentileRank(
+  rank: number | null | undefined,
+  dp = 1,
+): string {
+  if (rank === null || rank === undefined || Number.isNaN(rank)) return "—";
+  return (rank * 100).toFixed(dp);
+}
+
+/** Share of the universe ranked below this name (complement of percentile). */
+export function topUniversePct(
+  rank: number | null | undefined,
+  dp = 1,
+): string {
+  if (rank === null || rank === undefined || Number.isNaN(rank)) return "—";
+  return Math.max(0, (1 - rank) * 100).toFixed(dp);
+}
