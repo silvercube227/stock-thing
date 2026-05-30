@@ -55,6 +55,7 @@ from backend.ml.features import (
     _annotate_fundamentals,
     _build_fundamental_series,
     _build_sentiment_series,
+    _fund_filing_mask,
 )
 from backend.ml.model import HORIZONS
 
@@ -70,6 +71,11 @@ PRICE_FEATURES = [
 FUNDAMENTAL_FEATURES = [
     "revenue_growth", "gross_margin", "operating_margin", "debt_equity", "fcf_revenue",
 ]
+# Binary indicator: 1 = ticker has at least one SEC filing as-of the row date, 0 = none.
+# Lets the GBDT handle missing fundamentals explicitly rather than confounding "zero
+# value" (real) with "zero value" (no filing available). Critical for removed-from-index
+# names whose fundamental rows are absent.
+FUNDAMENTAL_MISSING_FEATURES = ["fund_available"]
 VALUATION_FEATURES = [
     "earnings_yield", "book_to_market", "sales_to_price", "fcf_yield",
 ]
@@ -107,7 +113,7 @@ FORWARD_VALUATION_FEATURES = [
     "forward_earnings_yield", "forward_ebitda_yield", "price_target_upside",
 ]
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
-FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + SENTIMENT_FEATURES
+FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
 EXPERIMENTAL_FEATURES = (
     VALUATION_FEATURES + QUALITY_FEATURES + RESIDUAL_MOM_FEATURES + EARNINGS_REACTION_FEATURES
     + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + FORWARD_VALUATION_FEATURES
@@ -770,6 +776,7 @@ def build_ticker_rows(
     bar_dates = [e[2] for e in entries]
     bar_positions = [e[1] for e in entries]
     fund = _build_fundamental_series(bar_dates, frame.fundamentals)  # (k, 5)
+    fund_avail = _fund_filing_mask(bar_dates, frame.fundamentals)    # (k,) bool
     sent = _build_sentiment_series(bar_dates, frame.sentiment)       # (k, 2)
     fund_ctx = _fundamental_context_asof(frame.fundamentals, bar_dates)
     reaction = _earnings_reaction_asof(
@@ -794,6 +801,7 @@ def build_ticker_rows(
         )
         for i, name in enumerate(FUNDAMENTAL_FEATURES):
             feats[name] = float(fund[j, i])
+        feats["fund_available"] = 1.0 if fund_avail[j] else 0.0
         # Keep experimental factors on the row for quick ablations, but don't
         # feed them into the default production baseline unless they win.
         price = adj_close[pos]
@@ -1136,17 +1144,50 @@ def _fit_predict(
     seed: int,
     shuffle: bool,
     feature_cols: list[str] | None = None,
+    n_seeds: int = 1,
 ) -> np.ndarray:
     cols = feature_cols if feature_cols is not None else FEATURE_COLS
-    model = fit_lgbm_model(
-        train_df, target_col, cfg, seed=seed, shuffle=shuffle, feature_cols=cols
-    )
-    return model.predict(test_df[cols])
+    if n_seeds == 1:
+        return fit_lgbm_model(
+            train_df, target_col, cfg, seed=seed, shuffle=shuffle, feature_cols=cols
+        ).predict(test_df[cols])
+    preds_all = np.stack([
+        fit_lgbm_model(
+            train_df, target_col, cfg, seed=seed + s * 997, shuffle=shuffle, feature_cols=cols
+        ).predict(test_df[cols])
+        for s in range(n_seeds)
+    ])
+    return preds_all.mean(axis=0)
 
 
 def _target_col(horizon: str, target_mode: str) -> str:
     """Training-target column: raw return needs no precomputed column."""
     return f"r_{horizon}" if target_mode == "return" else f"y_{horizon}_{target_mode}"
+
+
+def within_sector_ic(preds: np.ndarray, test_df, r_col: str, min_group_size: int = 10) -> float:
+    """Mean Spearman IC averaged across GICS sector groups in one test cross-section.
+
+    Builds a fresh DataFrame from numpy arrays to avoid pandas index mis-alignment.
+    Returns NaN when sector data is absent or no group meets min_group_size.
+    """
+    import pandas as pd
+
+    if "sector" not in test_df.columns:
+        return float("nan")
+    tmp = pd.DataFrame({
+        "pred": preds,
+        "r": test_df[r_col].to_numpy(dtype=float),
+        "sector": test_df["sector"].to_numpy(),
+    })
+    ics = []
+    for _, grp in tmp.dropna(subset=["sector"]).groupby("sector"):
+        if grp.shape[0] < min_group_size:
+            continue
+        ic = grp["pred"].corr(grp["r"], method="spearman")
+        if ic == ic:
+            ics.append(float(ic))
+    return float(np.mean(ics)) if ics else float("nan")
 
 
 def walk_forward_ic(
@@ -1159,6 +1200,8 @@ def walk_forward_ic(
     target_mode: str = "return",
     log=lambda *_: None,
     feature_cols: list[str] | None = None,
+    n_seeds: int = 1,
+    compute_sector_ic: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
 
@@ -1187,19 +1230,30 @@ def walk_forward_ic(
             continue
 
         preds = _fit_predict(
-            train, test, t_col, lgb_cfg, seed + fi, shuffle, feature_cols=feature_cols
+            train, test, t_col, lgb_cfg, seed + fi, shuffle,
+            feature_cols=feature_cols, n_seeds=n_seeds,
         )
         ic = pd.Series(preds).corr(pd.Series(test[r_col].to_numpy(dtype=float)), method="spearman")
         if ic != ic:  # NaN (zero-variance cross-section)
             continue
-        fold_rows.append({"date": test_date, "ic": float(ic), "n_test": int(test.shape[0]),
-                          "n_train": int(train.shape[0])})
+        fold = {"date": test_date, "ic": float(ic), "n_test": int(test.shape[0]),
+                "n_train": int(train.shape[0])}
+        if compute_sector_ic:
+            fold["sector_ic"] = within_sector_ic(preds, test, r_col)
+        fold_rows.append(fold)
         log(
             f"  fold {test_date}  ic {ic:+.4f}  "
             f"n_test={test.shape[0]:>4d}  n_train={train.shape[0]}"
         )
 
-    return {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
+    result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
+    if compute_sector_ic:
+        # sector_summary uses the same naive ICIR×√N formula as universe — caller
+        # should apply block_bootstrap_summary on sector_ic_values for honest t.
+        s_ics = [r["sector_ic"] for r in fold_rows if r["sector_ic"] == r["sector_ic"]]
+        result["sector_summary"] = summarize(s_ics)
+        result["sector_ic_values"] = s_ics
+    return result
 
 
 def summarize(ics: list[float]) -> dict:
@@ -1413,14 +1467,16 @@ async def run(args) -> None:
         real = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                seed=args.seed, shuffle=False, target_mode=args.target,
                                log=print if args.verbose else (lambda *_: None),
-                               feature_cols=feature_cols)
+                               feature_cols=feature_cols,
+                               n_seeds=args.n_seeds,
+                               compute_sector_ic=args.sector_neutral_ic)
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
               f"(expanding walk-forward, target={args.target}) ---")
         _print_summary("REAL", real["summary"])
+        block_size = args.block_size or max(
+            1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
+        )
         if args.block_bootstrap_reps > 0:
-            block_size = args.block_size or max(
-                1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
-            )
             boot = block_bootstrap_summary(
                 [r["ic"] for r in real["folds"]],
                 block_size=block_size,
@@ -1428,6 +1484,16 @@ async def run(args) -> None:
                 seed=args.seed,
             )
             _print_bootstrap("BOOT", boot)
+        if args.sector_neutral_ic and "sector_summary" in real:
+            _print_summary("SEC ", real["sector_summary"])
+            if args.block_bootstrap_reps > 0 and "sector_ic_values" in real:
+                sec_boot = block_bootstrap_summary(
+                    real["sector_ic_values"],
+                    block_size=block_size,
+                    reps=args.block_bootstrap_reps,
+                    seed=args.seed,
+                )
+                _print_bootstrap("SECB", sec_boot)
 
         if args.null_reps > 0:
             print(f"\nrunning {args.null_reps} shuffle-null reps ...")
@@ -1470,10 +1536,18 @@ def main() -> None:
         "--null-reps", type=int, default=0,
         help="shuffle-null repetitions for the no-signal band",
     )
-    p.add_argument("--block-bootstrap-reps", type=int, default=0,
-                   help="moving-block bootstrap reps for overlap-aware IC significance")
+    p.add_argument("--block-bootstrap-reps", type=int, default=2000,
+                   help="moving-block bootstrap reps for overlap-aware IC significance "
+                        "(default 2000; set 0 to skip)")
     p.add_argument("--block-size", type=int, default=None,
                    help="block length in monthly folds (default = horizon months)")
+    p.add_argument("--sector-neutral-ic", action="store_true",
+                   help="also report within-sector IC averaged across GICS sectors "
+                        "(guards against the edge being sector rotation rather than "
+                        "stock selection)")
+    p.add_argument("--n-seeds", type=int, default=1,
+                   help="seed-ensemble size for walk-forward (default 1; use 8 for "
+                        "production-equivalent smoothed IC estimate)")
     p.add_argument("--symbols", nargs="*", help="restrict to these symbols")
     p.add_argument("--refresh-cache", action="store_true",
                    help="re-pull frames from Supabase and overwrite the local "

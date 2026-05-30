@@ -464,7 +464,7 @@ def test_score_current_cross_section_rank_transforms_predictions():
         df[c] = 0.0
 
     rows = score_current_cross_section(
-        df, {"3M": DummyModel()}, ("3M",), as_of=as_of, active_ids={1, 3}
+        df, {"3M": [DummyModel()]}, ("3M",), as_of=as_of, active_ids={1, 3}
     )
 
     assert [r["ticker_id"] for r in rows] == [1, 3]
@@ -493,7 +493,7 @@ def test_score_current_cross_section_rank_transforms_regression_outputs():
         df[c] = 0.0
 
     rows = score_current_cross_section(
-        df, {"1Y": DummyRegressionModel()}, ("1Y",),
+        df, {"1Y": [DummyRegressionModel()]}, ("1Y",),
         as_of=as_of, active_ids={10, 20, 30, 40, 50},
     )
 
@@ -555,8 +555,9 @@ def test_fit_horizon_models_uses_per_horizon_target_mode():
         "1Y": HorizonSpec(target_mode="beta_resid", lgb_cfg=LGBMConfig(n_estimators=20)),
     }
     as_of = date(2020, 3, 31)
-    models, train_windows, trained_ids = fit_horizon_models(panel, specs, seed=1, as_of=as_of)
+    models, train_windows, trained_ids = fit_horizon_models(panel, specs, seed=1, as_of=as_of, n_seeds=1)
     assert set(models.keys()) == {"3M", "1Y"}
+    assert all(isinstance(models[h], list) and len(models[h]) == 1 for h in models)
     assert all(train_windows[h]["rows"] > 0 for h in models)
     assert trained_ids
 

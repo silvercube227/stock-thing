@@ -14,9 +14,19 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
 **Production: LightGBM GBDT cross-sectional ranker** (`backend/ml/gbm_inference.py`)
 - One shallow model per horizon (3M, 6M, 1Y) — 1M has no detectable signal, skip it
 - Per-horizon training target (`PRODUCTION_HORIZON_SPECS` in gbm_baseline.py): 3M/6M = rank-normalized cross-sectional return; 1Y = beta-residualized return (strips market beta toward idiosyncratic alpha). Scored by cross-sectional rank-IC.
-- 20 base features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, 2 FinBERT sentiment rolling averages. 6M + 1Y also include LSEG `revenue_surprise` (promoted via walk-forward ablation). Other LSEG packs (analyst revisions, forward valuation) exist as opt-in `--with-*` flags but didn't beat the null.
+- 21 base features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, `fund_available` (binary: has SEC filing as-of date), 2 FinBERT sentiment rolling averages. 6M + 1Y also include LSEG `revenue_surprise` (promoted via walk-forward ablation). Other LSEG packs (analyst revisions, forward valuation) exist as opt-in `--with-*` flags but didn't beat the null.
 - `n_jobs=1` required (MPS + multiprocessing conflict on M4)
-- Walk-forward validated ICIR (de-survivorshipped universe, incl. removed-from-index names): 3M=0.41/t=5.5, 6M=0.44/t=5.9 (+revenue_surprise), 1Y=0.45/t=6.0 (+revenue_surprise). NOTE: earlier survivor-only ICIRs were higher (e.g. 6M 0.64) but inflated by survivorship bias.
+- Production inference: 8-seed ensemble per horizon (predictions averaged before rank-transform), reduces seed variance.
+- Walk-forward stats (8-seed ensemble, de-survivorshipped universe, 716 tickers incl. removed-from-index):
+
+  | Horizon | mean_IC | t_block | p_block | SEC_IC | SECB_t | SECB_p | Verdict |
+  |---------|---------|---------|---------|--------|--------|--------|---------|
+  | 3M      | +0.053  | 3.03    | 0.0005  | +0.014 | 0.91   | 0.246  | Universe IC real but 100% sector rotation — no stock selection |
+  | 6M      | +0.078  | 2.35    | 0.003   | +0.034 | 1.86   | 0.009  | **Only defensible horizon**: block-significant universe + genuine within-sector selection |
+  | 1Y      | +0.074  | 1.48    | 0.055   | +0.028 | 0.87   | 0.266  | Neither correction leaves significant signal |
+
+  t_block/SECB_t = moving-block bootstrap (block=horizon months, 2000 reps). SEC/SECB = mean within-GICS-sector IC (min 10 names/sector), also block-corrected. t_naive (not shown) is inflated by overlapping labels. Earlier survivor-only ICIRs (e.g. 6M 0.64) were inflated by survivorship bias.
+- **6M is the only real signal.** 3M is sector rotation (SECB p=0.246). 1Y doesn't survive block correction (BOOT p=0.055 universe, SECB p=0.266 within-sector).
 - Signal is cross-sectional (relative ranking), not absolute direction — absolute direction has no detectable edge
 
 **Shelved: PatchTST transformer** (`backend/ml/model.py`, `train.py`, `dataset.py`)

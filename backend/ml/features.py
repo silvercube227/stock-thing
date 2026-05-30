@@ -160,6 +160,18 @@ def _build_fundamental_series(
     return out
 
 
+def _fund_filing_mask(window_dates: list[date], fund_rows: list[dict]) -> np.ndarray:
+    """Boolean mask: True where there is a filing with filed_at <= window date."""
+    annotated = _annotate_fundamentals(fund_rows)
+    filed_ats = [f["filed_at"] for f in annotated]
+    n = len(window_dates)
+    mask = np.zeros(n, dtype=bool)
+    for i, d in enumerate(window_dates):
+        if bisect.bisect_right(filed_ats, d) > 0:
+            mask[i] = True
+    return mask
+
+
 # =============================================================
 # Sentiment helpers
 # =============================================================

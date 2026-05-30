@@ -62,16 +62,14 @@ def fit_horizon_models(
     specs: dict[str, HorizonSpec],
     seed: int,
     as_of: date,
+    n_seeds: int = 1,
 ):
-    """Fit one LightGBM model per horizon, each with its own spec.
+    """Fit one LightGBM model ensemble per horizon, each with its own spec.
 
-    `specs` maps horizon ("1M"/"3M"/"6M"/"1Y") to a `HorizonSpec` carrying its
-    target_mode, hyperparameters, and optional feature override. The horizons
-    keys define which models to fit — that's also the loop order. Each fit
-    filters the panel on `mask_{h}` and the per-spec target's `notna()`, so
-    horizons whose target is sparse won't pollute the training set of others.
+    Returns `{horizon: [model_seed_0, model_seed_1, ...]}` — always a list even
+    when n_seeds=1, so `score_current_cross_section` can average uniformly.
     """
-    models: dict[str, object] = {}
+    models: dict[str, list] = {}
     train_windows: dict[str, dict] = {}
     trained_ids: set[int] = set()
     for i, (h, spec) in enumerate(specs.items()):
@@ -87,9 +85,12 @@ def fit_horizon_models(
             raise ValueError(
                 f"no labeled training rows for {h} target={spec.target_mode}"
             )
-        models[h] = fit_lgbm_model(
-            train, t_col, spec.lgb_cfg, seed=seed + i, shuffle=False, feature_cols=cols
-        )
+        models[h] = [
+            fit_lgbm_model(
+                train, t_col, spec.lgb_cfg, seed=seed + i + s * 997, shuffle=False, feature_cols=cols
+            )
+            for s in range(max(1, n_seeds))
+        ]
         train_windows[h] = {
             "start": min(train["date"]),
             "end": max(train["date"]),
@@ -136,7 +137,13 @@ def score_current_cross_section(
         # makes the dashboard semantics ("relative rank") consistent across all
         # target modes — pandas average-rank handles ties; single-name
         # cross-sections collapse to 0.5.
-        preds = np.asarray(models[h].predict(current[cols]), dtype=float)
+        model_or_list = models[h]
+        if isinstance(model_or_list, list):
+            preds = np.mean(
+                [np.asarray(m.predict(current[cols]), dtype=float) for m in model_or_list], axis=0
+            )
+        else:
+            preds = np.asarray(model_or_list.predict(current[cols]), dtype=float)
         if n > 1:
             ranks_raw = pd.Series(preds).rank(method="average").to_numpy()
             ranks = (ranks_raw - 1.0) / (n - 1)
@@ -294,7 +301,7 @@ async def run(args) -> None:
             raise SystemExit("empty panel (not enough history?)")
 
         models, train_windows, trained_ids = fit_horizon_models(
-            panel, specs, args.seed, as_of
+            panel, specs, args.seed, as_of, n_seeds=args.n_seeds
         )
         prediction_rows = score_current_cross_section(panel, models, specs, as_of, active_ids)
 
@@ -422,6 +429,10 @@ def main() -> None:
     )
     p.add_argument("--n-buckets", type=int, default=5)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--n-seeds", type=int, default=8,
+                   help="seed-ensemble size: fit this many models per horizon and "
+                        "average their raw predictions before rank-transforming "
+                        "(default 8; reduces seed variance at low compute cost)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
     asyncio.run(run(args))
