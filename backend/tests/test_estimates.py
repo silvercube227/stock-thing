@@ -6,18 +6,23 @@ mapping, NaN->None coercion, and all-null-row skipping.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 
 import pandas as pd
 
-from backend.ingestion.estimates import DB_FIELDS, parse_history
+from backend.ingestion import estimates as est
+from backend.ingestion.estimates import DB_FIELDS, lseg_session_reachable, parse_history
 
-# Exact display labels the probe returned, including trailing qualifiers.
+# Exact display labels the probe returned, including trailing qualifiers. The EPS
+# labels are best-guesses (confirm against scripts/_probe_lseg.py before backfill).
 _LABELS = {
     "rec_mean": "Recommendation - Mean (1-5)",
     "price_target_mean": "Price Target - Mean",
     "revenue_mean": "Revenue - Mean",
     "revenue_actual": "Revenue - Actual",
+    "eps_mean": "Earnings Per Share - Mean",
+    "eps_actual": "Earnings Per Share - Actual",
     "fwd_pe": "Forward P/E (Daily Time Series Ratio)",
     "fwd_ev_ebitda": "Forward Enterprise Value To EBITDA (Daily Time Series Ratio)",
 }
@@ -30,6 +35,8 @@ def test_parse_history_maps_known_columns_and_dates():
         _LABELS["price_target_mean"]: [150.0, 155.0],
         _LABELS["revenue_mean"]: [1000.0, 1010.0],
         _LABELS["revenue_actual"]: [float("nan"), 1005.0],  # sparse report-date col
+        _LABELS["eps_mean"]: [5.0, 5.1],
+        _LABELS["eps_actual"]: [float("nan"), 5.3],         # sparse report-date col
         _LABELS["fwd_pe"]: [25.0, 26.0],
         _LABELS["fwd_ev_ebitda"]: [18.0, 19.0],
     }, index=idx)
@@ -41,6 +48,9 @@ def test_parse_history_maps_known_columns_and_dates():
     assert rows[0]["ticker_id"] == 7
     assert rows[0]["as_of_date"] == date(2020, 1, 31)
     assert rows[0]["rec_mean"] == 2.1
+    assert rows[0]["eps_mean"] == 5.0
+    assert rows[0]["eps_actual"] is None                    # NaN -> None
+    assert rows[1]["eps_actual"] == 5.3
     assert rows[0]["fwd_ev_ebitda"] == 18.0
     assert rows[0]["fwd_pe"] == 25.0
     assert rows[0]["revenue_actual"] is None       # NaN -> None
@@ -63,6 +73,28 @@ def test_parse_history_skips_all_null_rows():
 
     assert len(rows) == 1                            # the all-null second row is dropped
     assert rows[0]["as_of_date"] == date(2020, 1, 31)
+
+
+def test_lseg_session_reachable_false_without_key(monkeypatch):
+    # No app key => unreachable, and we never import lseg.data (offline-safe).
+    class _S:
+        lseg_app_key = ""
+
+    monkeypatch.setattr(est, "get_settings", lambda: _S())
+    assert asyncio.run(lseg_session_reachable()) is False
+
+
+def test_lseg_session_reachable_false_when_open_raises(monkeypatch):
+    # Workspace down => _open_session raises => probe returns False, not an error.
+    class _S:
+        lseg_app_key = "key"
+
+    def _boom(_key):
+        raise RuntimeError("no desktop session")
+
+    monkeypatch.setattr(est, "get_settings", lambda: _S())
+    monkeypatch.setattr(est, "_open_session", _boom)
+    assert asyncio.run(lseg_session_reachable(timeout=2.0)) is False
 
 
 def test_parse_history_empty_and_unmapped():

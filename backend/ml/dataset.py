@@ -404,7 +404,7 @@ select ticker_id, score_date, rolling_7d, rolling_14d
 
 _EST_SQL = """
 select ticker_id, as_of_date, rec_mean, price_target_mean,
-       revenue_mean, revenue_actual, fwd_pe, fwd_ev_ebitda
+       revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda
   from analyst_estimates
  where ticker_id = any($1::bigint[])
  order by ticker_id, as_of_date

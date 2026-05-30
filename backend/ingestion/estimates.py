@@ -35,28 +35,36 @@ log = logging.getLogger(__name__)
 START_DATE = "2013-01-01"
 
 # TR field codes requested per ticker (confirmed available by scripts/_probe_lseg.py).
+# EPS mean/actual feed the computed eps_surprise (PEAD) feature — this license has
+# no direct EPSSurprise field, same as revenue (probe: eps_est_vs_actual TRAINABLE).
 ESTIMATE_FIELDS = [
     "TR.RecMean",
     "TR.PriceTargetMean",
     "TR.RevenueMean",
     "TR.RevenueActValue",
+    "TR.EPSMean",
+    "TR.EPSActValue",
     "TR.FwdPE",
     "TR.FwdEVToEBITDA",
 ]
 
 # Map a returned column's display label (substring, case-insensitive) -> db column.
 # Labels are the exact strings the probe printed; substring match tolerates the
-# trailing qualifiers ("(1-5)", "(Daily Time Series Ratio)").
+# trailing qualifiers ("(1-5)", "(Daily Time Series Ratio)"). The EPS labels are
+# best-guesses (Workspace wasn't available when this was added) — re-run
+# scripts/_probe_lseg.py and confirm the printed labels before the first backfill.
 COLUMN_MATCHERS: list[tuple[str, str]] = [
     ("recommendation - mean", "rec_mean"),
     ("price target - mean", "price_target_mean"),
     ("revenue - mean", "revenue_mean"),
     ("revenue - actual", "revenue_actual"),
+    ("earnings per share - mean", "eps_mean"),
+    ("earnings per share - actual", "eps_actual"),
     ("forward enterprise value to ebitda", "fwd_ev_ebitda"),
     ("forward p/e", "fwd_pe"),
 ]
 DB_FIELDS = ["rec_mean", "price_target_mean", "revenue_mean",
-             "revenue_actual", "fwd_pe", "fwd_ev_ebitda"]
+             "revenue_actual", "eps_mean", "eps_actual", "fwd_pe", "fwd_ev_ebitda"]
 
 
 # =============================================================
@@ -149,6 +157,34 @@ def _open_session(app_key: str):
     return ld
 
 
+async def lseg_session_reachable(timeout: float = 15.0) -> bool:
+    """True iff a desktop LSEG session can be opened right now.
+
+    Cheap reachability check (open + immediately close) so the daily orchestrator
+    can SKIP rather than FAIL the estimate stage when Workspace isn't running.
+    Never raises — any error, missing key, or timeout returns False.
+    """
+    settings = get_settings()
+    if not settings.lseg_app_key:
+        return False
+
+    def _probe() -> bool:
+        try:
+            ld = _open_session(settings.lseg_app_key)
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            ld.close_session()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_probe), timeout=timeout)
+    except Exception:  # noqa: BLE001  (TimeoutError included)
+        return False
+
+
 def resolve_rics(ld, symbols: list[str]) -> dict[str, str]:
     """Map ticker symbols -> primary RIC via LSEG symbology (one batch call)."""
     from lseg.data.content import symbol_conversion  # noqa: PLC0415
@@ -185,13 +221,15 @@ def resolve_rics(ld, symbols: list[str]) -> dict[str, str]:
 _UPSERT_SQL = """
 insert into analyst_estimates (
     ticker_id, as_of_date, rec_mean, price_target_mean,
-    revenue_mean, revenue_actual, fwd_pe, fwd_ev_ebitda, ingested_at
-) values ($1, $2, $3, $4, $5, $6, $7, $8, now())
+    revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda, ingested_at
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
 on conflict (ticker_id, as_of_date) do update set
     rec_mean          = excluded.rec_mean,
     price_target_mean = excluded.price_target_mean,
     revenue_mean      = excluded.revenue_mean,
     revenue_actual    = excluded.revenue_actual,
+    eps_mean          = excluded.eps_mean,
+    eps_actual        = excluded.eps_actual,
     fwd_pe            = excluded.fwd_pe,
     fwd_ev_ebitda     = excluded.fwd_ev_ebitda,
     ingested_at       = now()
@@ -203,7 +241,8 @@ async def _upsert_estimates(conn: asyncpg.Connection, rows: list[dict]) -> int:
         return 0
     payload = [
         (r["ticker_id"], r["as_of_date"], r["rec_mean"], r["price_target_mean"],
-         r["revenue_mean"], r["revenue_actual"], r["fwd_pe"], r["fwd_ev_ebitda"])
+         r["revenue_mean"], r["revenue_actual"], r["eps_mean"], r["eps_actual"],
+         r["fwd_pe"], r["fwd_ev_ebitda"])
         for r in rows
     ]
     async with conn.transaction():

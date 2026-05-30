@@ -99,6 +99,8 @@ create table if not exists analyst_estimates (
     price_target_mean   numeric,
     revenue_mean        numeric,                 -- forward consensus revenue (monthly)
     revenue_actual      numeric,                 -- reported revenue (report-date rows only)
+    eps_mean            numeric,                 -- forward consensus EPS (monthly)
+    eps_actual          numeric,                 -- reported EPS (report-date rows only)
     fwd_pe              numeric,                 -- forward P/E ratio
     fwd_ev_ebitda       numeric,                 -- forward EV/EBITDA ratio
     ingested_at         timestamptz not null default now(),
@@ -234,7 +236,7 @@ create table if not exists ingestion_runs (
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
     status          text not null default 'running'
-                    check (status in ('running', 'success', 'partial', 'failed')),
+                    check (status in ('running', 'success', 'partial', 'failed', 'skipped')),
     rows_inserted   integer,
     rows_updated    integer,
     error_message   text,

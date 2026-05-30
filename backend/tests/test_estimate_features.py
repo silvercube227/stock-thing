@@ -16,17 +16,24 @@ from backend.ml.gbm_baseline import _estimates_context_asof
 
 def _rows() -> list[dict]:
     # Each field deliberately lands on its own date (the real sparsity pattern).
+    # EPS consensus lands 3/15 (5.00) and the actual is reported 3/20 (5.50) -> a
+    # +10% earnings surprise, mirroring the revenue-surprise fixture.
     return [
         {"as_of_date": date(2020, 1, 15), "rec_mean": 3.0, "price_target_mean": None,
-         "revenue_mean": None, "revenue_actual": None, "fwd_pe": None, "fwd_ev_ebitda": None},
+         "revenue_mean": None, "revenue_actual": None, "eps_mean": None, "eps_actual": None,
+         "fwd_pe": None, "fwd_ev_ebitda": None},
         {"as_of_date": date(2020, 2, 15), "rec_mean": None, "price_target_mean": 100.0,
-         "revenue_mean": None, "revenue_actual": None, "fwd_pe": None, "fwd_ev_ebitda": None},
+         "revenue_mean": None, "revenue_actual": None, "eps_mean": None, "eps_actual": None,
+         "fwd_pe": None, "fwd_ev_ebitda": None},
         {"as_of_date": date(2020, 3, 15), "rec_mean": 2.0, "price_target_mean": None,
-         "revenue_mean": 1000.0, "revenue_actual": None, "fwd_pe": 20.0, "fwd_ev_ebitda": 10.0},
+         "revenue_mean": 1000.0, "revenue_actual": None, "eps_mean": 5.0, "eps_actual": None,
+         "fwd_pe": 20.0, "fwd_ev_ebitda": 10.0},
         {"as_of_date": date(2020, 3, 20), "rec_mean": None, "price_target_mean": None,
-         "revenue_mean": None, "revenue_actual": 1100.0, "fwd_pe": None, "fwd_ev_ebitda": None},
+         "revenue_mean": None, "revenue_actual": 1100.0, "eps_mean": None, "eps_actual": 5.5,
+         "fwd_pe": None, "fwd_ev_ebitda": None},
         {"as_of_date": date(2020, 6, 15), "rec_mean": 2.5, "price_target_mean": 120.0,
-         "revenue_mean": None, "revenue_actual": None, "fwd_pe": None, "fwd_ev_ebitda": None},
+         "revenue_mean": None, "revenue_actual": None, "eps_mean": None, "eps_actual": None,
+         "fwd_pe": None, "fwd_ev_ebitda": None},
     ]
 
 
@@ -40,6 +47,8 @@ def test_per_field_asof_and_revisions():
     assert ctx["forward_ebitda_yield"][0] == pytest.approx(0.10)     # 1/10
     # surprise: report 3/20 actual 1100 vs pre-report consensus 1000 (3/15).
     assert ctx["revenue_surprise"][0] == pytest.approx(0.10)
+    # EPS surprise: report 3/20 actual 5.5 vs pre-report consensus 5.0 (3/15).
+    assert ctx["eps_surprise"][0] == pytest.approx(0.10)
 
 
 def test_no_lookahead():
@@ -49,6 +58,7 @@ def test_no_lookahead():
     assert ctx["price_target_mean"][0] == 0.0              # 2/15 target unseen
     assert ctx["forward_earnings_yield"][0] == 0.0
     assert ctx["revenue_surprise"][0] == 0.0
+    assert ctx["eps_surprise"][0] == 0.0                   # 3/20 report unseen
 
 
 def test_empty_estimates_all_zero():

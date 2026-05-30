@@ -107,6 +107,13 @@ ANALYST_REVISION_FEATURES = [
 ESTIMATE_SURPRISE_FEATURES = [
     "revenue_surprise",
 ]
+# Earnings-surprise / PEAD pack (Phase 2): the most-recent reported EPS vs its
+# pre-report consensus. Computed downstream from eps_mean/eps_actual (this LSEG
+# license has no direct EPSSurprise field). Earnings-surprise drift is a classic
+# WITHIN-INDUSTRY stock-selection signal, strongest 3-9M.
+EPS_SURPRISE_FEATURES = [
+    "eps_surprise",
+]
 # Forward valuation stored as yields (inverse multiples) so ranking is monotonic
 # and negative/near-zero denominators don't blow up — mirrors earnings_yield.
 FORWARD_VALUATION_FEATURES = [
@@ -116,7 +123,8 @@ SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
 EXPERIMENTAL_FEATURES = (
     VALUATION_FEATURES + QUALITY_FEATURES + RESIDUAL_MOM_FEATURES + EARNINGS_REACTION_FEATURES
-    + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + FORWARD_VALUATION_FEATURES
+    + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + EPS_SURPRISE_FEATURES
+    + FORWARD_VALUATION_FEATURES
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /
 # earnings-reaction features already adjust for market or filing context so they
@@ -178,6 +186,10 @@ class HorizonSpec:
     target_mode: str = "return"
     lgb_cfg: LGBMConfig = field(default_factory=LGBMConfig)
     feature_cols: list[str] | None = None
+    # GBDT+ridge ensemble (Gu-Kelly-Xiu low-SNR robustness). 0.0 = pure GBDT
+    # (unchanged behavior); >0 blends a ridge model at this rank weight.
+    linear_blend: float = 0.0
+    ridge_alpha: float = 10.0
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -186,16 +198,20 @@ class HorizonSpec:
 # (this file's CLI) tests *one* horizon at a time and is unaffected.
 #
 # Source of current values:
-#   - 1M / 3M / 6M: `rank` — the historical inference default. NOT directly
-#     compared against `return`/`sector_return`/`beta_resid` in any sweep, so we
-#     preserve it rather than silently switch to a sweep-validated target. To
-#     change, sweep against `rank` baseline at these horizons first.
-#   - 1Y: `beta_resid` — test-4 phase-4 sweep: ICIR 0.552 → 0.685, Δ +0.133;
-#     hit rate 0.742 → 0.863. Stripping market beta from the training target
-#     forces the model away from cheap "high beta = high 1Y return" and toward
-#     idiosyncratic alpha. The asymmetry is structural: beta noise dominates 1Y
-#     return variance but is smaller relative to 3M dispersion, and beta_252 is
-#     noisier relative to short-horizon market moves.
+#   - 3M / 6M / 1Y: `sector_return` — train on the within-(date, sector)-relative
+#     return (test-6 sweep, n_seeds=8, de-survivorshipped, block-bootstrap on the
+#     WITHIN-SECTOR IC = SECB, the success bar). Targeting sector-relative return
+#     directly optimizes within-sector stock selection rather than letting the tree
+#     earn its universe IC from sector rotation. Before → after on SECB:
+#         3M: rank          SECB t=0.91 p=0.246  →  sector_return t=1.51 p=0.052
+#         6M: rank+surprise SECB t=1.86 p=0.009  →  sector_return  t=2.02 p=0.009
+#         1Y: beta_resid+sp SECB t=0.87 p=0.266  →  sector_return  t=2.09 p=0.003
+#     1Y is the headline: beta-residualization (the prior 1Y target) maximized
+#     idiosyncratic-vs-MARKET alpha but left SECTOR tilt in, so it failed the
+#     within-sector bar; sector_return clears it decisively (hit 0.81, ICIR 0.72).
+#     3M is a real lift (SEC IC doubles, p 0.246→0.052) but sits right at the
+#     detection floor — borderline-significant, not decisive like 6M/1Y. 1M stays
+#     `rank` (dead horizon, not scored in production).
 #   - 6M / 1Y feature_cols: + ESTIMATE_SURPRISE_FEATURES (LSEG revenue surprise).
 #     De-survivorshipped walk-forward ablation (2026-05-29): 6M ICIR 0.409→0.442
 #     (+0.033, bootstrap p=0.003, null z=6.5), 1Y 0.378→0.454 (+0.076, null z=9.7).
@@ -206,9 +222,9 @@ class HorizonSpec:
 _BASELINE_PLUS_SURPRISE = FEATURE_COLS + ESTIMATE_SURPRISE_FEATURES
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
-    "3M": HorizonSpec(target_mode="rank"),
-    "6M": HorizonSpec(target_mode="rank", feature_cols=_BASELINE_PLUS_SURPRISE),
-    "1Y": HorizonSpec(target_mode="beta_resid", feature_cols=_BASELINE_PLUS_SURPRISE),
+    "3M": HorizonSpec(target_mode="sector_return"),
+    "6M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE),
+    "1Y": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE),
 }
 
 
@@ -517,15 +533,17 @@ def _estimates_context_asof(est_rows: list[dict], as_of_dates: list) -> dict[str
 
     keys = ("rec_mean_level", "rec_rev_30d", "rec_rev_90d", "price_target_mean",
             "price_target_rev_90d", "forward_earnings_yield", "forward_ebitda_yield",
-            "revenue_surprise")
+            "revenue_surprise", "eps_surprise")
     if not est_rows:
         return {k: [0.0] * len(as_of_dates) for k in keys}
 
     rows_sorted = sorted(est_rows, key=lambda r: _as_date(r["as_of_date"]))
-    snap_fields = ("rec_mean", "price_target_mean", "revenue_mean", "fwd_pe", "fwd_ev_ebitda")
+    snap_fields = ("rec_mean", "price_target_mean", "revenue_mean", "eps_mean",
+                   "fwd_pe", "fwd_ev_ebitda")
     series: dict[str, tuple[list, list]] = {f: ([], []) for f in snap_fields}
-    rev_dates: list = []
-    rev_actuals: list[float] = []
+    # Report-date actuals tracked per metric (revenue, EPS) for surprise computation.
+    actual_dates: dict[str, list] = {"revenue": [], "eps": []}
+    actual_vals: dict[str, list[float]] = {"revenue": [], "eps": []}
     for r in rows_sorted:
         d = _as_date(r["as_of_date"])
         for f in snap_fields:
@@ -533,22 +551,24 @@ def _estimates_context_asof(est_rows: list[dict], as_of_dates: list) -> dict[str
             if v is not None:
                 series[f][0].append(d)
                 series[f][1].append(float(v))
-        ra = r.get("revenue_actual")
-        if ra is not None:
-            rev_dates.append(d)
-            rev_actuals.append(float(ra))
+        for metric, col in (("revenue", "revenue_actual"), ("eps", "eps_actual")):
+            av = r.get(col)
+            if av is not None:
+                actual_dates[metric].append(d)
+                actual_vals[metric].append(float(av))
 
     def asof(field: str, target) -> float | None:
         dates, vals = series[field]
         i = bisect.bisect_right(dates, target) - 1
         return vals[i] if i >= 0 else None
 
-    def surprise_asof(target) -> float | None:
-        i = bisect.bisect_right(rev_dates, target) - 1
+    def surprise_asof(metric: str, consensus_field: str, target) -> float | None:
+        dates, vals = actual_dates[metric], actual_vals[metric]
+        i = bisect.bisect_right(dates, target) - 1
         if i < 0:
             return None
-        report_date, actual = rev_dates[i], rev_actuals[i]
-        cons = asof("revenue_mean", report_date - timedelta(days=1))  # pre-report consensus
+        report_date, actual = dates[i], vals[i]
+        cons = asof(consensus_field, report_date - timedelta(days=1))  # pre-report consensus
         if cons is None or cons == 0:
             return None
         return (actual - cons) / abs(cons)
@@ -563,7 +583,8 @@ def _estimates_context_asof(est_rows: list[dict], as_of_dates: list) -> dict[str
         pt90 = asof("price_target_mean", d - timedelta(days=90))
         pe = asof("fwd_pe", d)
         ev = asof("fwd_ev_ebitda", d)
-        sp = surprise_asof(d)
+        sp = surprise_asof("revenue", "revenue_mean", d)
+        eps_sp = surprise_asof("eps", "eps_mean", d)
 
         out["rec_mean_level"].append(rec if rec is not None else 0.0)
         out["rec_rev_30d"].append((rec30 - rec) if rec is not None and rec30 is not None else 0.0)
@@ -574,6 +595,7 @@ def _estimates_context_asof(est_rows: list[dict], as_of_dates: list) -> dict[str
         out["forward_earnings_yield"].append(1.0 / pe if pe is not None and pe > 0 else 0.0)
         out["forward_ebitda_yield"].append(1.0 / ev if ev is not None and ev > 0 else 0.0)
         out["revenue_surprise"].append(sp if sp is not None else 0.0)
+        out["eps_surprise"].append(eps_sp if eps_sp is not None else 0.0)
     return out
 
 
@@ -831,6 +853,7 @@ def build_ticker_rows(
         feats["forward_earnings_yield"] = est_ctx["forward_earnings_yield"][j]
         feats["forward_ebitda_yield"] = est_ctx["forward_ebitda_yield"][j]
         feats["revenue_surprise"] = est_ctx["revenue_surprise"][j]
+        feats["eps_surprise"] = est_ctx["eps_surprise"][j]
         pt = est_ctx["price_target_mean"][j]
         feats["price_target_upside"] = ((pt - price) / price) if price and price > 0 and pt else 0.0
         # Panel-level demean overwrites this in `prepare_panel`; until then leave
@@ -984,6 +1007,10 @@ def apply_target_modes(
                             target (test-4 §4). Falls back to NaN where either
                             beta or the horizon-aggregated market return is
                             missing — those rows are dropped at fit time.
+      y_{h}_beta_sector_resid = beta_resid minus its within-(date, sector)
+                            median — strips market beta AND sector tilt, the
+                            within-sector idiosyncratic-alpha target (graded on
+                            SECB). Falls back to beta_resid for thin sectors.
 
     Scoring stays Spearman IC against the realized r_{h}, so target modes are
     apples-to-apples comparable: a sector-relative target trained model is judged
@@ -1038,6 +1065,24 @@ def apply_target_modes(
             out[f"y_{h}_beta_resid"] = valid - beta * mkt_r
         else:
             out[f"y_{h}_beta_resid"] = pd.Series(np.nan, index=out.index)
+
+        # --- Beta + sector double-residual target ---
+        # Strip BOTH market beta and sector tilt, isolating within-sector
+        # idiosyncratic alpha — the metric we now grade 1Y on (SECB). Sector-
+        # demean the beta-residual within (date, sector); groups below the size
+        # threshold fall back to the plain beta-residual. NaN where beta_resid is
+        # NaN, so the same fit-time row filtering applies.
+        if has_beta and has_sector:
+            br = out[f"y_{h}_beta_resid"]
+            bsec_grp = br.groupby([out["date"], out["sector"]])
+            bsec_med = bsec_grp.transform("median")
+            bsec_count = bsec_grp.transform("count")
+            use_bsec = out["sector"].notna() & (bsec_count >= sector_min_group_size)
+            out[f"y_{h}_beta_sector_resid"] = np.where(
+                use_bsec & br.notna(), br - bsec_med, br
+            )
+        else:
+            out[f"y_{h}_beta_sector_resid"] = out[f"y_{h}_beta_resid"]
     return out
 
 
@@ -1136,6 +1181,63 @@ def fit_lgbm_model(
     return model
 
 
+def fit_linear_model(
+    train_df,
+    target_col: str,
+    feature_cols: list[str] | None = None,
+    alpha: float = 10.0,
+    seed: int = 0,
+    shuffle: bool = False,
+):
+    """Fit a ridge regressor on the same rank-normalized features as the GBDT.
+
+    The features are already mapped to within-date ranks in [-1, 1], so no further
+    scaling is needed and ridge is the natural low-variance complement to the tree:
+    it captures the monotone linear part of the signal that a shallow GBDT
+    overfits on a thin (~500-name) cross-section (Gu-Kelly-Xiu: linear models are
+    competitive and more stable at low SNR; the ensemble dominates either alone).
+    """
+    from sklearn.linear_model import Ridge
+
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    X = train_df[cols].to_numpy(dtype=float)
+    y = train_df[target_col].to_numpy(dtype=float)
+    if shuffle:  # same no-signal null as the GBDT path
+        y = y[np.random.default_rng(seed).permutation(len(y))]
+    model = Ridge(alpha=alpha)
+    model.fit(X, y)
+    return model
+
+
+def _rank01(a: np.ndarray) -> np.ndarray:
+    """Map a prediction vector to within-cross-section percentile rank in [0, 1].
+
+    Used to put GBDT and ridge outputs (different scales/units) on a common
+    footing before blending; a single-name cross-section collapses to 0.5.
+    """
+    import pandas as pd
+
+    a = np.asarray(a, dtype=float)
+    n = a.size
+    if n < 2:
+        return np.full(n, 0.5, dtype=float)
+    return (pd.Series(a).rank(method="average").to_numpy() - 1.0) / (n - 1)
+
+
+def blend_gbdt_linear(
+    gbdt_pred: np.ndarray, linear_pred: np.ndarray, weight: float
+) -> np.ndarray:
+    """Weighted average of rank-transformed GBDT and ridge predictions.
+
+    `weight` is the ridge share in [0, 1]; 0.0 is pure GBDT. Blending on RANKS
+    (not raw outputs) keeps the two models commensurable regardless of target
+    mode, matching how the score path rank-transforms before storage.
+    """
+    if weight <= 0:
+        return np.asarray(gbdt_pred, dtype=float)
+    return (1.0 - weight) * _rank01(gbdt_pred) + weight * _rank01(linear_pred)
+
+
 def _fit_predict(
     train_df,
     test_df,
@@ -1165,23 +1267,32 @@ def _target_col(horizon: str, target_mode: str) -> str:
     return f"r_{horizon}" if target_mode == "return" else f"y_{horizon}_{target_mode}"
 
 
-def within_sector_ic(preds: np.ndarray, test_df, r_col: str, min_group_size: int = 10) -> float:
-    """Mean Spearman IC averaged across GICS sector groups in one test cross-section.
+def within_sector_ic(
+    preds: np.ndarray,
+    test_df,
+    r_col: str,
+    min_group_size: int = 10,
+    group_col: str = "sector",
+) -> float:
+    """Mean Spearman IC averaged across GICS `group_col` groups in one cross-section.
 
-    Builds a fresh DataFrame from numpy arrays to avoid pandas index mis-alignment.
-    Returns NaN when sector data is absent or no group meets min_group_size.
+    `group_col` is "sector" (default) or "industry" — industry is the finer cut
+    and a stricter stock-selection test, but yields smaller groups, so fewer clear
+    the min_group_size guard. Builds a fresh DataFrame from numpy arrays to avoid
+    pandas index mis-alignment. Returns NaN when the column is absent or no group
+    meets min_group_size.
     """
     import pandas as pd
 
-    if "sector" not in test_df.columns:
+    if group_col not in test_df.columns:
         return float("nan")
     tmp = pd.DataFrame({
         "pred": preds,
         "r": test_df[r_col].to_numpy(dtype=float),
-        "sector": test_df["sector"].to_numpy(),
+        "grp": test_df[group_col].to_numpy(),
     })
     ics = []
-    for _, grp in tmp.dropna(subset=["sector"]).groupby("sector"):
+    for _, grp in tmp.dropna(subset=["grp"]).groupby("grp"):
         if grp.shape[0] < min_group_size:
             continue
         ic = grp["pred"].corr(grp["r"], method="spearman")
@@ -1202,6 +1313,9 @@ def walk_forward_ic(
     feature_cols: list[str] | None = None,
     n_seeds: int = 1,
     compute_sector_ic: bool = False,
+    sector_group_col: str = "sector",
+    linear_blend: float = 0.0,
+    ridge_alpha: float = 10.0,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
 
@@ -1233,13 +1347,25 @@ def walk_forward_ic(
             train, test, t_col, lgb_cfg, seed + fi, shuffle,
             feature_cols=feature_cols, n_seeds=n_seeds,
         )
+        if linear_blend > 0:
+            # `test` is a single month-end cross-section here, so rank-blending is
+            # well-defined. The null path shuffles both models identically.
+            lin = fit_linear_model(
+                train, t_col, feature_cols=feature_cols, alpha=ridge_alpha,
+                seed=seed + fi, shuffle=shuffle,
+            )
+            cols = feature_cols if feature_cols is not None else FEATURE_COLS
+            lin_pred = lin.predict(test[cols].to_numpy(dtype=float))
+            preds = blend_gbdt_linear(preds, lin_pred, linear_blend)
         ic = pd.Series(preds).corr(pd.Series(test[r_col].to_numpy(dtype=float)), method="spearman")
         if ic != ic:  # NaN (zero-variance cross-section)
             continue
         fold = {"date": test_date, "ic": float(ic), "n_test": int(test.shape[0]),
                 "n_train": int(train.shape[0])}
         if compute_sector_ic:
-            fold["sector_ic"] = within_sector_ic(preds, test, r_col)
+            fold["sector_ic"] = within_sector_ic(
+                preds, test, r_col, group_col=sector_group_col
+            )
         fold_rows.append(fold)
         log(
             f"  fold {test_date}  ic {ic:+.4f}  "
@@ -1290,6 +1416,7 @@ def block_bootstrap_summary(
             "n_folds": 0, "block_size": block_size, "reps": reps,
             "mean_ic": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
             "p_value": float("nan"), "effective_blocks": 0.0, "t_block": float("nan"),
+            "se_block": float("nan"), "min_detect_ic": float("nan"),
         }
 
     block_size = max(1, min(int(block_size), n))
@@ -1300,10 +1427,14 @@ def block_bootstrap_summary(
     t_block = mean / std * math.sqrt(effective_blocks) if std > 0 else float("nan")
 
     if reps == 0:
+        # SE of the mean from the overlap-adjusted block count (no resampling).
+        se_block = std / math.sqrt(effective_blocks) if effective_blocks > 0 else float("nan")
         return {
             "n_folds": n, "block_size": block_size, "reps": reps, "mean_ic": mean,
             "ci_low": float("nan"), "ci_high": float("nan"), "p_value": float("nan"),
             "effective_blocks": effective_blocks, "t_block": t_block,
+            "se_block": se_block,
+            "min_detect_ic": 1.96 * se_block if se_block == se_block else float("nan"),
         }
 
     rng = np.random.default_rng(seed)
@@ -1321,6 +1452,11 @@ def block_bootstrap_summary(
         null_means[i] = float(centered[idx].mean())
 
     p_value = (1.0 + float(np.sum(np.abs(null_means) >= abs(mean)))) / (reps + 1.0)
+    # Bootstrap SE of the mean IC; smallest |mean IC| a two-sided 95% test could
+    # resolve at this block count. For power-limited horizons (1Y: annual labels
+    # ⇒ few independent blocks) min_detect_ic can exceed any plausible true IC,
+    # which is the honest read — not a model failure.
+    se_block = float(boot_means.std(ddof=1)) if reps > 1 else float("nan")
     return {
         "n_folds": n,
         "block_size": block_size,
@@ -1331,6 +1467,8 @@ def block_bootstrap_summary(
         "p_value": p_value,
         "effective_blocks": effective_blocks,
         "t_block": t_block,
+        "se_block": se_block,
+        "min_detect_ic": 1.96 * se_block if se_block == se_block else float("nan"),
     }
 
 
@@ -1394,6 +1532,20 @@ def _print_bootstrap(tag: str, s: dict) -> None:
     )
 
 
+def _print_power(tag: str, s: dict) -> None:
+    """Statistical-power read: the smallest |mean IC| this block count can resolve.
+
+    For overlapping long-horizon labels (1Y) eff_blocks is small, so min_detect|IC|
+    is large — a non-significant result there may be a power ceiling, not a dead
+    signal. Read mean_ic against min_detect, not just against zero.
+    """
+    print(
+        f"{tag:<5} eff_blocks={s['effective_blocks']:.1f}  se={s['se_block']:.4f}  "
+        f"min_detect|IC|@95%={s['min_detect_ic']:.4f}  "
+        f"(observed mean_ic={s['mean_ic']:+.4f})"
+    )
+
+
 def _compose_feature_cols(args) -> list[str]:
     """Build the active feature list for this run from CLI pack flags.
 
@@ -1414,6 +1566,8 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(ANALYST_REVISION_FEATURES)
     if args.with_estimate_surprise:
         cols += list(ESTIMATE_SURPRISE_FEATURES)
+    if args.with_eps_surprise:
+        cols += list(EPS_SURPRISE_FEATURES)
     if args.with_forward_valuation:
         cols += list(FORWARD_VALUATION_FEATURES)
     # De-dupe while preserving order.
@@ -1469,22 +1623,20 @@ async def run(args) -> None:
                                log=print if args.verbose else (lambda *_: None),
                                feature_cols=feature_cols,
                                n_seeds=args.n_seeds,
-                               compute_sector_ic=args.sector_neutral_ic)
-        print(f"\n--- {args.horizon} cross-sectional rank-IC "
-              f"(expanding walk-forward, target={args.target}) ---")
-        _print_summary("REAL", real["summary"])
+                               compute_sector_ic=args.sector_neutral_ic,
+                               sector_group_col=args.neutralize_by,
+                               linear_blend=args.with_linear_blend,
+                               ridge_alpha=args.ridge_alpha)
         block_size = args.block_size or max(
             1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
         )
-        if args.block_bootstrap_reps > 0:
-            boot = block_bootstrap_summary(
-                [r["ic"] for r in real["folds"]],
-                block_size=block_size,
-                reps=args.block_bootstrap_reps,
-                seed=args.seed,
-            )
-            _print_bootstrap("BOOT", boot)
+        print(f"\n--- {args.horizon} cross-sectional rank-IC "
+              f"(expanding walk-forward, target={args.target}) ---")
+
+        # HEADLINE: within-sector stock selection — the bar a horizon must clear.
+        sec_boot = None
         if args.sector_neutral_ic and "sector_summary" in real:
+            print(f"[HEADLINE] within-{args.neutralize_by} stock selection (the success bar):")
             _print_summary("SEC ", real["sector_summary"])
             if args.block_bootstrap_reps > 0 and "sector_ic_values" in real:
                 sec_boot = block_bootstrap_summary(
@@ -1494,23 +1646,51 @@ async def run(args) -> None:
                     seed=args.seed,
                 )
                 _print_bootstrap("SECB", sec_boot)
+                _print_power("SECB", sec_boot)
+
+        # DIAGNOSTIC: universe IC includes sector rotation; high here + flat SECB
+        # ⇒ the edge is sector timing, not stock selection (does NOT clear the bar).
+        print("[diagnostic] universe IC (incl. sector rotation):")
+        _print_summary("REAL", real["summary"])
+        if args.block_bootstrap_reps > 0:
+            boot = block_bootstrap_summary(
+                [r["ic"] for r in real["folds"]],
+                block_size=block_size,
+                reps=args.block_bootstrap_reps,
+                seed=args.seed,
+            )
+            _print_bootstrap("BOOT", boot)
 
         if args.null_reps > 0:
             print(f"\nrunning {args.null_reps} shuffle-null reps ...")
-            null_means = []
+            null_means, null_sec_means = [], []
             for rep in range(args.null_reps):
                 res = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                       seed=args.seed + 1000 * (rep + 1), shuffle=True,
-                                      target_mode=args.target, feature_cols=feature_cols)
+                                      target_mode=args.target, feature_cols=feature_cols,
+                                      compute_sector_ic=args.sector_neutral_ic,
+                                      sector_group_col=args.neutralize_by,
+                                      linear_blend=args.with_linear_blend,
+                                      ridge_alpha=args.ridge_alpha)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
+                if args.sector_neutral_ic and "sector_summary" in res:
+                    null_sec_means.append(res["sector_summary"]["mean_ic"])
                 print(f"  null rep {rep}: mean_ic={m:+.4f}")
-            nm = np.asarray(null_means, dtype=float)
-            null_mu, null_sd = float(nm.mean()), float(nm.std(ddof=1)) if nm.size > 1 else 0.0
-            z = (real["summary"]["mean_ic"] - null_mu) / null_sd if null_sd > 0 else float("nan")
-            print(f"\nNULL  reps={nm.size}  mean_ic={null_mu:+.4f} ± {null_sd:.4f}")
-            print(f"VERDICT  real mean_ic {real['summary']['mean_ic']:+.4f} vs null "
-                  f"{null_mu:+.4f}±{null_sd:.4f}  =>  z={z:+.2f}")
+
+            def _verdict(tag: str, real_mean: float, nulls: list[float]) -> None:
+                nm = np.asarray(nulls, dtype=float)
+                mu = float(nm.mean())
+                sd = float(nm.std(ddof=1)) if nm.size > 1 else 0.0
+                z = (real_mean - mu) / sd if sd > 0 else float("nan")
+                print(f"{tag}  reps={nm.size}  real {real_mean:+.4f} vs null "
+                      f"{mu:+.4f}±{sd:.4f}  =>  z={z:+.2f}")
+
+            print()
+            # The success-bar verdict is on within-sector IC; universe is secondary.
+            if null_sec_means:
+                _verdict("VERDICT(SECB)", real["sector_summary"]["mean_ic"], null_sec_means)
+            _verdict("verdict(univ)", real["summary"]["mean_ic"], null_means)
 
 
 def main() -> None:
@@ -1524,10 +1704,12 @@ def main() -> None:
                    help="rolling window length in months (default: expanding)")
     p.add_argument("--min-names", type=int, default=30, help="skip thinner test cross-sections")
     p.add_argument("--target", default="return",
-                   choices=["return", "rank", "quantile", "sector_return", "beta_resid"],
+                   choices=["return", "rank", "quantile", "sector_return",
+                            "beta_resid", "beta_sector_resid"],
                    help="training target transform (scoring is always vs realized "
-                        "universe-demeaned return; sector_return / beta_resid are "
-                        "test-4 phase-4 alpha-residual modes)")
+                        "universe-demeaned return; sector_return / beta_resid / "
+                        "beta_sector_resid are alpha-residual modes — the last "
+                        "strips both market beta and sector tilt)")
     p.add_argument(
         "--n-buckets", type=int, default=5,
         help="equal-count buckets for --target quantile",
@@ -1541,10 +1723,14 @@ def main() -> None:
                         "(default 2000; set 0 to skip)")
     p.add_argument("--block-size", type=int, default=None,
                    help="block length in monthly folds (default = horizon months)")
-    p.add_argument("--sector-neutral-ic", action="store_true",
-                   help="also report within-sector IC averaged across GICS sectors "
-                        "(guards against the edge being sector rotation rather than "
-                        "stock selection)")
+    p.add_argument("--sector-neutral-ic", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="report within-sector IC averaged across GICS groups as the "
+                        "HEADLINE success metric (stock selection, not sector "
+                        "rotation). On by default; pass --no-sector-neutral-ic to skip")
+    p.add_argument("--neutralize-by", default="sector", choices=["sector", "industry"],
+                   help="grouping for the within-group IC headline (industry is the "
+                        "finer, stricter stock-selection cut)")
     p.add_argument("--n-seeds", type=int, default=1,
                    help="seed-ensemble size for walk-forward (default 1; use 8 for "
                         "production-equivalent smoothed IC estimate)")
@@ -1568,12 +1754,21 @@ def main() -> None:
                         "price-target revision)")
     p.add_argument("--with-estimate-surprise", action="store_true",
                    help="add LSEG revenue-surprise pack")
+    p.add_argument("--with-eps-surprise", action="store_true",
+                   help="add LSEG EPS-surprise (PEAD) pack — computed from "
+                        "eps_mean/eps_actual; needs the 004 migration + estimate backfill")
     p.add_argument("--with-forward-valuation", action="store_true",
                    help="add LSEG forward-valuation pack (forward earnings/ebitda yield, "
                         "price-target upside)")
     p.add_argument("--industry-relative", action="store_true",
                    help="rank-normalize price/fundamental/valuation/quality "
                         "features within (date, industry) instead of universe-wide")
+    p.add_argument("--with-linear-blend", type=float, default=0.0, metavar="W",
+                   help="blend a ridge cross-sectional model with the GBDT at this "
+                        "weight (0..1, ridge share); 0 = pure GBDT. Blends on ranks "
+                        "(Gu-Kelly-Xiu: ensembles dominate at low SNR)")
+    p.add_argument("--ridge-alpha", type=float, default=10.0,
+                   help="L2 strength for the --with-linear-blend ridge model")
     args = p.parse_args()
     asyncio.run(run(args))
 

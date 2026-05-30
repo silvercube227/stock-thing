@@ -32,6 +32,8 @@ from backend.ml.gbm_baseline import (
     PRODUCTION_HORIZON_SPECS,
     HorizonSpec,
     LGBMConfig,
+    blend_gbdt_linear,
+    fit_linear_model,
     fit_lgbm_model,
     prepare_panel,
 )
@@ -66,10 +68,14 @@ def fit_horizon_models(
 ):
     """Fit one LightGBM model ensemble per horizon, each with its own spec.
 
-    Returns `{horizon: [model_seed_0, model_seed_1, ...]}` — always a list even
-    when n_seeds=1, so `score_current_cross_section` can average uniformly.
+    Returns `(models, train_windows, trained_ids, linear_models)`:
+      - `models[h]` = `[model_seed_0, ...]` — always a list even when n_seeds=1,
+        so `score_current_cross_section` can average uniformly.
+      - `linear_models[h]` = `(ridge_model, blend_weight)` only for horizons whose
+        spec sets `linear_blend > 0`; absent otherwise (pure GBDT).
     """
     models: dict[str, list] = {}
+    linear_models: dict[str, tuple] = {}
     train_windows: dict[str, dict] = {}
     trained_ids: set[int] = set()
     for i, (h, spec) in enumerate(specs.items()):
@@ -91,6 +97,13 @@ def fit_horizon_models(
             )
             for s in range(max(1, n_seeds))
         ]
+        if getattr(spec, "linear_blend", 0.0) > 0:
+            linear_models[h] = (
+                fit_linear_model(
+                    train, t_col, feature_cols=cols, alpha=spec.ridge_alpha, seed=seed + i
+                ),
+                float(spec.linear_blend),
+            )
         train_windows[h] = {
             "start": min(train["date"]),
             "end": max(train["date"]),
@@ -98,7 +111,7 @@ def fit_horizon_models(
             "tickers": int(train["ticker_id"].nunique()),
         }
         trained_ids.update(int(v) for v in train["ticker_id"].unique())
-    return models, train_windows, trained_ids
+    return models, train_windows, trained_ids, linear_models
 
 
 def score_current_cross_section(
@@ -107,6 +120,7 @@ def score_current_cross_section(
     specs: dict[str, HorizonSpec] | tuple[str, ...],
     as_of: date,
     active_ids: set[int],
+    linear_models: dict | None = None,
 ):
     """Return prediction dicts for active tickers present in the `as_of` cross-section.
 
@@ -114,7 +128,12 @@ def score_current_cross_section(
     model predicts on its own `feature_cols`) or — for backward compatibility
     with the existing test — a plain horizons tuple, in which case all horizons
     predict on the default `FEATURE_COLS`.
+
+    `linear_models` (optional) maps a horizon to `(ridge_model, blend_weight)`;
+    when present the GBDT and ridge predictions are rank-blended before the final
+    rank-transform, matching the walk-forward stack that validated the weight.
     """
+    linear_models = linear_models or {}
     current = panel[(panel["date"] == as_of) & panel["ticker_id"].isin(active_ids)].copy()
     if current.empty:
         raise ValueError(f"no active ticker rows available for as_of={as_of}")
@@ -144,6 +163,10 @@ def score_current_cross_section(
             )
         else:
             preds = np.asarray(model_or_list.predict(current[cols]), dtype=float)
+        if h in linear_models:
+            ridge, weight = linear_models[h]
+            lin_pred = np.asarray(ridge.predict(current[cols].to_numpy(dtype=float)), dtype=float)
+            preds = blend_gbdt_linear(preds, lin_pred, weight)
         if n > 1:
             ranks_raw = pd.Series(preds).rank(method="average").to_numpy()
             ranks = (ranks_raw - 1.0) / (n - 1)
@@ -156,6 +179,48 @@ def score_current_cross_section(
                 "relative_rank": float(rank),
             })
     return rows
+
+
+def apply_cross_horizon_shrink(
+    prediction_rows: list[dict],
+    source: str = "6M",
+    target: str = "1Y",
+    weight: float = 0.0,
+) -> list[dict]:
+    """Shrink the `target` horizon's percentile rank toward the `source` horizon's.
+
+    James-Stein-style strength borrowing: the long horizon is power-limited
+    (annual overlapping labels ⇒ few independent blocks) and its standalone rank
+    is noisy, while 6M is the reliable signal and the horizons are highly
+    correlated. Blending the target rank toward the source rank trades a little
+    bias for a meaningful variance reduction. `weight` in [0, 1]; 0 = no change.
+
+    Mutates and returns `prediction_rows`. Target rows are re-ranked to a clean
+    percentile after blending so stored `relative_rank` semantics are unchanged.
+    Names absent from the source keep their original rank.
+    """
+    if weight <= 0:
+        return prediction_rows
+    src = {
+        r["ticker_id"]: r["relative_rank"]
+        for r in prediction_rows
+        if r["horizon"] == source
+    }
+    tgt_rows = [r for r in prediction_rows if r["horizon"] == target]
+    if not src or len(tgt_rows) < 2:
+        return prediction_rows
+
+    import pandas as pd
+
+    blended = np.array([
+        (1.0 - weight) * r["relative_rank"] + weight * src[r["ticker_id"]]
+        if r["ticker_id"] in src else r["relative_rank"]
+        for r in tgt_rows
+    ], dtype=float)
+    ranks = (pd.Series(blended).rank(method="average").to_numpy() - 1.0) / (len(tgt_rows) - 1)
+    for r, rank in zip(tgt_rows, ranks, strict=True):
+        r["relative_rank"] = float(rank)
+    return prediction_rows
 
 
 def rank_stability(ranks: list[float]) -> float | None:
@@ -247,6 +312,8 @@ def _serialize_spec(spec: HorizonSpec) -> dict:
         "target_mode": spec.target_mode,
         "lgb_cfg": asdict(spec.lgb_cfg),
         "feature_cols": _spec_feature_cols(spec),
+        "linear_blend": getattr(spec, "linear_blend", 0.0),
+        "ridge_alpha": getattr(spec, "ridge_alpha", 10.0),
     }
 
 
@@ -269,6 +336,8 @@ def build_specs_from_args(args) -> dict[str, HorizonSpec]:
                 target_mode=args.target,
                 lgb_cfg=spec.lgb_cfg,
                 feature_cols=spec.feature_cols,
+                linear_blend=spec.linear_blend,
+                ridge_alpha=spec.ridge_alpha,
             )
         base[h] = spec
     return base
@@ -281,7 +350,9 @@ async def run(args) -> None:
         raise SystemExit(f"invalid horizon(s): {', '.join(invalid)}")
 
     specs = build_specs_from_args(args)
-    async with pool_context() as pool:
+    # Bulk historical load_frames pull can exceed the default 60s command timeout
+    # through the Supabase pooler under load; give the inference read path headroom.
+    async with pool_context(command_timeout=300) as pool:
         frames = await load_frames(pool)
         if not frames:
             raise SystemExit("no ticker frames loaded")
@@ -300,10 +371,17 @@ async def run(args) -> None:
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
 
-        models, train_windows, trained_ids = fit_horizon_models(
+        models, train_windows, trained_ids, linear_models = fit_horizon_models(
             panel, specs, args.seed, as_of, n_seeds=args.n_seeds
         )
-        prediction_rows = score_current_cross_section(panel, models, specs, as_of, active_ids)
+        prediction_rows = score_current_cross_section(
+            panel, models, specs, as_of, active_ids, linear_models=linear_models
+        )
+        if args.shrink_1y_toward_6m > 0 and {"6M", "1Y"} <= set(horizons):
+            prediction_rows = apply_cross_horizon_shrink(
+                prediction_rows, source="6M", target="1Y",
+                weight=args.shrink_1y_toward_6m,
+            )
 
         targets_str = ",".join(f"{h}={specs[h].target_mode}" for h in horizons)
         print(
@@ -333,6 +411,7 @@ async def run(args) -> None:
         artifact = {
             "model_type": "lightgbm_gbdt_ranker",
             "models": models,
+            "linear_models": linear_models,      # {h: (ridge, weight)} when blended
             "horizons": horizons,
             "specs": serialized_specs,           # per-horizon target / cfg / features
             "train_windows": train_windows_json,
@@ -421,13 +500,19 @@ def main() -> None:
                    choices=list(HORIZONS))
     p.add_argument(
         "--target", default=None,
-        choices=["return", "rank", "quantile", "sector_return", "beta_resid"],
+        choices=["return", "rank", "quantile", "sector_return", "beta_resid",
+                 "beta_sector_resid"],
         help="legacy global target override — sets the training target for EVERY "
              "horizon in --horizons to this mode. By default each horizon uses its "
              "own validated target from PRODUCTION_HORIZON_SPECS in gbm_baseline.py "
-             "(currently 1M/3M/6M=rank, 1Y=beta_resid).",
+             "(currently 3M/6M/1Y=sector_return, 1M=rank).",
     )
     p.add_argument("--n-buckets", type=int, default=5)
+    p.add_argument("--shrink-1y-toward-6m", type=float, default=0.0, metavar="W",
+                   help="James-Stein cross-horizon shrink: blend the 1Y rank toward "
+                        "the 6M rank at this weight (0..1) to borrow strength from "
+                        "the reliable horizon. 0 = off (default). Requires both "
+                        "horizons in --horizons")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--n-seeds", type=int, default=8,
                    help="seed-ensemble size: fit this many models per horizon and "

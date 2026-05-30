@@ -12,6 +12,7 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from backend.ml.dataset import TickerFrame, build_calendar_grid
 from backend.ml.gbm_baseline import (
@@ -33,6 +34,7 @@ from backend.ml.gbm_baseline import (
     summarize,
     walk_forward_folds,
     walk_forward_ic,
+    within_sector_ic,
 )
 from backend.ml.gbm_inference import score_current_cross_section
 from backend.ml.model import HORIZONS
@@ -316,6 +318,62 @@ def test_beta_resid_target_falls_back_when_market_return_missing():
     assert out["y_1M_beta_resid"].isna().all()
 
 
+def test_beta_sector_resid_strips_both_beta_and_sector():
+    d = date(2020, 1, 31)
+    df = pd.DataFrame({
+        "date": [d, d, d],
+        "sector": ["Tech", "Tech", "Tech"],
+        "beta_252d": [1.5, 1.0, 0.5],
+        "r_1M": [0.08, 0.05, 0.02],
+        "mask_1M": [True, True, True],
+    })
+    for h in HORIZONS:
+        if f"r_{h}" not in df:
+            df[f"r_{h}"] = 0.0
+        if f"mask_{h}" not in df:
+            df[f"mask_{h}"] = False
+    df["r_1M"] = [0.08, 0.05, 0.02]
+    df["mask_1M"] = [True, True, True]
+
+    mhr = {h: {} for h in HORIZONS}
+    mhr["1M"][d] = 0.04
+    out = apply_target_modes(df, market_horizon_returns=mhr, sector_min_group_size=2)
+    # beta_resid = r - beta*mkt = [0.02, 0.01, 0.00]; within-Tech median = 0.01;
+    # beta_sector_resid = beta_resid - 0.01 = [0.01, 0.00, -0.01].
+    assert np.allclose(out["y_1M_beta_sector_resid"].to_numpy(), [0.01, 0.0, -0.01])
+    # And it is sector-demeaned: within-sector median is ~0.
+    assert abs(float(np.median(out["y_1M_beta_sector_resid"].to_numpy()))) < 1e-9
+
+
+def test_within_sector_ic_supports_industry_grouping():
+    rng = np.random.default_rng(3)
+    n = 12
+    r_a = rng.normal(size=n)
+    r_b = rng.normal(size=n)
+    test_df = pd.DataFrame({
+        "industry": ["A"] * n + ["B"] * n,
+        "sector": ["S"] * (2 * n),
+        "r_1M": np.concatenate([r_a, r_b]),
+    })
+    preds = test_df["r_1M"].to_numpy()  # perfect within-group ranking
+    ic = within_sector_ic(preds, test_df, "r_1M", min_group_size=10, group_col="industry")
+    assert ic == pytest.approx(1.0, abs=1e-9)
+    # Absent grouping column -> NaN, not a crash.
+    assert np.isnan(within_sector_ic(preds, test_df, "r_1M", group_col="missing_col"))
+
+
+def test_block_bootstrap_summary_reports_power_floor():
+    ics = [0.10, 0.08, 0.12, 0.09, 0.11, 0.07, 0.13, 0.10]
+    s = block_bootstrap_summary(ics, block_size=2, reps=500, seed=1)
+    assert "se_block" in s and "min_detect_ic" in s
+    assert s["se_block"] > 0
+    assert s["min_detect_ic"] == pytest.approx(1.96 * s["se_block"], rel=1e-9)
+    # reps=0 path uses the analytic SE = std / sqrt(effective_blocks).
+    s0 = block_bootstrap_summary(ics, block_size=2, reps=0, seed=1)
+    assert s0["se_block"] > 0
+    assert s0["min_detect_ic"] == pytest.approx(1.96 * s0["se_block"], rel=1e-9)
+
+
 def test_build_market_horizon_returns_aggregates_over_trading_days():
     # 25 fake trading days with constant +1% daily log return; H=21 trading days
     # => market_r_h = 21 * 0.01 = 0.21 at any grid date with 21 days forward.
@@ -508,17 +566,44 @@ def test_score_current_cross_section_rank_transforms_regression_outputs():
     assert np.allclose(by_tid[50], 1.00)
 
 
-def test_production_horizon_specs_promotes_beta_resid_for_1y():
-    # Locks in the test-4 phase-4 promotion so an accidental edit to the spec
-    # dict trips the test. Other horizons preserve the historical `rank` mode
-    # (intentionally — they were never compared against the new target modes).
-    from backend.ml.gbm_baseline import PRODUCTION_HORIZON_SPECS
+def test_score_current_cross_section_blends_linear_model():
+    # GBDT ranks ascending by ticker, ridge ranks descending — perfectly opposed.
+    # At blend weight 0.5 every name's blended rank-score is identical (0.5*r +
+    # 0.5*(1-r) = 0.5), so all percentile ranks collapse to 0.5.
+    class GBDT:
+        def predict(self, X):
+            return np.array([0.0, 1.0, 2.0, 3.0, 4.0])
 
-    assert PRODUCTION_HORIZON_SPECS["1Y"].target_mode == "beta_resid"
-    for h in ("1M", "3M", "6M"):
-        assert PRODUCTION_HORIZON_SPECS[h].target_mode == "rank", (
-            f"{h} default unexpectedly changed — re-sweep before promoting"
+    class RidgeLike:
+        def predict(self, X):
+            return np.array([4.0, 3.0, 2.0, 1.0, 0.0])
+
+    as_of = date(2026, 5, 29)
+    df = pd.DataFrame({"date": [as_of] * 5, "ticker_id": [1, 2, 3, 4, 5]})
+    for c in FEATURE_COLS:
+        df[c] = 0.0
+
+    rows = score_current_cross_section(
+        df, {"3M": [GBDT()]}, ("3M",), as_of=as_of, active_ids={1, 2, 3, 4, 5},
+        linear_models={"3M": (RidgeLike(), 0.5)},
+    )
+    assert all(abs(r["relative_rank"] - 0.5) < 1e-9 for r in rows)
+
+
+def test_production_horizon_specs_use_sector_return_for_scored_horizons():
+    # Locks in the test-6 promotion (sector_return for every scored horizon — the
+    # within-sector / SECB winner) so an accidental edit to the spec dict trips the
+    # test. 1M stays `rank` (dead horizon, not scored in production).
+    from backend.ml.gbm_baseline import ESTIMATE_SURPRISE_FEATURES, PRODUCTION_HORIZON_SPECS
+
+    for h in ("3M", "6M", "1Y"):
+        assert PRODUCTION_HORIZON_SPECS[h].target_mode == "sector_return", (
+            f"{h} target unexpectedly changed — re-sweep SECB before promoting"
         )
+    assert PRODUCTION_HORIZON_SPECS["1M"].target_mode == "rank"
+    # 6M and 1Y still carry the promoted revenue-surprise pack.
+    for h in ("6M", "1Y"):
+        assert ESTIMATE_SURPRISE_FEATURES[0] in (PRODUCTION_HORIZON_SPECS[h].feature_cols or [])
 
 
 def test_fit_horizon_models_uses_per_horizon_target_mode():
@@ -555,11 +640,37 @@ def test_fit_horizon_models_uses_per_horizon_target_mode():
         "1Y": HorizonSpec(target_mode="beta_resid", lgb_cfg=LGBMConfig(n_estimators=20)),
     }
     as_of = date(2020, 3, 31)
-    models, train_windows, trained_ids = fit_horizon_models(panel, specs, seed=1, as_of=as_of, n_seeds=1)
+    models, train_windows, trained_ids, linear_models = fit_horizon_models(
+        panel, specs, seed=1, as_of=as_of, n_seeds=1
+    )
     assert set(models.keys()) == {"3M", "1Y"}
     assert all(isinstance(models[h], list) and len(models[h]) == 1 for h in models)
     assert all(train_windows[h]["rows"] > 0 for h in models)
     assert trained_ids
+    # No spec sets linear_blend, so no ridge models are fit.
+    assert linear_models == {}
+
+
+def test_apply_cross_horizon_shrink_pulls_1y_toward_6m():
+    from backend.ml.gbm_inference import apply_cross_horizon_shrink
+
+    # 1Y ranks are the reverse of 6M; full shrink (weight=1.0) should re-rank 1Y
+    # to match 6M's ordering exactly.
+    rows = []
+    for tid, (r6, r1) in enumerate(
+        [(0.0, 1.0), (0.25, 0.75), (0.5, 0.5), (0.75, 0.25), (1.0, 0.0)], start=1
+    ):
+        rows.append({"ticker_id": tid, "horizon": "6M", "relative_rank": r6})
+        rows.append({"ticker_id": tid, "horizon": "1Y", "relative_rank": r1})
+
+    out = apply_cross_horizon_shrink(rows, source="6M", target="1Y", weight=1.0)
+    by = {(r["ticker_id"], r["horizon"]): r["relative_rank"] for r in out}
+    for tid in range(1, 6):
+        assert by[(tid, "1Y")] == pytest.approx(by[(tid, "6M")])
+    # weight 0 is a no-op.
+    rows2 = [{"ticker_id": 1, "horizon": "1Y", "relative_rank": 0.3},
+             {"ticker_id": 1, "horizon": "6M", "relative_rank": 0.9}]
+    assert apply_cross_horizon_shrink(list(rows2), weight=0.0) == rows2
 
 
 def test_rank_stability():
@@ -617,6 +728,25 @@ def test_walk_forward_recovers_planted_signal_and_null_does_not():
     assert real["mean_ic"] > 0.20, f"expected to recover signal, got {real['mean_ic']}"
     assert real["mean_ic"] > null["mean_ic"] + 0.15
     assert abs(null["mean_ic"]) < 0.10, f"shuffle null should be ~0, got {null['mean_ic']}"
+
+
+def test_linear_blend_matches_pure_gbdt_at_zero_and_recovers_signal():
+    panel = _planted_panel(n_dates=48, n_names=60, beta=1.0, seed=7)
+    wf = WalkForwardConfig(min_train_months=12, min_names=20)
+    cfg = LGBMConfig(n_estimators=120)
+
+    pure = walk_forward_ic(panel, "1M", cfg, wf, seed=1, shuffle=False)["summary"]
+    blend0 = walk_forward_ic(
+        panel, "1M", cfg, wf, seed=1, shuffle=False, linear_blend=0.0
+    )["summary"]
+    blended = walk_forward_ic(
+        panel, "1M", cfg, wf, seed=1, shuffle=False, linear_blend=0.5
+    )["summary"]
+
+    # weight 0.0 is exactly the pure-GBDT path (no ridge fit, no rank-blend).
+    assert blend0["mean_ic"] == pytest.approx(pure["mean_ic"], abs=1e-12)
+    # The blended stack still recovers the (linear) planted signal.
+    assert blended["mean_ic"] > 0.20, f"blend lost signal: {blended['mean_ic']}"
 
 
 def test_prepare_panel_end_to_end_on_frames():
