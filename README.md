@@ -1,6 +1,6 @@
 # stock-thing
 
-Personal long-only stock and ETF trend prediction app. 
+Personal long-only stock and ETF trend prediction app. Must run with LSEG workspace active.
 
 ## Repo layout
 

@@ -27,6 +27,10 @@ class Settings(BaseSettings):
 
     sec_edgar_user_agent: str = Field(default="stock-thing local dev contact@example.com")
 
+    # LSEG Workspace (analyst estimates). Uses the lseg.data desktop session, which
+    # talks to a locally-running Workspace; the app key authorizes that session.
+    lseg_app_key: str = Field(default="")
+
     models_dir: Path = MODELS_DIR
     # On-disk cache of load_frames() pulls, so repeated local experiment/backtest
     # runs read frames from disk instead of re-pulling full history through the

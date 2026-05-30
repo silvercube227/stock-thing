@@ -27,6 +27,7 @@ ingestion = [
     "pandas>=2.2",
     "pandas-market-calendars>=4.4",
     "sec-edgar-downloader>=5.0",
+    "lseg-data>=2.0",
 ]
 ml = [
     "torch>=2.4",

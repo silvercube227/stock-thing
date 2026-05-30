@@ -1,6 +1,6 @@
 ## Stock Trend Predictor
 
-Personal long-only stock and ETF trend prediction app. Not for active trading — for directional awareness over 1M, 3M, 6M, and 1Y horizons.
+Personal long-only stock and ETF trend prediction app. Not for active trading — for directional awareness over 3M, 6M, and 1Y horizons.
 
 ### Stack
 - **Frontend:** Next.js 15 App Router + TypeScript + Tailwind (deploys to Vercel)
@@ -13,10 +13,10 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
 
 **Production: LightGBM GBDT cross-sectional ranker** (`backend/ml/gbm_inference.py`)
 - One shallow model per horizon (3M, 6M, 1Y) — 1M has no detectable signal, skip it
-- Training target: rank-normalized cross-sectional return (demean, rank-normalize per date)
-- 19 features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, 2 FinBERT sentiment rolling averages
+- Per-horizon training target (`PRODUCTION_HORIZON_SPECS` in gbm_baseline.py): 3M/6M = rank-normalized cross-sectional return; 1Y = beta-residualized return (strips market beta toward idiosyncratic alpha). Scored by cross-sectional rank-IC.
+- 20 base features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, 2 FinBERT sentiment rolling averages. 6M + 1Y also include LSEG `revenue_surprise` (promoted via walk-forward ablation). Other LSEG packs (analyst revisions, forward valuation) exist as opt-in `--with-*` flags but didn't beat the null.
 - `n_jobs=1` required (MPS + multiprocessing conflict on M4)
-- Walk-forward validated ICIR: 3M=0.45/t=5.4, 6M=0.64/t=7.5, 1Y=0.55/t=6.2
+- Walk-forward validated ICIR (de-survivorshipped universe, incl. removed-from-index names): 3M=0.41/t=5.5, 6M=0.44/t=5.9 (+revenue_surprise), 1Y=0.45/t=6.0 (+revenue_surprise). NOTE: earlier survivor-only ICIRs were higher (e.g. 6M 0.64) but inflated by survivorship bias.
 - Signal is cross-sectional (relative ranking), not absolute direction — absolute direction has no detectable edge
 
 **Shelved: PatchTST transformer** (`backend/ml/model.py`, `train.py`, `dataset.py`)
@@ -26,12 +26,12 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
 ### Architecture
 
 ```
-yfinance / SEC EDGAR
+yfinance / SEC EDGAR / LSEG Workspace
         |
-backend/ingestion/          prices.py  fundamentals.py  headlines.py
+backend/ingestion/          prices.py  fundamentals.py  headlines.py  estimates.py
         |                   (asyncpg upserts to Supabase)
         v
-Supabase Postgres           price_history  fundamentals  headlines  sentiment_daily
+Supabase Postgres           price_history  fundamentals  headlines  sentiment_daily  analyst_estimates
         |
 backend/ml/                 gbm_inference.py  (reads frames, trains, writes predictions)
         |
@@ -56,12 +56,14 @@ backend/
     prices.py             yfinance incremental ingest + drift detection; entry: ingest_recent()
     fundamentals.py       SEC EDGAR companyfacts parser + upsert; entry: ingest_fundamentals()
     headlines.py          yfinance news fetch, FinBERT scoring, sentiment_daily recompute; entry: ingest_sentiment()
+    estimates.py          LSEG (lseg.data) analyst estimates → analyst_estimates; entry: ingest_estimates()
   jobs/
     daily_pipeline.py     Orchestrator: prices → sentiment → fundamentals (Fri) → inference (Fri+month-start)
+    promote_model.py      Promote a candidate model_version → production (retires the old one, atomic)
   ml/
-    features.py           build_sample(): 12-feature point-in-time assembly, seq_len=252
-    dataset.py            TickerFrame, train/val/holdout split (T-18mo / T-18mo…T-6mo / ≥T-6mo)
-    gbm_baseline.py       Walk-forward LightGBM baseline, FEATURE_COLS (19), rank-IC scoring
+    features.py           build_sample(): 12-feature point-in-time assembly, seq_len=252 (transformer path)
+    dataset.py            TickerFrame, load_frames(+_cached experiment cache), train/val/holdout split
+    gbm_baseline.py       Walk-forward LightGBM, FEATURE_COLS (20) + opt-in packs (valuation/quality/LSEG estimate), rank-IC scoring, PRODUCTION_HORIZON_SPECS
     gbm_inference.py      Production: fit per-horizon GBDTs, score cross-section, upsert predictions
     model.py              PatchTST transformer (shelved)
     train.py              Transformer training harness (shelved)
@@ -76,14 +78,16 @@ backend/
       rankings.py         Prediction/ranking endpoints
       tickers.py          Ticker add/search
   db/
-    schema.sql            9 tables: tickers, price_history, fundamentals, headlines,
-                          sentiment_daily, portfolio_holdings, model_versions, predictions, ingestion_runs
+    schema.sql            10 tables: tickers, price_history, fundamentals, headlines,
+                          sentiment_daily, analyst_estimates, portfolio_holdings, model_versions, predictions, ingestion_runs
     rls.sql               RLS on portfolio_holdings (user_id scoped)
-    seed_tickers.sql      35-ticker starter universe (S&P 500 sample + ETFs)
+    seed_tickers.sql      35-ticker starter seed (live universe is ~716: 507 active + 209 removed-from-index)
     migrations/
       001_headlines_score_date.sql
-  tests/                  8 modules, ~78 tests (prices drift, features no-lookahead,
-                          dataset splits, model arch, GBM baseline, API, sentiment bucketing, fundamentals parser)
+      002_analyst_estimates.sql
+  tests/                  12 modules, ~126 tests (prices drift, features no-lookahead, dataset splits,
+                          model arch, GBM baseline, API, sentiment, fundamentals parser, frame cache,
+                          estimate ingestion + estimate-feature PIT)
 
 frontend/
   src/app/
@@ -117,9 +121,12 @@ scripts/                  One-off backfill + seed utilities (run with python -m 
   backfill_prices.py      Price history backfill
   backfill_fundamentals.py  EDGAR fundamentals backfill
   backfill_sentiment.py   Historical sentiment backfill
+  backfill_estimates.py   LSEG analyst-estimate backfill (--missing-only, --symbols); needs Workspace running
   backfill_ciks.py        Populate CIKs from ticker symbols
   _inspect_prices.py      Debug utility
   _inspect_fundamentals.py  Debug utility
+  _probe_lseg.py          One-off LSEG field/PIT-history probe
+  measure_egress.py       Supabase egress attribution (read-only)
 
 deploy/
   launchd/
@@ -139,7 +146,8 @@ Each stage logs start/finish/status to `ingestion_runs`. The orchestrator adds a
 
 ### Key invariants
 
-- **No lookahead**: all feature joins use `filed_at` (SEC receipt date), not `period_end`. Features are point-in-time as of the sample date.
+- **No lookahead**: feature joins are point-in-time as of the sample date — fundamentals on `filed_at` (SEC receipt), LSEG estimates on `as_of_date` (observation date), each looked up independently per field; never `period_end`.
+- **Survivorship**: the universe includes removed-from-index names (`active=false`, `removed_at` set) with their price history, so the cross-sectional panel isn't survivor-only (de-survivorshipping deflated older ICIRs to honest levels). Estimates now cover removed names; fundamentals/sentiment for them are still a gap.
 - **Cross-sectional scoring**: `direction_prob` in `predictions` stores the clipped predicted percentile rank (0–1), not a calibrated probability. Dashboard copy should say "relative rank."
 - **Rank stability** (`predictions.confidence`): std of predicted rank across the last ≤3 scoring dates. Lower = steadier model view of that name. Null if fewer than 2 dates available.
 - **Horizon trading days**: 1M=21, 3M=63, 6M=126, 1Y=252. Defined in `calendar.py:HORIZON_TRADING_DAYS`.
@@ -150,6 +158,7 @@ Each stage logs start/finish/status to `ingestion_runs`. The orchestrator adds a
 - Price/volume: yfinance (incremental, drift-corrected for splits/dividends)
 - Fundamentals: SEC EDGAR companyfacts XBRL API (10-K + 10-Q, TTM where applicable)
 - Sentiment: yfinance news (~30 days lookback) scored by FinBERT (`ProsusAI/finbert`)
+- Analyst estimates: LSEG Workspace via `lseg.data` desktop session (recommendation/price-target consensus, revenue estimates + actuals, forward P/E & EV/EBITDA); monthly point-in-time history. Manual backfill only — not a daily pipeline stage (the desktop session needs Workspace running locally), so estimates go stale unless re-backfilled.
 - Macro: deliberately excluded (scope decision)
 
 ### Scope
@@ -157,4 +166,54 @@ Each stage logs start/finish/status to `ingestion_runs`. The orchestrator adds a
 - Options support deferred (requires Monte Carlo pricer)
 - Personal tool, not a hosted service
 - Screener page is a stub
-- Auto-promotion of candidate → production model versions not yet implemented
+- Candidate → production promotion is manual (`backend/jobs/promote_model.py`); auto-promotion not implemented
+- Whole-pipeline de-survivorship incomplete: removed-from-index names lack fundamentals/sentiment
+
+1. Think Before Coding
+Don't assume. Don't hide confusion. Surface tradeoffs.
+
+Before implementing:
+
+State your assumptions explicitly. If uncertain, ask.
+If multiple interpretations exist, present them - don't pick silently.
+If a simpler approach exists, say so. Push back when warranted.
+If something is unclear, stop. Name what's confusing. Ask.
+2. Simplicity First
+Minimum code that solves the problem. Nothing speculative.
+
+No features beyond what was asked.
+No abstractions for single-use code.
+No "flexibility" or "configurability" that wasn't requested.
+No error handling for impossible scenarios.
+If you write 200 lines and it could be 50, rewrite it.
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+
+3. Surgical Changes
+Touch only what you must. Clean up only your own mess.
+
+When editing existing code:
+
+Don't "improve" adjacent code, comments, or formatting.
+Don't refactor things that aren't broken.
+Match existing style, even if you'd do it differently.
+If you notice unrelated dead code, mention it - don't delete it.
+When your changes create orphans:
+
+Remove imports/variables/functions that YOUR changes made unused.
+Don't remove pre-existing dead code unless asked.
+The test: Every changed line should trace directly to the user's request.
+
+4. Goal-Driven Execution
+Define success criteria. Loop until verified.
+
+Transform tasks into verifiable goals:
+
+"Add validation" → "Write tests for invalid inputs, then make them pass"
+"Fix the bug" → "Write a test that reproduces it, then make it pass"
+"Refactor X" → "Ensure tests pass before and after"
+For multi-step tasks, state a brief plan:
+
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.

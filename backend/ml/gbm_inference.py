@@ -285,7 +285,11 @@ async def run(args) -> None:
         grid = sorted(set(grid + [as_of]))
 
         print(f"loaded {len(frames)} tickers ({len(active_ids)} active); preparing panel ...")
-        panel = prepare_panel(frames, grid, n_buckets=args.n_buckets)
+        # Rank-normalize every feature any horizon uses (not just FEATURE_COLS), so
+        # promoted packs (e.g. revenue_surprise on 6M/1Y) are normalized exactly as
+        # they were during the walk-forward validation that promoted them.
+        rank_cols = sorted({c for s in specs.values() for c in _spec_feature_cols(s)})
+        panel = prepare_panel(frames, grid, n_buckets=args.n_buckets, rank_cols=rank_cols)
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
 

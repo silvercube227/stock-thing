@@ -92,10 +92,25 @@ EARNINGS_REACTION_FEATURES = [
     "filing_drift_30d", "filing_surprise_3d",
     "filings_recency_days", "filings_in_90d",
 ]
+# LSEG/I-B-E-S analyst-estimate packs (opt-in; require analyst_estimates ingested).
+# rec_mean is the consensus rating (1=Strong Buy .. 5=Sell), so a DROP = upgrades;
+# rec_rev_* are (prior - current) so "net upgrades" reads positive.
+ANALYST_REVISION_FEATURES = [
+    "rec_mean_level", "rec_rev_30d", "rec_rev_90d", "price_target_rev_90d",
+]
+ESTIMATE_SURPRISE_FEATURES = [
+    "revenue_surprise",
+]
+# Forward valuation stored as yields (inverse multiples) so ranking is monotonic
+# and negative/near-zero denominators don't blow up — mirrors earnings_yield.
+FORWARD_VALUATION_FEATURES = [
+    "forward_earnings_yield", "forward_ebitda_yield", "price_target_upside",
+]
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + SENTIMENT_FEATURES
 EXPERIMENTAL_FEATURES = (
     VALUATION_FEATURES + QUALITY_FEATURES + RESIDUAL_MOM_FEATURES + EARNINGS_REACTION_FEATURES
+    + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + FORWARD_VALUATION_FEATURES
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /
 # earnings-reaction features already adjust for market or filing context so they
@@ -175,11 +190,19 @@ class HorizonSpec:
 #     idiosyncratic alpha. The asymmetry is structural: beta noise dominates 1Y
 #     return variance but is smaller relative to 3M dispersion, and beta_252 is
 #     noisier relative to short-horizon market moves.
+#   - 6M / 1Y feature_cols: + ESTIMATE_SURPRISE_FEATURES (LSEG revenue surprise).
+#     De-survivorshipped walk-forward ablation (2026-05-29): 6M ICIR 0.409→0.442
+#     (+0.033, bootstrap p=0.003, null z=6.5), 1Y 0.378→0.454 (+0.076, null z=9.7).
+#     The other LSEG packs (analyst revisions, forward valuation) did not beat the
+#     null net of surprise, and 3M saw no estimate signal — so only surprise is
+#     promoted, and only at 6M/1Y. (Baselines here are below CLAUDE.md's older
+#     survivor-only ICIRs because the universe now includes removed-from-index names.)
+_BASELINE_PLUS_SURPRISE = FEATURE_COLS + ESTIMATE_SURPRISE_FEATURES
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
     "3M": HorizonSpec(target_mode="rank"),
-    "6M": HorizonSpec(target_mode="rank"),
-    "1Y": HorizonSpec(target_mode="beta_resid"),
+    "6M": HorizonSpec(target_mode="rank", feature_cols=_BASELINE_PLUS_SURPRISE),
+    "1Y": HorizonSpec(target_mode="beta_resid", feature_cols=_BASELINE_PLUS_SURPRISE),
 }
 
 
@@ -471,6 +494,83 @@ def _fundamental_context_asof(fund_rows: list[dict], as_of_dates: list) -> dict[
     return out
 
 
+def _estimates_context_asof(est_rows: list[dict], as_of_dates: list) -> dict[str, list[float]]:
+    """Point-in-time LSEG analyst-estimate features for each as-of date.
+
+    LSEG fields land on different dates (sparse rows), so each field is looked up
+    INDEPENDENTLY: the most recent non-null observation with as_of_date <= d.
+    Revisions compare against the value ~30/90 calendar days earlier. Revenue
+    surprise carries forward the latest report's (actual - pre-report consensus).
+    Forward multiples become yields (inverse); non-positive ratios -> 0. Gaps -> 0.
+
+    `price_target_mean` is returned as an intermediate (build_ticker_rows turns it
+    into price_target_upside with the as-of price); it is not a feature itself.
+    """
+    import bisect
+    from datetime import timedelta
+
+    keys = ("rec_mean_level", "rec_rev_30d", "rec_rev_90d", "price_target_mean",
+            "price_target_rev_90d", "forward_earnings_yield", "forward_ebitda_yield",
+            "revenue_surprise")
+    if not est_rows:
+        return {k: [0.0] * len(as_of_dates) for k in keys}
+
+    rows_sorted = sorted(est_rows, key=lambda r: _as_date(r["as_of_date"]))
+    snap_fields = ("rec_mean", "price_target_mean", "revenue_mean", "fwd_pe", "fwd_ev_ebitda")
+    series: dict[str, tuple[list, list]] = {f: ([], []) for f in snap_fields}
+    rev_dates: list = []
+    rev_actuals: list[float] = []
+    for r in rows_sorted:
+        d = _as_date(r["as_of_date"])
+        for f in snap_fields:
+            v = r.get(f)
+            if v is not None:
+                series[f][0].append(d)
+                series[f][1].append(float(v))
+        ra = r.get("revenue_actual")
+        if ra is not None:
+            rev_dates.append(d)
+            rev_actuals.append(float(ra))
+
+    def asof(field: str, target) -> float | None:
+        dates, vals = series[field]
+        i = bisect.bisect_right(dates, target) - 1
+        return vals[i] if i >= 0 else None
+
+    def surprise_asof(target) -> float | None:
+        i = bisect.bisect_right(rev_dates, target) - 1
+        if i < 0:
+            return None
+        report_date, actual = rev_dates[i], rev_actuals[i]
+        cons = asof("revenue_mean", report_date - timedelta(days=1))  # pre-report consensus
+        if cons is None or cons == 0:
+            return None
+        return (actual - cons) / abs(cons)
+
+    out: dict[str, list[float]] = {k: [] for k in keys}
+    for d in as_of_dates:
+        d = _as_date(d)
+        rec = asof("rec_mean", d)
+        rec30 = asof("rec_mean", d - timedelta(days=30))
+        rec90 = asof("rec_mean", d - timedelta(days=90))
+        pt = asof("price_target_mean", d)
+        pt90 = asof("price_target_mean", d - timedelta(days=90))
+        pe = asof("fwd_pe", d)
+        ev = asof("fwd_ev_ebitda", d)
+        sp = surprise_asof(d)
+
+        out["rec_mean_level"].append(rec if rec is not None else 0.0)
+        out["rec_rev_30d"].append((rec30 - rec) if rec is not None and rec30 is not None else 0.0)
+        out["rec_rev_90d"].append((rec90 - rec) if rec is not None and rec90 is not None else 0.0)
+        out["price_target_mean"].append(pt if pt is not None else 0.0)
+        out["price_target_rev_90d"].append(
+            (pt - pt90) / abs(pt90) if pt is not None and pt90 not in (None, 0) else 0.0)
+        out["forward_earnings_yield"].append(1.0 / pe if pe is not None and pe > 0 else 0.0)
+        out["forward_ebitda_yield"].append(1.0 / ev if ev is not None and ev > 0 else 0.0)
+        out["revenue_surprise"].append(sp if sp is not None else 0.0)
+    return out
+
+
 def _earnings_reaction_asof(
     fund_rows: list[dict],
     bar_positions: list[int],
@@ -680,6 +780,7 @@ def build_ticker_rows(
         adj_close,
         market_returns,
     )
+    est_ctx = _estimates_context_asof(frame.estimates or [], bar_dates)
 
     rows: list[dict] = []
     for j, (g, pos, _bd) in enumerate(entries):
@@ -714,6 +815,16 @@ def build_ticker_rows(
         # Earnings-reaction features are precomputed once per ticker above.
         for name in EARNINGS_REACTION_FEATURES:
             feats[name] = reaction[name][j]
+        # LSEG analyst-estimate features (precomputed per ticker in est_ctx).
+        feats["rec_mean_level"] = est_ctx["rec_mean_level"][j]
+        feats["rec_rev_30d"] = est_ctx["rec_rev_30d"][j]
+        feats["rec_rev_90d"] = est_ctx["rec_rev_90d"][j]
+        feats["price_target_rev_90d"] = est_ctx["price_target_rev_90d"][j]
+        feats["forward_earnings_yield"] = est_ctx["forward_earnings_yield"][j]
+        feats["forward_ebitda_yield"] = est_ctx["forward_ebitda_yield"][j]
+        feats["revenue_surprise"] = est_ctx["revenue_surprise"][j]
+        pt = est_ctx["price_target_mean"][j]
+        feats["price_target_upside"] = ((pt - price) / price) if price and price > 0 and pt else 0.0
         # Panel-level demean overwrites this in `prepare_panel`; until then leave
         # it equal to mom_12_1 so single-ticker callers see a finite value.
         feats["industry_neutral_mom_12_1"] = feats["mom_12_1"]
@@ -1245,6 +1356,12 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(RESIDUAL_MOM_FEATURES)
     if args.with_earnings_reaction:
         cols += list(EARNINGS_REACTION_FEATURES)
+    if args.with_analyst_revisions:
+        cols += list(ANALYST_REVISION_FEATURES)
+    if args.with_estimate_surprise:
+        cols += list(ESTIMATE_SURPRISE_FEATURES)
+    if args.with_forward_valuation:
+        cols += list(FORWARD_VALUATION_FEATURES)
     # De-dupe while preserving order.
     seen: set[str] = set()
     out: list[str] = []
@@ -1372,6 +1489,14 @@ def main() -> None:
                    help="add residual / structural momentum pack")
     p.add_argument("--with-earnings-reaction", action="store_true",
                    help="add filing-drift / surprise reaction pack")
+    p.add_argument("--with-analyst-revisions", action="store_true",
+                   help="add LSEG analyst-revision pack (rec level + 30/90d revisions, "
+                        "price-target revision)")
+    p.add_argument("--with-estimate-surprise", action="store_true",
+                   help="add LSEG revenue-surprise pack")
+    p.add_argument("--with-forward-valuation", action="store_true",
+                   help="add LSEG forward-valuation pack (forward earnings/ebitda yield, "
+                        "price-target upside)")
     p.add_argument("--industry-relative", action="store_true",
                    help="rank-normalize price/fundamental/valuation/quality "
                         "features within (date, industry) instead of universe-wide")

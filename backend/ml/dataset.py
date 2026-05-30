@@ -71,6 +71,8 @@ class TickerFrame:
     shares_outstanding: int | None = None  # from tickers table; used for log_market_cap
     sector: str | None = None
     industry: str | None = None
+    # analyst_estimates rows (as_of_date PIT); None tolerates pre-estimates pickled caches.
+    estimates: list[dict] | None = None
 
 
 @dataclass
@@ -400,6 +402,14 @@ select ticker_id, score_date, rolling_7d, rolling_14d
  order by ticker_id, score_date
 """
 
+_EST_SQL = """
+select ticker_id, as_of_date, rec_mean, price_target_mean,
+       revenue_mean, revenue_actual, fwd_pe, fwd_ev_ebitda
+  from analyst_estimates
+ where ticker_id = any($1::bigint[])
+ order by ticker_id, as_of_date
+"""
+
 
 async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFrame]:
     """Pull all training data from Supabase into per-ticker frames.
@@ -426,10 +436,12 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     price_rows = await pool.fetch(_PRICE_SQL, ids)
     fund_rows = await pool.fetch(_FUND_SQL, ids)
     sent_rows = await pool.fetch(_SENT_SQL, ids)
+    est_rows = await pool.fetch(_EST_SQL, ids)
 
     by_ticker_prices = _group(price_rows)
     by_ticker_fund = _group(fund_rows)
     by_ticker_sent = _group(sent_rows)
+    by_ticker_est = _group(est_rows)
 
     frames: list[TickerFrame] = []
     for r in ticker_rows:
@@ -445,6 +457,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 shares_outstanding=r["shares_outstanding"],
                 sector=r["sector"],
                 industry=r["industry"],
+                estimates=by_ticker_est.get(tid, []),
             )
         )
     return frames

@@ -85,6 +85,31 @@ create index if not exists fundamentals_ticker_filed_idx
     on fundamentals (ticker_id, filed_at);
 
 -- =============================================================
+-- analyst_estimates  (LSEG/I-B-E-S consensus + estimates, point-in-time)
+-- =============================================================
+-- Raw point-in-time snapshots from LSEG Workspace. Like fundamentals we store
+-- RAW values and derive features downstream (revisions, surprise, forward yields
+-- live in backend/ml/gbm_baseline.py). as_of_date is the LSEG observation date —
+-- THE point-in-time join key (analogous to fundamentals.filed_at). Most rows are
+-- monthly consensus snapshots; revenue_actual is sparse (only on report-date rows).
+create table if not exists analyst_estimates (
+    ticker_id           bigint not null references tickers(ticker_id) on delete restrict,
+    as_of_date          date not null,           -- LSEG observation date; the PIT join key
+    rec_mean            numeric,                 -- consensus recommendation (1=Strong Buy .. 5=Sell)
+    price_target_mean   numeric,
+    revenue_mean        numeric,                 -- forward consensus revenue (monthly)
+    revenue_actual      numeric,                 -- reported revenue (report-date rows only)
+    fwd_pe              numeric,                 -- forward P/E ratio
+    fwd_ev_ebitda       numeric,                 -- forward EV/EBITDA ratio
+    ingested_at         timestamptz not null default now(),
+    primary key (ticker_id, as_of_date)
+);
+
+-- Point-in-time lookups join on as_of_date, never a period/fiscal date.
+create index if not exists analyst_estimates_ticker_asof_idx
+    on analyst_estimates (ticker_id, as_of_date);
+
+-- =============================================================
 -- headlines
 -- =============================================================
 create table if not exists headlines (
