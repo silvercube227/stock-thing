@@ -18,9 +18,11 @@ from backend.api.routers.tickers import router as tickers_router
 from backend.config import get_settings
 from backend.ingestion.db import create_pool
 
+_extra_origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    *_extra_origins,
 ]
 
 

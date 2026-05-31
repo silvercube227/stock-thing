@@ -1,0 +1,21 @@
+# Render blueprint for the hosted read-API. The ML/ingestion pipeline stays on the
+# local Mac; this service only reads Supabase + verifies Supabase JWTs + serves live
+# yfinance quotes. Secrets are `sync: false` — their values are entered in the Render
+# dashboard, never committed here.
+services:
+  - type: web
+    name: stock-thing-api
+    runtime: python
+    plan: free
+    buildCommand: pip install ".[api]"
+    startCommand: uvicorn backend.api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DATABASE_URL   # Supabase transaction pooler (host *.pooler.supabase.com, port 6543)
+        sync: false
+      - key: SUPABASE_URL   # https://<project>.supabase.co — for JWKS JWT verification
+        sync: false
+      - key: CORS_ORIGINS   # the Vercel frontend URL, e.g. https://<app>.vercel.app
+        sync: false

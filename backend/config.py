@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     frame_cache_dir: Path = REPO_ROOT / ".frame_cache"
     api_host: str = Field(default="127.0.0.1")
     api_port: int = Field(default=8000)
+    # Comma-separated extra CORS origins for the hosted frontend (e.g. the Vercel
+    # URL). The localhost dev origins are always allowed; this adds to them.
+    cors_origins: str = Field(default="")
 
 
 @lru_cache

@@ -22,6 +22,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Hosted read-API runtime: core deps + yfinance (live quotes in api/quotes.py and
+# api/tickers.py). Deliberately excludes torch/lightgbm/transformers — the API
+# imports no ML code. Used by the Render build: `pip install ".[api]"`.
+api = [
+    "yfinance>=0.2.40",
+]
 ingestion = [
     "yfinance>=0.2.40",
     "pandas>=2.2",
