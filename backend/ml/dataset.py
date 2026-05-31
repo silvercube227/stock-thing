@@ -411,6 +411,20 @@ select ticker_id, as_of_date, rec_mean, price_target_mean,
 """
 
 
+async def _fetch_chunked(pool, sql: str, ids: list[int], chunk: int = 100) -> list:
+    """Run an `ids = any($1)` query in ticker-id batches and concatenate results.
+
+    A single full-history fetch can exceed the Supabase session pooler's transfer
+    limit and get dropped (ConnectionDoesNotExistError); batching keeps each
+    transfer small. Whole tickers stay within one batch so per-ticker row order
+    (and thus _group) is preserved.
+    """
+    out: list = []
+    for i in range(0, len(ids), chunk):
+        out.extend(await pool.fetch(sql, ids[i:i + chunk]))
+    return out
+
+
 async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFrame]:
     """Pull all training data from Supabase into per-ticker frames.
 
@@ -433,10 +447,13 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     if not ids:
         return []
 
-    price_rows = await pool.fetch(_PRICE_SQL, ids)
-    fund_rows = await pool.fetch(_FUND_SQL, ids)
-    sent_rows = await pool.fetch(_SENT_SQL, ids)
-    est_rows = await pool.fetch(_EST_SQL, ids)
+    # Fetch in ticker-id batches: the full price pull (1.6M rows) is large enough
+    # that the Supabase session pooler drops the single transfer mid-stream. Each
+    # ticker's rows stay contiguous within a batch, so _group ordering is intact.
+    price_rows = await _fetch_chunked(pool, _PRICE_SQL, ids)
+    fund_rows = await _fetch_chunked(pool, _FUND_SQL, ids)
+    sent_rows = await _fetch_chunked(pool, _SENT_SQL, ids)
+    est_rows = await _fetch_chunked(pool, _EST_SQL, ids)
 
     by_ticker_prices = _group(price_rows)
     by_ticker_fund = _group(fund_rows)
