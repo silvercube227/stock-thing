@@ -41,6 +41,7 @@ async def rankings(
               from predictions p
               join tickers t on t.ticker_id = p.ticker_id
              where p.model_version_id = $1 and p.horizon = $2
+               and t.user_added = false
                and p.as_of_date = (
                    select max(as_of_date) from predictions
                     where model_version_id = $1 and horizon = $2

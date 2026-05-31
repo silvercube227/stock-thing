@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { searchTickers, type TickerSummary } from "@/lib/api";
+import { useRouter } from "next/navigation";
+import { addTicker, searchTickers, type TickerSummary } from "@/lib/api";
 
 export function AddTickerControl({
   onAdd,
@@ -10,6 +11,7 @@ export function AddTickerControl({
   onAdd: (symbol: string, shares: number, costBasis?: number | null) => Promise<void>;
   existingTickerIds: Set<number>;
 }) {
+  const router = useRouter();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<TickerSummary[]>([]);
   const [selected, setSelected] = useState<TickerSummary | null>(null);
@@ -17,23 +19,45 @@ export function AddTickerControl({
   const [cost, setCost] = useState("");
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (selected || query.trim().length === 0) {
       setResults([]);
+      setSearched(false);
       return;
     }
+    setSearched(false);
     const id = setTimeout(async () => {
       try {
         setResults(await searchTickers(query.trim()));
         setOpen(true);
       } catch {
         setResults([]);
+      } finally {
+        setSearched(true);
       }
     }, 200);
     return () => clearTimeout(id);
   }, [query, selected]);
+
+  async function addNew() {
+    const sym = query.trim().toUpperCase();
+    if (!sym) return;
+    setAdding(true);
+    setAddError(null);
+    try {
+      await addTicker(sym);
+      router.push(`/ticker/${encodeURIComponent(sym)}`);
+    } catch (e) {
+      setAddError(e instanceof Error ? e.message : "Could not add ticker");
+    } finally {
+      setAdding(false);
+    }
+  }
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
@@ -112,6 +136,22 @@ export function AddTickerControl({
               })}
             </ul>
           )}
+          {open && searched && results.length === 0 && query.trim() && !selected && (
+            <div className="absolute z-10 mt-1 w-full rounded-xl border border-border bg-surface p-3 shadow-2xl shadow-black/60">
+              <p className="text-xs text-muted">
+                No covered match for{" "}
+                <span className="font-semibold tracking-wide">{query.trim().toUpperCase()}</span>.
+              </p>
+              <button
+                onClick={addNew}
+                disabled={adding}
+                className="mt-2 w-full rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-background transition-opacity hover:opacity-90 disabled:opacity-40"
+              >
+                {adding ? "Queuing…" : `Add & score "${query.trim().toUpperCase()}" (off-index)`}
+              </button>
+              {addError && <p className="mt-2 text-[11px] text-down">{addError}</p>}
+            </div>
+          )}
         </div>
 
         <input
@@ -144,7 +184,8 @@ export function AddTickerControl({
         </button>
       </div>
       <p className="mt-2 text-[11px] text-faint">
-        Limited to covered tickers (the model&apos;s tracked universe).
+        Search covered tickers, or add any symbol to score it against the S&P
+        (off-index accuracy may be lower).
       </p>
     </div>
   );

@@ -651,6 +651,79 @@ def test_fit_horizon_models_uses_per_horizon_target_mode():
     assert linear_models == {}
 
 
+def _tiny_panel(n_names: int = 8):
+    """3-date panel with every column fit_horizon_models needs (mirrors the
+    per-horizon-target test above)."""
+    dates = [date(2020, 1, 31), date(2020, 2, 28), date(2020, 3, 31)]
+    rng = np.random.default_rng(7)
+    rows = []
+    for d in dates:
+        for tid in range(n_names):
+            row = {"date": d, "ticker_id": tid, "beta_252d": 1.0}
+            for c in FEATURE_COLS:
+                row[c] = float(rng.normal())
+            for h in HORIZONS:
+                row[f"r_{h}"] = float(rng.normal(0, 0.05))
+                row[f"mask_{h}"] = True
+                row[f"y_{h}_return"] = row[f"r_{h}"]
+                row[f"y_{h}_rank"] = float((tid + 1) / n_names)
+                row[f"y_{h}_sector_return"] = row[f"r_{h}"]
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_fit_horizon_models_excludes_ids():
+    # User-added tickers must be droppable from training while everyone else is
+    # unaffected — the guarantee that off-index names never train the model.
+    from backend.ml.gbm_baseline import HorizonSpec, LGBMConfig
+    from backend.ml.gbm_inference import fit_horizon_models
+
+    panel = _tiny_panel(n_names=8)
+    specs = {"3M": HorizonSpec(target_mode="rank", lgb_cfg=LGBMConfig(n_estimators=10))}
+    as_of = date(2020, 3, 31)
+
+    _, base_windows, base_ids, _ = fit_horizon_models(
+        panel, specs, seed=1, as_of=as_of, n_seeds=1
+    )
+    _, ex_windows, ex_ids, _ = fit_horizon_models(
+        panel, specs, seed=1, as_of=as_of, n_seeds=1, exclude_ids={0, 1}
+    )
+    assert {0, 1} <= base_ids
+    assert {0, 1}.isdisjoint(ex_ids)          # excluded names never trained
+    assert ex_windows["3M"]["rows"] < base_windows["3M"]["rows"]
+    assert ex_windows["3M"]["tickers"] == base_windows["3M"]["tickers"] - 2
+
+
+def test_specs_from_serialized_roundtrips():
+    from backend.ml.gbm_baseline import HorizonSpec, LGBMConfig
+    from backend.ml.gbm_inference import _serialize_spec, _specs_from_serialized
+
+    spec = HorizonSpec(
+        target_mode="sector_return",
+        lgb_cfg=LGBMConfig(n_estimators=123, num_leaves=9),
+        feature_cols=["mom_1m", "vol_20d"],
+        linear_blend=0.3,
+        ridge_alpha=5.0,
+    )
+    rebuilt = _specs_from_serialized({"6M": _serialize_spec(spec)})["6M"]
+    assert rebuilt.target_mode == "sector_return"
+    assert rebuilt.feature_cols == ["mom_1m", "vol_20d"]
+    assert rebuilt.linear_blend == 0.3
+    assert rebuilt.ridge_alpha == 5.0
+    assert rebuilt.lgb_cfg.n_estimators == 123
+    assert rebuilt.lgb_cfg.num_leaves == 9
+
+
+def test_save_load_bundle_roundtrips(tmp_path):
+    from backend.ml.gbm_inference import load_bundle, save_bundle
+
+    bundle = {"model_type": "x", "as_of": "2020-03-31", "specs": {"6M": {"k": 1}}}
+    path = tmp_path / "b.pkl"
+    sha = save_bundle(path, bundle)
+    assert path.exists() and len(sha) == 64
+    assert load_bundle(path) == bundle
+
+
 def test_apply_cross_horizon_shrink_pulls_1y_toward_6m():
     from backend.ml.gbm_inference import apply_cross_horizon_shrink
 

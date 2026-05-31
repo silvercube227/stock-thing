@@ -104,6 +104,31 @@ class TickerSummary(BaseModel):
     sector: str | None = None
     industry: str | None = None
     asset_type: str | None = None
+    # True for off-index tickers the user added themselves: scored by the model
+    # but never trained on, and excluded from the screener. Drives the UI
+    # accuracy disclaimer.
+    user_added: bool = False
+
+
+class AddTickerRequest(BaseModel):
+    """Body for POST /tickers — queue ingestion + scoring of an off-index symbol."""
+
+    symbol: str
+
+
+class AddTickerResponse(BaseModel):
+    symbol: str
+    # "queued" = background job started; "exists" = already a covered ticker.
+    status: str
+    run_id: int | None = None
+    ticker_id: int | None = None
+
+
+class TickerStatus(BaseModel):
+    symbol: str
+    # "running" | "ready" | "insufficient_history" | "failed" | "unknown"
+    status: str
+    message: str | None = None
 
 
 class TickerDetail(BaseModel):

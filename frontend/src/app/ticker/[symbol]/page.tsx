@@ -38,7 +38,7 @@ export default function TickerPage({
   const { symbol } = use(params);
   const router = useRouter();
   const { session, loading: authLoading } = useAuth();
-  const { detail, prices, loading, error } = useTickerDetail(symbol);
+  const { detail, prices, loading, error, predStatus } = useTickerDetail(symbol);
 
   useEffect(() => {
     if (!authLoading && !session) router.replace("/login");
@@ -78,6 +78,17 @@ export default function TickerPage({
           </div>
         ) : detail ? (
           <>
+            {detail.ticker.user_added && (
+              <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/8 px-4 py-2.5 text-[13px] text-amber-300">
+                Off-index ticker — model accuracy may be lower than for S&P 500 names.
+                {detail.ticker.sector == null && (
+                  <span className="ml-1 text-faint">
+                    Sector unavailable — within-sector rank not available.
+                  </span>
+                )}
+              </div>
+            )}
+
             <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
               <div>
                 <h1 className="text-2xl font-semibold tracking-tight">
@@ -113,10 +124,29 @@ export default function TickerPage({
               </Card>
 
               <Card title="Projected performance">
-                <RankGaugeRow
-                  predictions={detail.predictions}
-                  asOf={detail.as_of_date}
-                />
+                {detail.predictions.length > 0 ? (
+                  <RankGaugeRow
+                    predictions={detail.predictions}
+                    asOf={detail.as_of_date}
+                  />
+                ) : predStatus === "running" ? (
+                  <div className="flex flex-col items-center gap-2 py-8 text-center text-sm text-muted">
+                    <span className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-accent" />
+                    Scoring this ticker… this can take a minute.
+                  </div>
+                ) : predStatus === "insufficient_history" ? (
+                  <p className="py-8 text-center text-sm text-muted">
+                    Not enough price history (need ~1 year) to score this ticker.
+                  </p>
+                ) : predStatus === "failed" ? (
+                  <p className="py-8 text-center text-sm text-down">
+                    Scoring failed. Try removing and re-adding this ticker.
+                  </p>
+                ) : (
+                  <p className="py-8 text-center text-sm text-muted">
+                    No predictions available for this ticker.
+                  </p>
+                )}
               </Card>
             </div>
 

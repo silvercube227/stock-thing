@@ -502,6 +502,26 @@ def _frame_cache_key(symbols: list[str] | None) -> str:
     return f"sym-{digest}"
 
 
+def write_frames_cache(frames: list[TickerFrame], symbols: list[str] | None = None) -> "Path":
+    """Atomically write `frames` to the on-disk cache for a symbol set.
+
+    Lets a caller that already has frames in memory (e.g. production inference,
+    which pulls fresh) warm the cache with no extra Supabase egress, so the
+    single-ticker scoring path can read the universe from disk instead of
+    re-pulling the full history.
+    """
+    from pathlib import Path
+
+    cache_dir = get_settings().frame_cache_dir
+    path = cache_dir / f"frames_{_frame_cache_key(symbols)}.pkl"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".pkl.tmp")
+    with tmp.open("wb") as f:
+        pickle.dump(frames, f)
+    tmp.replace(path)  # atomic: never leave a half-written cache file
+    return path
+
+
 async def load_frames_cached(
     pool, symbols: list[str] | None = None, refresh: bool = False
 ) -> list[TickerFrame]:
@@ -528,11 +548,7 @@ async def load_frames_cached(
     why = "refresh" if refresh else "miss"
     print(f"[frame-cache] {why}: pulling full history from Supabase ...")
     frames = await load_frames(pool, symbols=symbols)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".pkl.tmp")
-    with tmp.open("wb") as f:
-        pickle.dump(frames, f)
-    tmp.replace(path)  # atomic: never leave a half-written cache file
+    write_frames_cache(frames, symbols=symbols)
     print(f"[frame-cache] wrote {path} ({len(frames)} tickers)")
     return frames
 

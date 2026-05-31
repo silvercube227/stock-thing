@@ -27,6 +27,7 @@ create table if not exists tickers (
     sector          text,
     industry        text,
     active          boolean not null default true,
+    user_added      boolean not null default false,  -- off-index, user-added: scored but never trained on (migration 006)
     added_at        timestamptz not null default now(),
     removed_at      timestamptz,
     embedding_idx        integer not null unique default nextval('ticker_embedding_seq'),

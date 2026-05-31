@@ -13,6 +13,17 @@ not a calibrated probability.
 
 from __future__ import annotations
 
+import os
+
+# libomp coexistence: this process loads torch (via dataset -> model) AND
+# lightgbm (when models are fit, or unpickled in the --score-ticker path). Each
+# ships its own OpenMP runtime, and a multi-threaded team from one alongside the
+# other segfaults on macOS — exactly what crashed the reloaded-model predict path
+# (SIGSEGV at load_bundle). Forcing single-threaded OpenMP BEFORE those imports
+# sidesteps it. Fit already uses n_jobs=1; this extends the same guard to the
+# unpickle/predict path. setdefault so an explicit override still wins.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import argparse
 import asyncio
 import hashlib
@@ -26,7 +37,12 @@ import numpy as np
 
 from backend.config import get_settings
 from backend.ingestion.db import pool_context
-from backend.ml.dataset import build_calendar_grid, load_frames
+from backend.ml.dataset import (
+    build_calendar_grid,
+    load_frames,
+    load_frames_cached,
+    write_frames_cache,
+)
 from backend.ml.gbm_baseline import (
     FEATURE_COLS,
     PRODUCTION_HORIZON_SPECS,
@@ -65,6 +81,7 @@ def fit_horizon_models(
     seed: int,
     as_of: date,
     n_seeds: int = 1,
+    exclude_ids: set[int] | None = None,
 ):
     """Fit one LightGBM model ensemble per horizon, each with its own spec.
 
@@ -73,6 +90,10 @@ def fit_horizon_models(
         so `score_current_cross_section` can average uniformly.
       - `linear_models[h]` = `(ridge_model, blend_weight)` only for horizons whose
         spec sets `linear_blend > 0`; absent otherwise (pure GBDT).
+
+    `exclude_ids` drops those ticker_ids from the training rows (used to keep
+    user-added off-index names out of the model — they are still scored, just
+    never trained on). Default None preserves the original behavior exactly.
     """
     models: dict[str, list] = {}
     linear_models: dict[str, tuple] = {}
@@ -87,6 +108,8 @@ def fit_horizon_models(
             & panel[m_col].astype(bool)
             & panel[t_col].notna()
         ]
+        if exclude_ids:
+            train = train[~train["ticker_id"].isin(exclude_ids)]
         if train.empty:
             raise ValueError(
                 f"no labeled training rows for {h} target={spec.target_mode}"
@@ -275,6 +298,31 @@ def save_bundle(path: Path, bundle: dict) -> str:
     return _sha256(path)
 
 
+def load_bundle(path: Path) -> dict:
+    """Reload a saved model artifact (the dict written by save_bundle)."""
+    with path.open("rb") as f:
+        return pickle.load(f)
+
+
+def _specs_from_serialized(serialized: dict) -> dict[str, HorizonSpec]:
+    """Rebuild per-horizon HorizonSpecs from a saved artifact's `specs` dict.
+
+    Uses the spec stored WITH the model (its exact training feature_cols), not the
+    live PRODUCTION_HORIZON_SPECS, so reloaded scoring can't drift if the code's
+    feature packs change after the model was promoted.
+    """
+    out: dict[str, HorizonSpec] = {}
+    for h, d in serialized.items():
+        out[h] = HorizonSpec(
+            target_mode=d["target_mode"],
+            lgb_cfg=LGBMConfig(**d["lgb_cfg"]),
+            feature_cols=d.get("feature_cols"),
+            linear_blend=d.get("linear_blend", 0.0),
+            ridge_alpha=d.get("ridge_alpha", 10.0),
+        )
+    return out
+
+
 async def upsert_predictions(
     pool, model_version_id, as_of: date, prediction_rows: list[dict]
 ) -> None:
@@ -356,8 +404,17 @@ async def run(args) -> None:
         frames = await load_frames(pool)
         if not frames:
             raise SystemExit("no ticker frames loaded")
+        # Warm the on-disk frame cache with the freshly-pulled frames (no extra
+        # egress) so the single-ticker add path (score_single_ticker) reads the
+        # universe from disk instead of re-pulling the full history per add.
+        write_frames_cache(frames)
         active_rows = await pool.fetch("select ticker_id, symbol from tickers where active = true")
         active_ids = {int(r["ticker_id"]) for r in active_rows}
+        # User-added off-index names are scored (they're active) but must never
+        # train the model — exclude them from the fit so the production model and
+        # the S&P ranking stay exactly what they'd be on the index alone.
+        user_added_rows = await pool.fetch("select ticker_id from tickers where user_added = true")
+        user_added_ids = {int(r["ticker_id"]) for r in user_added_rows}
         grid = build_calendar_grid(frames)
         as_of = date.fromisoformat(args.as_of) if args.as_of else max(grid)
         grid = sorted(set(grid + [as_of]))
@@ -372,7 +429,7 @@ async def run(args) -> None:
             raise SystemExit("empty panel (not enough history?)")
 
         models, train_windows, trained_ids, linear_models = fit_horizon_models(
-            panel, specs, args.seed, as_of, n_seeds=args.n_seeds
+            panel, specs, args.seed, as_of, n_seeds=args.n_seeds, exclude_ids=user_added_ids
         )
         prediction_rows = score_current_cross_section(
             panel, models, specs, as_of, active_ids, linear_models=linear_models
@@ -493,6 +550,111 @@ async def insert_model_version_with_id(
     )
 
 
+async def _resolve_production_model(pool) -> tuple[str, str]:
+    """Return (model_version_id, weights_path) for the production model.
+
+    Falls back to the most recently created candidate when no model is promoted
+    yet (mirrors the dashboard's _resolve_active_model), so a fresh setup still
+    scores against whatever model wrote the current cross-section.
+    """
+    row = await pool.fetchrow(
+        "select model_version_id, weights_path from model_versions "
+        "where status = 'production' order by promoted_at desc nulls last limit 1"
+    )
+    if row is None:
+        row = await pool.fetchrow(
+            "select model_version_id, weights_path from model_versions "
+            "order by created_at desc limit 1"
+        )
+    if row is None:
+        raise SystemExit("no model_versions row — train a model before scoring tickers")
+    return str(row["model_version_id"]), str(row["weights_path"])
+
+
+async def score_single_ticker(pool, symbol: str) -> dict:
+    """Score ONE already-ingested ticker against the current S&P cross-section.
+
+    Reloads the production model (no retraining), ranks the ticker against the
+    full cross-section ∪ {this ticker} at the model's latest stored prediction
+    date, and writes ONLY this ticker's rows under the existing production
+    model_version_id. Existing S&P prediction rows are never read or written, so
+    the S&P ranking is untouched.
+
+    Returns a structured outcome dict (no DB-status side effects — the orchestrator
+    owns the ingestion_runs row): {"status": "scored", "symbol", "as_of", "ranks"}
+    or {"status": "insufficient_history", "symbol"}.
+    """
+    model_version_id, weights_path = await _resolve_production_model(pool)
+    as_of = await pool.fetchval(
+        "select max(as_of_date) from predictions where model_version_id = $1",
+        model_version_id,
+    )
+    if as_of is None:
+        raise SystemExit(
+            f"production model {model_version_id} has no predictions yet — "
+            "run a full inference pass before scoring individual tickers"
+        )
+
+    trow = await pool.fetchrow(
+        "select ticker_id from tickers where upper(symbol) = upper($1)", symbol
+    )
+    if trow is None:
+        raise SystemExit(f"ticker not found (ingest it first): {symbol}")
+    new_id = int(trow["ticker_id"])
+
+    path = Path(weights_path)
+    if not path.exists():
+        raise SystemExit(f"model artifact missing on disk: {path}")
+    bundle = load_bundle(path)
+    models = bundle["models"]
+    linear_models = bundle.get("linear_models", {})
+    specs = _specs_from_serialized(bundle["specs"])
+
+    # DB-efficient load: reuse the cached universe (no full-universe re-pull) and
+    # fetch only the new ticker fresh, then splice it in (dropping any stale copy
+    # already in the cache).
+    universe = await load_frames_cached(pool)
+    new_frames = await load_frames(pool, symbols=[symbol])
+    if not new_frames:
+        raise SystemExit(f"no frame data for {symbol} — ingestion incomplete")
+    frames = [f for f in universe if f.ticker_id != new_id] + new_frames
+
+    grid = build_calendar_grid(frames)
+    grid = sorted(set(grid + [as_of]))
+    rank_cols = sorted({c for s in specs.values() for c in _spec_feature_cols(s)})
+    panel = prepare_panel(frames, grid, n_buckets=5, rank_cols=rank_cols)
+
+    # Rank against the S&P cross-section ONLY (+ this ticker), so the percentile
+    # means "vs the S&P" — not vs other off-index names a user happens to have added.
+    index_rows = await pool.fetch(
+        "select ticker_id from tickers where active = true and user_added = false"
+    )
+    active_ids = {int(r["ticker_id"]) for r in index_rows} | {new_id}
+
+    prediction_rows = score_current_cross_section(
+        panel, models, specs, as_of, active_ids, linear_models=linear_models
+    )
+    mine = [r for r in prediction_rows if r["ticker_id"] == new_id]
+    if not mine:
+        # build_ticker_rows dropped it: <252 trading days of history at as_of.
+        return {"status": "insufficient_history", "symbol": symbol}
+
+    horizons = list(specs.keys())
+    prior = await fetch_prior_ranks(pool, [new_id], horizons, as_of)
+    for r in mine:
+        series = prior.get((new_id, r["horizon"]), []) + [r["relative_rank"]]
+        r["confidence"] = rank_stability(series)
+
+    await upsert_predictions(pool, model_version_id, as_of, mine)
+    return {
+        "status": "scored",
+        "symbol": symbol,
+        "as_of": as_of.isoformat(),
+        "model_version_id": model_version_id,
+        "ranks": {r["horizon"]: r["relative_rank"] for r in mine},
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Train GBDT rankers and write current predictions")
     p.add_argument("--as-of", help="score this date (default = latest month/grid date)")
@@ -519,8 +681,27 @@ def main() -> None:
                         "average their raw predictions before rank-transforming "
                         "(default 8; reduces seed variance at low compute cost)")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--score-ticker", metavar="SYMBOL",
+                   help="score ONE already-ingested ticker against the current S&P "
+                        "cross-section using the existing production model (no "
+                        "retraining, writes only that ticker's rows). Skips the "
+                        "training/scoring/upsert pass entirely.")
     args = p.parse_args()
+    if args.score_ticker:
+        asyncio.run(_run_score_ticker(args.score_ticker))
+        return
     asyncio.run(run(args))
+
+
+async def _run_score_ticker(symbol: str) -> None:
+    async with pool_context(command_timeout=300) as pool:
+        result = await score_single_ticker(pool, symbol)
+    # Single machine-readable line the add_ticker orchestrator parses from stdout.
+    print(json.dumps(result))
+    if result["status"] == "scored":
+        print(f"scored {symbol} as_of={result['as_of']} ranks={result['ranks']}")
+    else:
+        print(f"{symbol}: {result['status']}")
 
 
 if __name__ == "__main__":

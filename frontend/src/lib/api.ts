@@ -32,6 +32,23 @@ export interface TickerSummary {
   sector: string | null;
   industry: string | null;
   asset_type: string | null;
+  // Off-index ticker the user added: scored but not trained on. Drives the
+  // accuracy disclaimer.
+  user_added: boolean;
+}
+
+export interface AddTickerResponse {
+  symbol: string;
+  status: string; // "queued" | "exists"
+  run_id: number | null;
+  ticker_id: number | null;
+}
+
+export interface TickerStatus {
+  symbol: string;
+  // "running" | "ready" | "insufficient_history" | "failed" | "unknown"
+  status: string;
+  message: string | null;
 }
 
 export interface HorizonPrediction {
@@ -170,3 +187,12 @@ export const getPrices = (symbol: string, lookback = "1y") =>
 
 export const getRankings = (horizon: string, limit = 500) =>
   apiFetch<RankingResponse>(`/rankings?horizon=${horizon}&limit=${limit}`);
+
+export const addTicker = (symbol: string) =>
+  apiFetch<AddTickerResponse>("/tickers", {
+    method: "POST",
+    body: JSON.stringify({ symbol }),
+  });
+
+export const getTickerStatus = (symbol: string) =>
+  apiFetch<TickerStatus>(`/tickers/${encodeURIComponent(symbol)}/status`);
