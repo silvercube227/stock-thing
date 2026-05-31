@@ -100,9 +100,11 @@ create table if not exists analyst_estimates (
     revenue_mean        numeric,                 -- forward consensus revenue (monthly)
     revenue_actual      numeric,                 -- reported revenue (report-date rows only)
     eps_mean            numeric,                 -- forward consensus EPS (monthly)
-    eps_actual          numeric,                 -- reported EPS (report-date rows only)
+    eps_actual          numeric,                 -- reported EPS (report-date rows only; legacy annual, superseded by earnings_surprises)
     fwd_pe              numeric,                 -- forward P/E ratio
     fwd_ev_ebitda       numeric,                 -- forward EV/EBITDA ratio
+    num_analysts        numeric,                 -- analyst coverage count (revision-momentum pack)
+    pt_num_estimates    numeric,                 -- # price-target estimates (revision-momentum pack)
     ingested_at         timestamptz not null default now(),
     primary key (ticker_id, as_of_date)
 );
@@ -110,6 +112,27 @@ create table if not exists analyst_estimates (
 -- Point-in-time lookups join on as_of_date, never a period/fiscal date.
 create index if not exists analyst_estimates_ticker_asof_idx
     on analyst_estimates (ticker_id, as_of_date);
+
+-- =============================================================
+-- earnings_surprises  (quarterly PEAD: pre-report consensus vs reported actual)
+-- =============================================================
+-- One row per fiscal quarter. report_date is the announcement date and THE point-in-time
+-- join key. Replaces the annual-frequency surprise previously derived from
+-- analyst_estimates.{eps,revenue}_actual. See migrations/005.
+create table if not exists earnings_surprises (
+    ticker_id     bigint not null references tickers(ticker_id) on delete restrict,
+    period_end    date not null,           -- fiscal quarter end
+    report_date   date not null,           -- announcement date; the PIT join key
+    eps_consensus numeric,                 -- pre-report consensus EPS for the quarter
+    eps_actual    numeric,                 -- reported EPS
+    rev_consensus numeric,                 -- pre-report consensus revenue
+    rev_actual    numeric,                 -- reported revenue
+    ingested_at   timestamptz not null default now(),
+    primary key (ticker_id, period_end)
+);
+
+create index if not exists earnings_surprises_ticker_report_idx
+    on earnings_surprises (ticker_id, report_date);
 
 -- =============================================================
 -- headlines

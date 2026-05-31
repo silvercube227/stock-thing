@@ -32,34 +32,34 @@ function RankGauge({
 
   return (
     <div>
-      <div className="mb-1.5 flex items-baseline justify-between">
+      <div className="mb-2 flex items-baseline justify-between">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium">{horizon}</span>
+          <span className="text-xs font-semibold uppercase tracking-widest text-muted">{horizon}</span>
           {lowSignal && (
             <span
               title="Validation shows little to no skill at the 1-month horizon."
-              className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-faint"
+              className="rounded-sm bg-surface-2 px-1.5 py-0.5 text-[9px] uppercase tracking-widest text-faint border border-border"
             >
               low signal
             </span>
           )}
         </div>
-        <span className={`nums text-sm ${tone.text}`}>top {topPct}%</span>
+        <span className={`nums text-sm font-semibold ${tone.text}`}>top {topPct}%</span>
       </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-surface-2">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-surface-2">
         <div
-          className={`h-full rounded-full ${tone.bar} ${lowSignal ? "opacity-40" : ""}`}
+          className={`h-full rounded-full transition-all ${tone.bar} ${lowSignal ? "opacity-30" : ""}`}
           style={{ width: `${rank * 100}%` }}
         />
       </div>
-      <div className="mt-1 flex justify-between text-[11px] text-faint">
-        <span>{pctile} percentile vs universe</span>
+      <div className="mt-1.5 flex justify-between text-[10px] text-faint">
+        <span>{pctile} percentile</span>
         {rankStd != null && (
           <span
             className="nums"
             title="Std of the predicted rank over the last 3 scoring dates — lower is steadier."
           >
-            rank σ {rankStd.toFixed(2)} · {stabilityLabel(rankStd)}
+            σ {rankStd.toFixed(2)} · {stabilityLabel(rankStd)}
           </span>
         )}
       </div>
@@ -84,7 +84,7 @@ export function RankGaugeRow({
 
   return (
     <div>
-      <div className="space-y-4">
+      <div className="space-y-5">
         {predictions.map((p) => (
           <RankGauge
             key={p.horizon}
@@ -95,9 +95,9 @@ export function RankGaugeRow({
           />
         ))}
       </div>
-      <p className="mt-4 text-[11px] leading-relaxed text-faint">
-        Relative strength vs the tracked universe (cross-sectional percentile rank),
-        not a probability of going up.{asOf ? ` As of ${asOf}.` : ""}
+      <p className="mt-5 text-[10px] leading-relaxed text-faint border-t border-border/40 pt-3">
+        Cross-sectional percentile rank vs tracked universe — relative strength,
+        not a directional probability.{asOf ? ` As of ${asOf}.` : ""}
       </p>
     </div>
   );

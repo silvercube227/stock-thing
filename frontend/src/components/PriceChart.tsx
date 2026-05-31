@@ -15,7 +15,6 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Area"> | null>(null);
 
-  // Create the chart once.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -25,24 +24,27 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
       height: 300,
       layout: {
         background: { type: ColorType.Solid, color: "transparent" },
-        textColor: "#8b8b94",
+        textColor: "#384d6e",
         fontFamily: "var(--font-geist-mono), monospace",
         attributionLogo: false,
       },
       grid: {
         vertLines: { visible: false },
-        horzLines: { color: "#1a1a1f" },
+        horzLines: { color: "#0d1829" },
       },
-      rightPriceScale: { borderColor: "#232329" },
-      timeScale: { borderColor: "#232329", fixLeftEdge: true, fixRightEdge: true },
-      crosshair: { horzLine: { labelBackgroundColor: "#a78bfa" }, vertLine: { labelBackgroundColor: "#a78bfa" } },
+      rightPriceScale: { borderColor: "#162038" },
+      timeScale: { borderColor: "#162038", fixLeftEdge: true, fixRightEdge: true },
+      crosshair: {
+        horzLine: { labelBackgroundColor: "#38bdf8" },
+        vertLine: { labelBackgroundColor: "#38bdf8" },
+      },
     });
 
     const series = chart.addSeries(AreaSeries, {
-      lineColor: "#a78bfa",
+      lineColor: "#38bdf8",
       lineWidth: 2,
-      topColor: "rgba(167, 139, 250, 0.25)",
-      bottomColor: "rgba(167, 139, 250, 0.02)",
+      topColor: "rgba(56, 189, 248, 0.20)",
+      bottomColor: "rgba(56, 189, 248, 0.01)",
       priceLineVisible: false,
     });
 
@@ -62,7 +64,6 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
     };
   }, []);
 
-  // Push data whenever it changes.
   useEffect(() => {
     if (!seriesRef.current) return;
     seriesRef.current.setData(

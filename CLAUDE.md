@@ -14,19 +14,19 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
 **Production: LightGBM GBDT cross-sectional ranker** (`backend/ml/gbm_inference.py`)
 - One shallow model per horizon (3M, 6M, 1Y) — 1M has no detectable signal, skip it
 - Per-horizon training target (`PRODUCTION_HORIZON_SPECS` in gbm_baseline.py): 3M/6M/1Y all train on `sector_return` (within-(date,sector)-relative return), which directly optimizes within-sector stock selection — the success bar. 1M stays `rank` (dead horizon, not scored). Scored by cross-sectional rank-IC; promotions are graded on the block-bootstrapped WITHIN-SECTOR IC (SECB).
-- 21 base features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, `fund_available` (binary: has SEC filing as-of date), 2 FinBERT sentiment rolling averages. 6M + 1Y also include LSEG `revenue_surprise` (promoted via walk-forward ablation). Opt-in `--with-*` packs: `eps_surprise` (PEAD, computed from eps_mean/eps_actual), `linear_blend` (GBDT+ridge stack), analyst revisions, forward valuation — built but not promoted to production.
+- 21 base features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, `fund_available` (binary: has SEC filing as-of date), 2 FinBERT sentiment rolling averages. **Per-horizon promoted packs (`PRODUCTION_HORIZON_SPECS`): 3M adds `revision_momentum` (forward-EPS estimate revisions + analyst-coverage / PT-estimate counts); 6M + 1Y add LSEG `revenue_surprise` (now computed from QUARTERLY `earnings_surprises`, was annual).** Opt-in `--with-*` packs built but NOT promoted: `eps_surprise` (PEAD — ablated & rejected at every horizon, even on quarterly data: negative standalone), `linear_blend` (GBDT+ridge stack), analyst revisions, forward valuation.
 - `n_jobs=1` required (MPS + multiprocessing conflict on M4)
 - Production inference: 8-seed ensemble per horizon (predictions averaged before rank-transform), reduces seed variance.
-- Walk-forward stats (8-seed ensemble, de-survivorshipped universe, 716 tickers incl. removed-from-index), `sector_return` target, graded on SECB:
+- Walk-forward stats (8-seed ensemble, de-survivorshipped universe, 716 tickers incl. removed-from-index), `sector_return` target, PRODUCTION per-horizon feature packs, graded on SECB:
 
   | Horizon | mean_IC | t_block | p_block | SEC_IC | SECB_t | SECB_p | Verdict |
   |---------|---------|---------|---------|--------|--------|--------|---------|
-  | 3M      | +0.047  | 2.86    | 0.001   | +0.022 | 1.51   | 0.052  | Borderline within-sector (SEC IC doubled vs old `rank`; at detection floor) |
-  | 6M      | +0.074  | 2.51    | 0.001   | +0.038 | 2.02   | 0.009  | Block-significant within-sector selection (hit 0.74) |
-  | 1Y      | +0.075  | 1.75    | 0.022   | +0.047 | 2.09   | 0.003  | **Block-significant within-sector selection** (hit 0.81, ICIR 0.72) |
+  | 3M (+revmom) | +0.047 | 2.85 | 0.001 | +0.027 | 1.96 | 0.011 | **Block-significant within-sector** — revision-momentum moved it off the detection floor (was p≈0.05) |
+  | 6M (+rev)    | +0.063 | 2.25 | 0.003 | +0.042 | 2.06 | 0.008 | Block-significant within-sector selection (hit 0.75; quarterly surprise stronger than annual) |
+  | 1Y (+rev)    | +0.061 | 1.51 | 0.040 | +0.050 | 1.96 | 0.003 | **Block-significant within-sector selection** (hit 0.80) |
 
-  t_block/SECB_t = moving-block bootstrap (block=horizon months, 2000 reps). SEC/SECB = mean within-GICS-sector IC (min 10 names/sector), also block-corrected. The `sector_return` target traded a little universe IC for genuine within-sector selection at every horizon. 1Y went from failing the bar under `beta_resid` (SECB p=0.266 — beta-residual leaves sector tilt in) to clearly passing under `sector_return` (p=0.003). t_naive (not shown) is inflated by overlapping labels.
-- **6M and 1Y now show block-significant within-sector selection; 3M is borderline** (SECB p≈0.05, at the detection floor — a real lift from the old sector-rotation-only `rank` result, but not decisive). Power note: 1Y is block-limited (~8 effective blocks) so its `min_detect|IC|`≈0.028 — the sweep CLI prints this.
+  t_block/SECB_t = moving-block bootstrap (block=horizon months, 2000 reps). SEC/SECB = mean within-GICS-sector IC (min 10 names/sector), also block-corrected. The `sector_return` target traded a little universe IC for genuine within-sector selection at every horizon; 1Y went from failing under `beta_resid` (SECB p=0.266) to clearly passing under `sector_return`. t_naive (not shown) is inflated by overlapping labels.
+- **All three scored horizons now show block-significant within-sector selection** (SECB p ≤ 0.011). The quarterly-surprise rebuild (2026-05-31) strengthened `revenue_surprise` at 6M and made it a wash at 1Y (base ≈ +rev — left on as a no-op, candidate parsimony cleanup); the 3M `revision_momentum` pack lifted 3M off the borderline. Power note: 1Y is block-limited (~8 effective blocks) so its `min_detect|IC|`≈0.032 — the sweep CLI prints this.
 - Signal is cross-sectional (relative ranking), not absolute direction — absolute direction has no detectable edge
 
 **Shelved: PatchTST transformer** (`backend/ml/model.py`, `train.py`, `dataset.py`)
@@ -41,7 +41,7 @@ yfinance / SEC EDGAR / LSEG Workspace
 backend/ingestion/          prices.py  fundamentals.py  headlines.py  estimates.py
         |                   (asyncpg upserts to Supabase)
         v
-Supabase Postgres           price_history  fundamentals  headlines  sentiment_daily  analyst_estimates
+Supabase Postgres           price_history  fundamentals  headlines  sentiment_daily  analyst_estimates  earnings_surprises
         |
 backend/ml/                 gbm_inference.py  (reads frames, trains, writes predictions)
         |
@@ -66,14 +66,14 @@ backend/
     prices.py             yfinance incremental ingest + drift detection; entry: ingest_recent()
     fundamentals.py       SEC EDGAR companyfacts parser + upsert; entry: ingest_fundamentals()
     headlines.py          yfinance news fetch, FinBERT scoring, sentiment_daily recompute; entry: ingest_sentiment()
-    estimates.py          LSEG (lseg.data) analyst estimates → analyst_estimates; entry: ingest_estimates()
+    estimates.py          LSEG (lseg.data) analyst estimates → analyst_estimates (monthly) + earnings_surprises (quarterly FQ0 grid); entry: ingest_estimates()
   jobs/
     daily_pipeline.py     Orchestrator: prices → sentiment → fundamentals (Fri) → inference (Fri+month-start)
     promote_model.py      Promote a candidate model_version → production (retires the old one, atomic)
   ml/
     features.py           build_sample(): 12-feature point-in-time assembly, seq_len=252 (transformer path)
     dataset.py            TickerFrame, load_frames(+_cached experiment cache), train/val/holdout split
-    gbm_baseline.py       Walk-forward LightGBM, FEATURE_COLS (20) + opt-in packs (valuation/quality/LSEG estimate), rank-IC scoring, PRODUCTION_HORIZON_SPECS
+    gbm_baseline.py       Walk-forward LightGBM, FEATURE_COLS + opt-in packs (valuation/quality/LSEG estimate/revision-momentum), rank-IC scoring, PRODUCTION_HORIZON_SPECS
     gbm_inference.py      Production: fit per-horizon GBDTs, score cross-section, upsert predictions
     model.py              PatchTST transformer (shelved)
     train.py              Transformer training harness (shelved)
@@ -88,14 +88,17 @@ backend/
       rankings.py         Prediction/ranking endpoints
       tickers.py          Ticker add/search
   db/
-    schema.sql            10 tables: tickers, price_history, fundamentals, headlines,
-                          sentiment_daily, analyst_estimates, portfolio_holdings, model_versions, predictions, ingestion_runs
+    schema.sql            11 tables: tickers, price_history, fundamentals, headlines,
+                          sentiment_daily, analyst_estimates, earnings_surprises, portfolio_holdings, model_versions, predictions, ingestion_runs
     rls.sql               RLS on portfolio_holdings (user_id scoped)
     seed_tickers.sql      35-ticker starter seed (live universe is ~716: 507 active + 209 removed-from-index)
     migrations/
       001_headlines_score_date.sql
       002_analyst_estimates.sql
-  tests/                  12 modules, ~126 tests (prices drift, features no-lookahead, dataset splits,
+      003_ingestion_runs_skipped_status.sql
+      004_analyst_estimates_eps.sql
+      005_quarterly_surprises_and_counts.sql   earnings_surprises table + num_analysts/pt_num_estimates cols
+  tests/                  ~134 tests (prices drift, features no-lookahead, dataset splits,
                           model arch, GBM baseline, API, sentiment, fundamentals parser, frame cache,
                           estimate ingestion + estimate-feature PIT)
 
@@ -157,7 +160,7 @@ Each stage logs start/finish/status to `ingestion_runs`. The orchestrator adds a
 
 ### Key invariants
 
-- **No lookahead**: feature joins are point-in-time as of the sample date — fundamentals on `filed_at` (SEC receipt), LSEG estimates on `as_of_date` (observation date), each looked up independently per field; never `period_end`.
+- **No lookahead**: feature joins are point-in-time as of the sample date — fundamentals on `filed_at` (SEC receipt), LSEG monthly estimates on `as_of_date` (observation date), quarterly surprises on `report_date` (announcement date, in `earnings_surprises`), each looked up independently per field; never `period_end`. The quarterly consensus stored in `earnings_surprises` is the pre-report `Period=FQ0` value (LSEG-probe-verified: matches the last pre-report monthly snapshot, not the post-announcement revision).
 - **Survivorship**: the universe includes removed-from-index names (`active=false`, `removed_at` set) with their price history, so the cross-sectional panel isn't survivor-only (de-survivorshipping deflated older ICIRs to honest levels). Estimates now cover removed names; fundamentals/sentiment for them are still a gap.
 - **Cross-sectional scoring**: `direction_prob` in `predictions` stores the clipped predicted percentile rank (0–1), not a calibrated probability. Dashboard copy should say "relative rank."
 - **Rank stability** (`predictions.confidence`): std of predicted rank across the last ≤3 scoring dates. Lower = steadier model view of that name. Null if fewer than 2 dates available.
@@ -169,7 +172,7 @@ Each stage logs start/finish/status to `ingestion_runs`. The orchestrator adds a
 - Price/volume: yfinance (incremental, drift-corrected for splits/dividends)
 - Fundamentals: SEC EDGAR companyfacts XBRL API (10-K + 10-Q, TTM where applicable)
 - Sentiment: yfinance news (~30 days lookback) scored by FinBERT (`ProsusAI/finbert`)
-- Analyst estimates: LSEG Workspace via `lseg.data` desktop session (recommendation/price-target consensus, revenue + EPS estimates & actuals, forward P/E & EV/EBITDA); monthly point-in-time history. Now a conditional month-start pipeline stage that runs only when the desktop session is reachable (else logs a `skipped` run); manual `backfill_estimates.py` still available. EPS mean/actual feed the computed `eps_surprise` (PEAD) feature.
+- Analyst estimates: LSEG Workspace via `lseg.data` desktop session. Two grains: (1) MONTHLY point-in-time snapshots → `analyst_estimates` (recommendation/price-target consensus, forward EPS consensus, forward P/E & EV/EBITDA, analyst-coverage + PT-estimate counts); (2) QUARTERLY fiscal-period grid (`Period=FQ0,Frq=FQ`) → `earnings_surprises` (pre-report EPS/revenue consensus + actual + report date), which drives the `revenue_surprise` (promoted 6M/1Y) and `eps_surprise` (rejected) features. Note: this license has no recommendation-bucket counts (strong-buy/buy) — only aggregate `RecMean`. Conditional month-start pipeline stage (runs only when the desktop session is reachable, else logs a `skipped` run); manual `backfill_estimates.py` still available.
 - Macro: deliberately excluded (scope decision)
 
 ### Scope

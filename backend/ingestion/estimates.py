@@ -46,6 +46,8 @@ ESTIMATE_FIELDS = [
     "TR.EPSActValue",
     "TR.FwdPE",
     "TR.FwdEVToEBITDA",
+    "TR.NumberOfAnalysts",                 # analyst coverage (revision-momentum pack)
+    "TR.PriceTargetNumIncEstimates",       # # price-target estimates (revision-momentum pack)
 ]
 
 # Map a returned column's display label (substring, case-insensitive) -> db column.
@@ -62,9 +64,12 @@ COLUMN_MATCHERS: list[tuple[str, str]] = [
     ("earnings per share - actual", "eps_actual"),
     ("forward enterprise value to ebitda", "fwd_ev_ebitda"),
     ("forward p/e", "fwd_pe"),
+    ("price target - number of included estimates", "pt_num_estimates"),
+    ("number of analysts", "num_analysts"),
 ]
 DB_FIELDS = ["rec_mean", "price_target_mean", "revenue_mean",
-             "revenue_actual", "eps_mean", "eps_actual", "fwd_pe", "fwd_ev_ebitda"]
+             "revenue_actual", "eps_mean", "eps_actual", "fwd_pe", "fwd_ev_ebitda",
+             "num_analysts", "pt_num_estimates"]
 
 
 # =============================================================
@@ -78,6 +83,7 @@ class TickerResult:
     symbol: str
     ric: str | None
     rows_written: int = 0
+    surprise_rows: int = 0
     error: str | None = None
 
 
@@ -86,6 +92,7 @@ class IngestionResult:
     started_at: datetime
     finished_at: datetime
     rows_inserted: int = 0
+    surprise_rows_inserted: int = 0
     failed_tickers: list[str] = field(default_factory=list)
     skipped_no_ric: list[str] = field(default_factory=list)
     per_ticker: list[TickerResult] = field(default_factory=list)
@@ -143,6 +150,84 @@ def parse_history(df, ticker_id: int) -> list[dict]:
         as_of = ts.date() if hasattr(ts, "date") else ts
         rows.append({"ticker_id": ticker_id, "as_of_date": as_of,
                      **{f: vals.get(f) for f in DB_FIELDS}})
+    return rows
+
+
+# =============================================================
+# Quarterly earnings surprises (FQ0 grid: pre-report consensus vs reported actual)
+# =============================================================
+
+# One get_data call per ticker returns ~15y of fiscal quarters. Period=FQ0 is the
+# pre-report consensus (probe-confirmed PIT-safe — it matches the last pre-report
+# monthly snapshot, not the actual); EPSActReportDate is the announcement date.
+_Q = "(Period=FQ0,Frq=FQ,SDate=0,EDate=-60)"
+QUARTERLY_FIELDS = [
+    f"TR.EPSMean{_Q}", f"TR.EPSActValue{_Q}",
+    f"TR.RevenueMean{_Q}", f"TR.RevenueActValue{_Q}",
+    f"TR.EPSActValue{_Q}.periodenddate",
+    f"TR.EPSActReportDate{_Q}",
+]
+
+# get_data column display-label substring -> earnings_surprises field.
+_Q_MATCHERS: list[tuple[str, str]] = [
+    ("earnings per share - mean", "eps_consensus"),
+    ("earnings per share - actual", "eps_actual"),
+    ("revenue - mean", "rev_consensus"),
+    ("revenue - actual", "rev_actual"),
+    ("period end date", "period_end"),
+    ("report date", "report_date"),
+]
+_Q_NUMERIC = ("eps_consensus", "eps_actual", "rev_consensus", "rev_actual")
+
+
+def _as_date_cell(v):
+    """Coerce a get_data date cell (Timestamp / 'YYYY-MM-DD...' / None / NaT) to date."""
+    if v is None:
+        return None
+    import pandas as pd  # noqa: PLC0415 — lseg dependency; NaT isn't None or float-nan
+    if pd.isna(v):                       # catches NaN and NaT (whose .date() returns NaT)
+        return None
+    if hasattr(v, "date"):
+        return v.date()
+    s = str(v)
+    return date.fromisoformat(s[:10]) if s[:4].isdigit() else None
+
+
+def parse_quarterly(df, ticker_id: int) -> list[dict]:
+    """Convert a single-ticker quarterly get_data frame into earnings_surprises rows.
+
+    One row per fiscal quarter; keep only quarters with both a period_end and a
+    report_date (the PIT anchor) and at least one actual.
+    """
+    if df is None or getattr(df, "empty", True):
+        return []
+    colmap: dict = {}
+    for col in df.columns:
+        label = str(col[-1] if isinstance(col, tuple) else col).lower()
+        for sub, field_ in _Q_MATCHERS:
+            if sub in label:
+                colmap[col] = field_
+                break
+
+    rows: list[dict] = []
+    for _, r in df.iterrows():
+        period_end = report_date = None
+        nums: dict = {}
+        for col, field_ in colmap.items():
+            if field_ == "period_end":
+                period_end = _as_date_cell(r[col])
+            elif field_ == "report_date":
+                report_date = _as_date_cell(r[col])
+            else:
+                nums[field_] = _num(r[col])
+        if period_end is None or report_date is None:
+            continue
+        if all(nums.get(f) is None for f in ("eps_actual", "rev_actual")):
+            continue
+        rows.append({
+            "ticker_id": ticker_id, "period_end": period_end, "report_date": report_date,
+            **{f: nums.get(f) for f in _Q_NUMERIC},
+        })
     return rows
 
 
@@ -221,8 +306,9 @@ def resolve_rics(ld, symbols: list[str]) -> dict[str, str]:
 _UPSERT_SQL = """
 insert into analyst_estimates (
     ticker_id, as_of_date, rec_mean, price_target_mean,
-    revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda, ingested_at
-) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+    revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda,
+    num_analysts, pt_num_estimates, ingested_at
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
 on conflict (ticker_id, as_of_date) do update set
     rec_mean          = excluded.rec_mean,
     price_target_mean = excluded.price_target_mean,
@@ -232,6 +318,8 @@ on conflict (ticker_id, as_of_date) do update set
     eps_actual        = excluded.eps_actual,
     fwd_pe            = excluded.fwd_pe,
     fwd_ev_ebitda     = excluded.fwd_ev_ebitda,
+    num_analysts      = excluded.num_analysts,
+    pt_num_estimates  = excluded.pt_num_estimates,
     ingested_at       = now()
 """
 
@@ -242,11 +330,39 @@ async def _upsert_estimates(conn: asyncpg.Connection, rows: list[dict]) -> int:
     payload = [
         (r["ticker_id"], r["as_of_date"], r["rec_mean"], r["price_target_mean"],
          r["revenue_mean"], r["revenue_actual"], r["eps_mean"], r["eps_actual"],
-         r["fwd_pe"], r["fwd_ev_ebitda"])
+         r["fwd_pe"], r["fwd_ev_ebitda"], r["num_analysts"], r["pt_num_estimates"])
         for r in rows
     ]
     async with conn.transaction():
         await conn.executemany(_UPSERT_SQL, payload)
+    return len(payload)
+
+
+_UPSERT_SURPRISE_SQL = """
+insert into earnings_surprises (
+    ticker_id, period_end, report_date,
+    eps_consensus, eps_actual, rev_consensus, rev_actual, ingested_at
+) values ($1, $2, $3, $4, $5, $6, $7, now())
+on conflict (ticker_id, period_end) do update set
+    report_date   = excluded.report_date,
+    eps_consensus = excluded.eps_consensus,
+    eps_actual    = excluded.eps_actual,
+    rev_consensus = excluded.rev_consensus,
+    rev_actual    = excluded.rev_actual,
+    ingested_at   = now()
+"""
+
+
+async def _upsert_surprises(conn: asyncpg.Connection, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    payload = [
+        (r["ticker_id"], r["period_end"], r["report_date"],
+         r["eps_consensus"], r["eps_actual"], r["rev_consensus"], r["rev_actual"])
+        for r in rows
+    ]
+    async with conn.transaction():
+        await conn.executemany(_UPSERT_SURPRISE_SQL, payload)
     return len(payload)
 
 
@@ -286,6 +402,7 @@ async def _log_run_finish(pool: asyncpg.Pool, run_id: int, result: IngestionResu
             "failed_tickers": result.failed_tickers,
             "skipped_no_ric": result.skipped_no_ric,
             "ticker_count": len(result.per_ticker),
+            "surprise_rows_inserted": result.surprise_rows_inserted,
         }),
     )
 
@@ -339,7 +456,23 @@ async def ingest_estimates(
             if rows:
                 async with pool.acquire() as conn:
                     n = await _upsert_estimates(conn, rows)
-            per_ticker.append(TickerResult(ticker_id, symbol, ric, rows_written=n))
+
+            # Quarterly earnings surprises (separate FQ0 grid call). A failure here
+            # is recorded but doesn't discard the monthly snapshot write above.
+            sn = 0
+            q_err: str | None = None
+            try:
+                qdf = await asyncio.to_thread(
+                    ld.get_data, universe=[ric], fields=QUARTERLY_FIELDS,
+                )
+                qrows = parse_quarterly(qdf, ticker_id)
+                if qrows:
+                    async with pool.acquire() as conn:
+                        sn = await _upsert_surprises(conn, qrows)
+            except Exception as exc:  # noqa: BLE001
+                q_err = f"quarterly: {exc}"
+            per_ticker.append(TickerResult(ticker_id, symbol, ric,
+                                           rows_written=n, surprise_rows=sn, error=q_err))
     finally:
         ld.close_session()
 
@@ -348,6 +481,7 @@ async def ingest_estimates(
         started_at=started,
         finished_at=finished,
         rows_inserted=sum(tr.rows_written for tr in per_ticker),
+        surprise_rows_inserted=sum(tr.surprise_rows for tr in per_ticker),
         failed_tickers=[tr.symbol for tr in per_ticker
                         if tr.error and tr.error != "no RIC"],
         skipped_no_ric=[tr.symbol for tr in per_ticker if tr.error == "no RIC"],

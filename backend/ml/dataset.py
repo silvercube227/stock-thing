@@ -73,6 +73,8 @@ class TickerFrame:
     industry: str | None = None
     # analyst_estimates rows (as_of_date PIT); None tolerates pre-estimates pickled caches.
     estimates: list[dict] | None = None
+    # earnings_surprises rows (quarterly, report_date PIT); None tolerates older caches.
+    surprises: list[dict] | None = None
 
 
 @dataclass
@@ -404,10 +406,19 @@ select ticker_id, score_date, rolling_7d, rolling_14d
 
 _EST_SQL = """
 select ticker_id, as_of_date, rec_mean, price_target_mean,
-       revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda
+       revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda,
+       num_analysts, pt_num_estimates
   from analyst_estimates
  where ticker_id = any($1::bigint[])
  order by ticker_id, as_of_date
+"""
+
+_SURPRISE_SQL = """
+select ticker_id, period_end, report_date,
+       eps_consensus, eps_actual, rev_consensus, rev_actual
+  from earnings_surprises
+ where ticker_id = any($1::bigint[])
+ order by ticker_id, report_date
 """
 
 
@@ -454,11 +465,13 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     fund_rows = await _fetch_chunked(pool, _FUND_SQL, ids)
     sent_rows = await _fetch_chunked(pool, _SENT_SQL, ids)
     est_rows = await _fetch_chunked(pool, _EST_SQL, ids)
+    surprise_rows = await _fetch_chunked(pool, _SURPRISE_SQL, ids)
 
     by_ticker_prices = _group(price_rows)
     by_ticker_fund = _group(fund_rows)
     by_ticker_sent = _group(sent_rows)
     by_ticker_est = _group(est_rows)
+    by_ticker_surprise = _group(surprise_rows)
 
     frames: list[TickerFrame] = []
     for r in ticker_rows:
@@ -475,6 +488,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 sector=r["sector"],
                 industry=r["industry"],
                 estimates=by_ticker_est.get(tid, []),
+                surprises=by_ticker_surprise.get(tid, []),
             )
         )
     return frames

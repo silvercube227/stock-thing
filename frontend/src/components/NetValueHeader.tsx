@@ -19,8 +19,6 @@ export function NetValueHeader({
   let dayChange = 0;
   let anyPrice = false;
 
-  // Total return is computed only over holdings that have BOTH a cost basis and a
-  // current price, so the figure is honest about what it covers.
   let costBasisValue = 0;
   let totalCost = 0;
 
@@ -47,38 +45,38 @@ export function NetValueHeader({
     totalCost > 0 && rows.some((r) => r.cost_basis == null);
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-6">
-      <div className="text-xs uppercase tracking-wider text-faint">
-        Portfolio value
-      </div>
-      <div className="mt-1 flex flex-wrap items-baseline gap-x-4 gap-y-1">
+    <div className="rounded-2xl border border-border bg-surface p-6">
+      <div className="text-xs text-muted">Portfolio value</div>
+
+      <div className="mt-2 flex flex-wrap items-baseline gap-x-4 gap-y-1">
         <span className="nums text-4xl font-semibold">
           {anyPrice ? money(total) : "—"}
         </span>
         {dayChange !== 0 && (
-          <span className={`nums text-sm ${changeColor(dayChange)}`}>
-            {money(dayChange)} ({pct(dayPct)}) today
+          <span className={`nums text-sm font-medium ${changeColor(dayChange)}`}>
+            {dayChange >= 0 ? "+" : ""}{money(dayChange)}{" "}
+            <span className="text-xs opacity-80">({pct(dayPct)}) today</span>
           </span>
         )}
       </div>
-      {totalReturn !== null && (
-        <div className="mt-2 flex items-baseline gap-2 text-sm">
-          <span className="text-faint">Total return</span>
-          <span className={`nums ${changeColor(totalReturn)}`}>
-            {money(totalReturn)} ({pct(totalReturnPct)})
-          </span>
-          {partialCostCoverage && (
-            <span
-              title="Only holdings with a recorded cost basis are included."
-              className="text-faint"
-            >
-              ·
+
+      <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 border-t border-border/60 pt-4">
+        {totalReturn !== null && (
+          <div className="flex items-baseline gap-2 text-sm">
+            <span className="text-faint text-xs uppercase tracking-wider">Total return</span>
+            <span className={`nums font-medium ${changeColor(totalReturn)}`}>
+              {money(totalReturn)} ({pct(totalReturnPct)})
             </span>
-          )}
+            {partialCostCoverage && (
+              <span title="Only holdings with a recorded cost basis are included." className="text-faint">
+                ·
+              </span>
+            )}
+          </div>
+        )}
+        <div className="text-xs text-faint">
+          {rows.length} {rows.length === 1 ? "holding" : "holdings"}
         </div>
-      )}
-      <div className="mt-1 text-xs text-faint">
-        {rows.length} {rows.length === 1 ? "holding" : "holdings"}
       </div>
     </div>
   );

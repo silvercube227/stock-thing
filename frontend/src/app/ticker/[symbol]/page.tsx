@@ -23,8 +23,8 @@ function Card({
   className?: string;
 }) {
   return (
-    <section className={`rounded-xl border border-border bg-surface p-5 ${className}`}>
-      <h2 className="mb-4 text-sm font-medium text-muted">{title}</h2>
+    <section className={`rounded-2xl border border-border bg-surface p-5 ${className}`}>
+      <h2 className="mb-4 text-xs font-medium text-muted">{title}</h2>
       {children}
     </section>
   );
@@ -62,36 +62,41 @@ export default function TickerPage({
     <>
       <AppHeader>
         <span className="text-faint">/</span>
-        <span className="text-sm font-medium">{symbol.toUpperCase()}</span>
+        <span className="text-sm font-semibold tracking-wide">{symbol.toUpperCase()}</span>
       </AppHeader>
 
       <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-8">
         {error && (
-          <p className="rounded-lg border border-down/40 bg-down/10 px-3 py-2 text-sm text-down">
+          <p className="rounded-xl border border-down/30 bg-down/8 px-4 py-2.5 text-sm text-down mb-4">
             {error}
           </p>
         )}
 
         {loading && !detail ? (
-          <div className="rounded-xl border border-border p-10 text-center text-sm text-muted">
+          <div className="rounded-2xl border border-border p-12 text-center text-sm text-muted">
             Loading {symbol.toUpperCase()}…
           </div>
         ) : detail ? (
           <>
-            <div className="mb-6 flex flex-wrap items-baseline justify-between gap-2">
+            <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
               <div>
                 <h1 className="text-2xl font-semibold tracking-tight">
                   {detail.ticker.symbol}
                 </h1>
-                <p className="text-sm text-muted">
+                <p className="mt-1 text-sm text-muted">
                   {detail.ticker.name}
-                  {detail.ticker.sector ? ` · ${detail.ticker.sector}` : ""}
+                  {detail.ticker.sector ? (
+                    <>
+                      <span className="mx-1.5 text-faint">·</span>
+                      <span className="text-faint">{detail.ticker.sector}</span>
+                    </>
+                  ) : null}
                 </p>
               </div>
               <div className="text-right">
                 <div className="nums text-2xl font-semibold">{money(price)}</div>
                 {q?.change_pct != null && (
-                  <div className={`nums text-sm ${changeColor(q.change_pct)}`}>
+                  <div className={`nums text-sm font-medium mt-0.5 ${changeColor(q.change_pct)}`}>
                     {money(q.change)} ({pct(q.change_pct)})
                   </div>
                 )}
@@ -125,7 +130,7 @@ export default function TickerPage({
             </div>
 
             <div className="mt-6">
-              <Link href="/" className="text-xs text-faint hover:text-foreground">
+              <Link href="/" className="text-[11px] text-faint transition-colors hover:text-foreground">
                 ← Back to portfolio
               </Link>
             </div>

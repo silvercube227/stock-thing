@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Trends",
+  title: "Portfolio",
   description: "Personal long-only trend awareness dashboard.",
 };
 

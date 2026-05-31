@@ -73,7 +73,6 @@ export default function ScreenerPage() {
     );
   }
 
-  // Rank position is based on the full ranked list, not the filtered view.
   const rankOf = new Map((data?.rows ?? []).map((r, i) => [r.ticker_id, i + 1]));
 
   return (
@@ -84,18 +83,18 @@ export default function ScreenerPage() {
           <div>
             <h1 className="text-xl font-semibold tracking-tight">Screener</h1>
             <p className="mt-1 text-sm text-muted">
-              Every covered ticker ranked by relative strength vs the universe.
+              Universe ranked by relative strength.
               {data?.as_of_date ? ` As of ${data.as_of_date}.` : ""}
             </p>
           </div>
-          <div className="flex rounded-lg border border-border p-0.5 text-sm">
+          <div className="flex rounded-xl border border-border bg-surface p-1 text-sm">
             {HORIZONS.map((h) => (
               <button
                 key={h}
                 onClick={() => setHorizon(h)}
-                className={`rounded-md px-3 py-1.5 transition-colors ${
+                className={`rounded-lg px-4 py-1.5 text-xs font-medium transition-colors ${
                   horizon === h
-                    ? "bg-surface-2 text-foreground"
+                    ? "bg-accent/15 text-accent"
                     : "text-muted hover:text-foreground"
                 }`}
               >
@@ -110,9 +109,9 @@ export default function ScreenerPage() {
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             placeholder="Filter by symbol, name, or sector…"
-            className="flex-1 rounded-lg border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-accent"
+            className="flex-1 rounded-xl border border-border bg-surface px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent/60"
           />
-          <label className="flex items-center gap-2 text-xs text-muted">
+          <label className="flex items-center gap-2 text-xs text-muted cursor-pointer">
             <input
               type="checkbox"
               checked={heldOnly}
@@ -124,28 +123,28 @@ export default function ScreenerPage() {
         </div>
 
         {error && (
-          <p className="rounded-lg border border-down/40 bg-down/10 px-3 py-2 text-sm text-down">
+          <p className="rounded-xl border border-down/30 bg-down/8 px-4 py-2.5 text-sm text-down mb-4">
             {error}
           </p>
         )}
 
         {loading ? (
-          <div className="rounded-xl border border-border p-10 text-center text-sm text-muted">
+          <div className="rounded-2xl border border-border p-12 text-center text-sm text-muted">
             Loading rankings…
           </div>
         ) : visible.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted">
+          <div className="rounded-2xl border border-dashed border-border p-12 text-center text-sm text-muted">
             No tickers match.
           </div>
         ) : (
-          <div className="overflow-hidden rounded-xl border border-border">
+          <div className="overflow-hidden rounded-2xl border border-border">
             <table className="w-full text-sm">
               <thead>
-                <tr className="border-b border-border text-left text-xs uppercase tracking-wider text-faint">
-                  <th className="w-12 px-4 py-3 text-right font-medium">#</th>
-                  <th className="px-4 py-3 font-medium">Ticker</th>
-                  <th className="px-4 py-3 font-medium">Relative strength</th>
-                  <th className="px-4 py-3 text-right font-medium">Percentile</th>
+                <tr className="border-b border-border bg-surface-2 text-left text-xs text-muted">
+                  <th className="w-12 px-5 py-3.5 text-right font-medium">#</th>
+                  <th className="px-5 py-3.5 font-medium">Ticker</th>
+                  <th className="px-5 py-3.5 font-medium">Relative strength</th>
+                  <th className="px-5 py-3.5 text-right font-medium">Percentile</th>
                 </tr>
               </thead>
               <tbody>
@@ -156,35 +155,35 @@ export default function ScreenerPage() {
                     <tr
                       key={r.ticker_id}
                       onClick={() => router.push(`/ticker/${r.symbol}`)}
-                      className={`cursor-pointer border-b border-border/60 last:border-0 transition-colors hover:bg-surface ${
-                        held ? "bg-accent/5" : ""
+                      className={`cursor-pointer border-b border-border/40 last:border-0 transition-colors hover:bg-surface ${
+                        held ? "bg-accent/4" : ""
                       }`}
                     >
-                      <td className="nums px-4 py-3 text-right text-faint">
+                      <td className="nums px-5 py-4 text-right text-faint text-xs">
                         {rankOf.get(r.ticker_id)}
                       </td>
-                      <td className="px-4 py-3">
+                      <td className="px-5 py-4">
                         <div className="flex items-center gap-2">
-                          <span className="font-medium">{r.symbol}</span>
+                          <span className="font-semibold tracking-wide">{r.symbol}</span>
                           {held && (
-                            <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent">
+                            <span className="rounded-sm bg-accent/15 px-1.5 py-0.5 text-[9px] uppercase tracking-widest text-accent">
                               held
                             </span>
                           )}
                         </div>
-                        <div className="max-w-[16rem] truncate text-xs text-muted">
+                        <div className="max-w-[16rem] truncate text-[11px] text-muted mt-0.5">
                           {r.name ?? r.sector ?? ""}
                         </div>
                       </td>
-                      <td className="px-4 py-3">
-                        <div className="h-2 w-full max-w-[14rem] overflow-hidden rounded-full bg-surface-2">
+                      <td className="px-5 py-4">
+                        <div className="h-1.5 w-full max-w-[14rem] overflow-hidden rounded-full bg-surface-2">
                           <div
                             className={`h-full rounded-full ${barTone(r.percentile_rank)}`}
                             style={{ width: `${r.percentile_rank * 100}%` }}
                           />
                         </div>
                       </td>
-                      <td className="nums px-4 py-3 text-right">{pctile}</td>
+                      <td className="nums px-5 py-4 text-right font-medium">{pctile}</td>
                     </tr>
                   );
                 })}
@@ -194,7 +193,7 @@ export default function ScreenerPage() {
         )}
 
         <div className="mt-6">
-          <Link href="/" className="text-xs text-faint hover:text-foreground">
+          <Link href="/" className="text-[11px] text-faint transition-colors hover:text-foreground">
             ← Back to portfolio
           </Link>
         </div>

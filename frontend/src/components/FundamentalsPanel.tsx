@@ -5,9 +5,9 @@ import { compactMoney, num } from "@/lib/format";
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-border bg-surface px-3 py-2.5">
-      <div className="text-[11px] uppercase tracking-wider text-faint">{label}</div>
-      <div className="nums mt-0.5 text-sm">{value}</div>
+    <div className="rounded-xl border border-border bg-surface-2 px-3.5 py-3">
+      <div className="text-[10px] uppercase tracking-widest text-faint">{label}</div>
+      <div className="nums mt-1 text-sm font-medium">{value}</div>
     </div>
   );
 }
@@ -37,7 +37,7 @@ export function FundamentalsPanel({ f }: { f: FundamentalsSnapshot | null }) {
         <Metric label="Operating margin" value={ratioPct(f.operating_margin)} />
         <Metric label="Debt / equity" value={debtEquity} />
       </div>
-      <p className="mt-3 text-[11px] text-faint">
+      <p className="mt-3 text-[10px] text-faint border-t border-border/40 pt-3">
         {f.filing_type ?? "Latest filing"}
         {f.period_end ? ` · period ending ${f.period_end}` : ""}
         {f.filed_at ? ` · filed ${f.filed_at}` : ""}

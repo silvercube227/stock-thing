@@ -3,10 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import { searchTickers, type TickerSummary } from "@/lib/api";
 
-/**
- * Search the seeded universe (the model only covers tickers already in the DB)
- * and add the selected one to the portfolio.
- */
 export function AddTickerControl({
   onAdd,
   existingTickerIds,
@@ -23,7 +19,6 @@ export function AddTickerControl({
   const [busy, setBusy] = useState(false);
   const boxRef = useRef<HTMLDivElement>(null);
 
-  // Debounced catalog search.
   useEffect(() => {
     if (selected || query.trim().length === 0) {
       setResults([]);
@@ -40,7 +35,6 @@ export function AddTickerControl({
     return () => clearTimeout(id);
   }, [query, selected]);
 
-  // Close the dropdown on outside click.
   useEffect(() => {
     function onClick(e: MouseEvent) {
       if (boxRef.current && !boxRef.current.contains(e.target as Node)) {
@@ -86,16 +80,16 @@ export function AddTickerControl({
         <div className="relative flex-1">
           <input
             value={query}
-            placeholder="Search ticker to add (e.g. AAPL)…"
+            placeholder="Search ticker… (e.g. AAPL)"
             onChange={(e) => {
               setQuery(e.target.value);
               setSelected(null);
             }}
             onFocus={() => results.length && setOpen(true)}
-            className="w-full rounded-lg border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-accent"
+            className="w-full rounded-xl border border-border bg-surface px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent/60"
           />
           {open && results.length > 0 && (
-            <ul className="absolute z-10 mt-1 max-h-72 w-full overflow-auto rounded-lg border border-border bg-surface-2 py-1 shadow-xl">
+            <ul className="absolute z-10 mt-1 max-h-72 w-full overflow-auto rounded-xl border border-border bg-surface py-1 shadow-2xl shadow-black/60">
               {results.map((t) => {
                 const held = existingTickerIds.has(t.ticker_id);
                 return (
@@ -103,13 +97,13 @@ export function AddTickerControl({
                     <button
                       disabled={held}
                       onClick={() => pick(t)}
-                      className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-surface disabled:opacity-40"
+                      className="flex w-full items-center justify-between px-4 py-2.5 text-left text-sm transition-colors hover:bg-surface-2 disabled:opacity-40"
                     >
                       <span>
-                        <span className="font-medium">{t.symbol}</span>
+                        <span className="font-semibold tracking-wide">{t.symbol}</span>
                         <span className="ml-2 text-xs text-muted">{t.name}</span>
                       </span>
-                      <span className="text-xs text-faint">
+                      <span className="text-[11px] text-faint">
                         {held ? "held" : t.sector}
                       </span>
                     </button>
@@ -128,7 +122,7 @@ export function AddTickerControl({
           placeholder="Shares"
           onChange={(e) => setShares(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && submit()}
-          className="nums w-24 rounded-lg border border-border bg-surface px-3 py-2 text-right text-sm outline-none focus:border-accent"
+          className="nums w-24 rounded-xl border border-border bg-surface px-3 py-2.5 text-right text-sm outline-none transition-colors placeholder:text-faint focus:border-accent/60"
         />
         <input
           type="number"
@@ -139,17 +133,17 @@ export function AddTickerControl({
           title="Optional cost per share, for total-return tracking"
           onChange={(e) => setCost(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && submit()}
-          className="nums w-24 rounded-lg border border-border bg-surface px-3 py-2 text-right text-sm outline-none focus:border-accent"
+          className="nums w-24 rounded-xl border border-border bg-surface px-3 py-2.5 text-right text-sm outline-none transition-colors placeholder:text-faint focus:border-accent/60"
         />
         <button
           onClick={submit}
           disabled={!selected || !shares || busy}
-          className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:opacity-40"
+          className="rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-background transition-opacity hover:opacity-90 disabled:opacity-30"
         >
-          Add
+          {busy ? "…" : "Add"}
         </button>
       </div>
-      <p className="mt-2 text-xs text-faint">
+      <p className="mt-2 text-[11px] text-faint">
         Limited to covered tickers (the model&apos;s tracked universe).
       </p>
     </div>

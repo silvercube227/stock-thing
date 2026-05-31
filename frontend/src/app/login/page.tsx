@@ -26,10 +26,7 @@ export default function LoginPage() {
     setMessage(null);
     try {
       if (mode === "signin") {
-        const { error } = await supabase.auth.signInWithPassword({
-          email,
-          password,
-        });
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
         router.replace("/");
       } else {
@@ -53,28 +50,23 @@ export default function LoginPage() {
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="w-full max-w-sm">
         <div className="mb-8 text-center">
-          <h1 className="text-2xl font-semibold tracking-tight">Trends</h1>
-          <p className="mt-1 text-sm text-muted">
-            Long-only directional awareness.
-          </p>
+          <h1 className="text-xl font-semibold text-accent">Portfolio</h1>
+          <p className="mt-1 text-sm text-muted">Long-only directional awareness.</p>
         </div>
 
         <form
           onSubmit={submit}
-          className="rounded-xl border border-border bg-surface p-6"
+          className="rounded-2xl border border-border bg-surface p-7"
         >
-          <div className="mb-4 flex rounded-lg border border-border p-0.5 text-sm">
+          <div className="mb-5 flex rounded-xl border border-border bg-surface-2 p-1 text-sm">
             {(["signin", "signup"] as const).map((m) => (
               <button
                 key={m}
                 type="button"
-                onClick={() => {
-                  setMode(m);
-                  setError(null);
-                }}
-                className={`flex-1 rounded-md px-3 py-1.5 transition-colors ${
+                onClick={() => { setMode(m); setError(null); }}
+                className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
                   mode === m
-                    ? "bg-surface-2 text-foreground"
+                    ? "bg-accent/15 text-accent"
                     : "text-muted hover:text-foreground"
                 }`}
               >
@@ -83,24 +75,28 @@ export default function LoginPage() {
             ))}
           </div>
 
-          <label className="mb-1 block text-xs text-muted">Email</label>
+          <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-widest text-faint">
+            Email
+          </label>
           <input
             type="email"
             required
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="mb-3 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-accent"
+            className="mb-4 w-full rounded-xl border border-border bg-background px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent/60"
             placeholder="you@example.com"
           />
 
-          <label className="mb-1 block text-xs text-muted">Password</label>
+          <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-widest text-faint">
+            Password
+          </label>
           <input
             type="password"
             required
             minLength={6}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="mb-4 w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none focus:border-accent"
+            className="mb-5 w-full rounded-xl border border-border bg-background px-4 py-2.5 text-sm outline-none transition-colors placeholder:text-faint focus:border-accent/60"
             placeholder="••••••••"
           />
 
@@ -110,7 +106,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={busy}
-            className="w-full rounded-lg bg-accent px-3 py-2 text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:opacity-50"
+            className="w-full rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-background transition-opacity hover:opacity-90 disabled:opacity-40"
           >
             {busy ? "…" : mode === "signin" ? "Sign in" : "Create account"}
           </button>

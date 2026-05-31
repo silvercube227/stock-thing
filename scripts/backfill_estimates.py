@@ -69,6 +69,7 @@ async def amain(symbols: list[str] | None, missing_only: bool = False) -> int:
     print()
     print(f"Status:           {result.status}")
     print(f"Rows inserted:    {result.rows_inserted:,}")
+    print(f"Surprise rows:    {result.surprise_rows_inserted:,}")
     print(f"Tickers:          {len(result.per_ticker)}")
     if result.skipped_no_ric:
         print(f"Skipped (no RIC): {', '.join(result.skipped_no_ric)}")
