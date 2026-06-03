@@ -28,6 +28,9 @@ _SHARPE_MIN_OBS = 30
 # Annualized Sharpe of daily log returns over the last _SHARPE_WINDOW trading rows
 # per ticker, for the given set of ticker_ids. Population over the window: mean/std
 # of daily log returns, annualized by sqrt(252). Null when too few returns.
+# Risk-free rate is 0 — this is an excess-return-over-zero Sharpe (no rf is
+# subtracted before dividing by volatility). Fine for relative ranking; runs a bit
+# high versus a textbook rf-adjusted Sharpe.
 _SHARPE_SQL = """
 with ranked as (
     select ticker_id, trade_date, adj_close,

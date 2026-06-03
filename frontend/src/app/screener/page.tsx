@@ -218,7 +218,7 @@ export default function ScreenerPage() {
                   </th>
                   <th
                     onClick={() => setSortKey("sharpe")}
-                    title="Trailing 1-year realized annualized Sharpe — backward-looking, not a forecast."
+                    title="Trailing 1-year realized annualized Sharpe — backward-looking, not a forecast. Excess return over a zero risk-free rate (rf = 0)."
                     className={`cursor-pointer px-5 py-3.5 text-right font-medium select-none hover:text-foreground ${
                       sortKey === "sharpe" ? "text-accent" : ""
                     }`}
@@ -284,6 +284,14 @@ export default function ScreenerPage() {
               </tbody>
             </table>
           </div>
+        )}
+
+        {!loading && visible.length > 0 && (
+          <p className="mt-4 text-[11px] text-faint">
+            Sharpe is the trailing 1-year realized annualized Sharpe of daily
+            returns — excess return over a zero risk-free rate (rf = 0).
+            Backward-looking, not a forecast.
+          </p>
         )}
 
         <div className="mt-6">
