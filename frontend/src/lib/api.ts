@@ -80,6 +80,19 @@ export interface SentimentSnapshot {
   rolling_14d: number | null;
 }
 
+export interface ValuationSnapshot {
+  symbol: string;
+  trailing_pe: number | null;
+  price_to_sales: number | null;
+  ebitda: number | null;
+  // Fundamentals fallback for off-index names with no EDGAR filing.
+  revenue: number | null;
+  net_income: number | null;
+  gross_margin: number | null;
+  operating_margin: number | null;
+  fcf: number | null;
+}
+
 export interface TickerDetail {
   ticker: TickerSummary;
   as_of_date: string | null;
@@ -94,6 +107,11 @@ export interface TickerDetail {
 export interface PricePoint {
   date: string;
   close: number;
+  // OHLC (split-adjusted, same axis as close) + volume for candlestick view.
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  volume: number | null;
 }
 
 export interface RankingRow {
@@ -103,6 +121,12 @@ export interface RankingRow {
   sector: string | null;
   percentile_rank: number;
   rank_std: number | null;
+  // Within-sector percentile in [0, 1] (null when sector unknown or <2 names).
+  sector_rank: number | null;
+  // Ordinal position within sector, e.g. "3/42".
+  sector_rank_label: string | null;
+  // Trailing realized annualized Sharpe (backward-looking, not a forecast).
+  sharpe: number | null;
 }
 
 export interface RankingResponse {
@@ -183,6 +207,11 @@ export const getTickerDetail = (symbol: string) =>
 export const getPrices = (symbol: string, lookback = "1y") =>
   apiFetch<PricePoint[]>(
     `/tickers/${encodeURIComponent(symbol)}/prices?lookback=${lookback}`,
+  );
+
+export const getValuation = (symbol: string) =>
+  apiFetch<ValuationSnapshot>(
+    `/tickers/${encodeURIComponent(symbol)}/valuation`,
   );
 
 export const getRankings = (horizon: string, limit = 500) =>

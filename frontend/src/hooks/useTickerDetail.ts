@@ -28,13 +28,22 @@ export function useTickerDetail(symbol: string, lookback = "1y") {
   const [predStatus, setPredStatus] = useState<PredStatus>(null);
 
   const loadDetail = useCallback(async () => {
-    const [d, p] = await Promise.all([
-      getTickerDetail(symbol),
-      getPrices(symbol, lookback),
-    ]);
+    const d = await getTickerDetail(symbol);
     setDetail(d);
-    setPrices(p);
     return d;
+  }, [symbol]);
+
+  // Prices refetch on their own whenever the chart range (lookback) changes, so
+  // adjusting the range doesn't reload predictions/fundamentals or restart the
+  // scoring poll.
+  useEffect(() => {
+    let cancelled = false;
+    getPrices(symbol, lookback)
+      .then((p) => !cancelled && setPrices(p))
+      .catch(() => !cancelled && setPrices([]));
+    return () => {
+      cancelled = true;
+    };
   }, [symbol, lookback]);
 
   useEffect(() => {

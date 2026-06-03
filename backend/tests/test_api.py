@@ -292,6 +292,12 @@ def test_rankings(client, store) -> None:
     syms = [r["symbol"] for r in body["rows"]]
     assert syms == ["MSFT", "AAPL"]  # order preserved from the query
     assert body["rows"][0]["percentile_rank"] == 0.91
+    # Within-sector rank: both are Technology, MSFT (higher score) tops the sector.
+    msft, aapl = body["rows"][0], body["rows"][1]
+    assert msft["sector_rank"] == 1.0 and msft["sector_rank_label"] == "1/2"
+    assert aapl["sector_rank"] == 0.0 and aapl["sector_rank_label"] == "2/2"
+    # No price history in the fake store ⇒ Sharpe is null, not an error.
+    assert msft["sharpe"] is None
 
 
 def test_quotes_live(client, monkeypatch) -> None:

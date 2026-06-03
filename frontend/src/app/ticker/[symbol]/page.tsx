@@ -1,17 +1,25 @@
 "use client";
 
-import { use, useEffect, useMemo } from "react";
+import { use, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
 import { AppHeader } from "@/components/AppHeader";
-import { PriceChart } from "@/components/PriceChart";
+import { PriceChart, type ChartMode } from "@/components/PriceChart";
 import { RankGaugeRow } from "@/components/RankGauge";
 import { FundamentalsPanel } from "@/components/FundamentalsPanel";
 import { SentimentGauge } from "@/components/SentimentGauge";
 import { useTickerDetail } from "@/hooks/useTickerDetail";
 import { useQuotes } from "@/hooks/useQuotes";
+import { getValuation, type ValuationSnapshot } from "@/lib/api";
 import { changeColor, money, pct } from "@/lib/format";
+
+const RANGES = [
+  { label: "1M", lookback: "1m" },
+  { label: "6M", lookback: "6m" },
+  { label: "1Y", lookback: "1y" },
+  { label: "MAX", lookback: "max" },
+];
 
 function Card({
   title,
@@ -38,7 +46,9 @@ export default function TickerPage({
   const { symbol } = use(params);
   const router = useRouter();
   const { session, loading: authLoading } = useAuth();
-  const { detail, prices, loading, error, predStatus } = useTickerDetail(symbol);
+  const [range, setRange] = useState("1y");
+  const [chartMode, setChartMode] = useState<ChartMode>("area");
+  const { detail, prices, loading, error, predStatus } = useTickerDetail(symbol, range);
 
   useEffect(() => {
     if (!authLoading && !session) router.replace("/login");
@@ -47,6 +57,20 @@ export default function TickerPage({
   const quoteSymbols = useMemo(() => [symbol], [symbol]);
   const quotes = useQuotes(quoteSymbols);
   const q = quotes[symbol.toUpperCase()];
+
+  // Live valuation multiples (yfinance) load independently of the main detail so
+  // the page renders immediately and fills these in when ready.
+  const [valuation, setValuation] = useState<ValuationSnapshot | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setValuation(null);
+    getValuation(symbol)
+      .then((v) => !cancelled && setValuation(v))
+      .catch(() => !cancelled && setValuation(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol]);
 
   if (authLoading || !session) {
     return (
@@ -116,8 +140,40 @@ export default function TickerPage({
 
             <div className="grid gap-4 lg:grid-cols-3">
               <Card title="Price history" className="lg:col-span-2">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex rounded-lg border border-border bg-surface-2 p-0.5 text-[11px]">
+                    {RANGES.map((r) => (
+                      <button
+                        key={r.lookback}
+                        onClick={() => setRange(r.lookback)}
+                        className={`rounded-md px-2.5 py-1 font-medium transition-colors ${
+                          range === r.lookback
+                            ? "bg-accent/15 text-accent"
+                            : "text-muted hover:text-foreground"
+                        }`}
+                      >
+                        {r.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex rounded-lg border border-border bg-surface-2 p-0.5 text-[11px]">
+                    {(["area", "candles"] as ChartMode[]).map((m) => (
+                      <button
+                        key={m}
+                        onClick={() => setChartMode(m)}
+                        className={`rounded-md px-2.5 py-1 font-medium capitalize transition-colors ${
+                          chartMode === m
+                            ? "bg-accent/15 text-accent"
+                            : "text-muted hover:text-foreground"
+                        }`}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 {prices.length > 0 ? (
-                  <PriceChart data={prices} />
+                  <PriceChart data={prices} mode={chartMode} />
                 ) : (
                   <p className="text-sm text-muted">No price history available.</p>
                 )}
@@ -152,7 +208,7 @@ export default function TickerPage({
 
             <div className="mt-4 grid gap-4 lg:grid-cols-3">
               <Card title="Fundamentals" className="lg:col-span-2">
-                <FundamentalsPanel f={detail.fundamentals} />
+                <FundamentalsPanel f={detail.fundamentals} valuation={valuation} />
               </Card>
               <Card title="Sentiment">
                 <SentimentGauge s={detail.sentiment} />

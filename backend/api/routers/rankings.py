@@ -2,9 +2,13 @@
 
 Returns the active model's latest cross-section for a horizon, ordered by
 percentile rank — i.e. how every covered ticker stacks up against the universe.
+Also surfaces a within-sector percentile (the selection the model is trained on)
+and each name's trailing realized Sharpe for sorting/filtering.
 """
 
 from __future__ import annotations
+
+from collections import defaultdict
 
 import asyncpg
 from fastapi import APIRouter, Depends, Query
@@ -15,6 +19,77 @@ from backend.api.routers.tickers import HORIZON_ORDER, _resolve_active_model
 from backend.api.schemas import RankingResponse, RankingRow
 
 router = APIRouter(prefix="/rankings", tags=["rankings"])
+
+# Trailing window for the realized Sharpe (≈1 trading year); need a reasonable
+# minimum of observations before the ratio is meaningful.
+_SHARPE_WINDOW = 252
+_SHARPE_MIN_OBS = 30
+
+# Annualized Sharpe of daily log returns over the last _SHARPE_WINDOW trading rows
+# per ticker, for the given set of ticker_ids. Population over the window: mean/std
+# of daily log returns, annualized by sqrt(252). Null when too few returns.
+_SHARPE_SQL = """
+with ranked as (
+    select ticker_id, trade_date, adj_close,
+           row_number() over (partition by ticker_id order by trade_date desc) as rn
+      from price_history
+     where ticker_id = any($1::bigint[]) and adj_close is not null and adj_close > 0
+       -- Bound the scan to ~recent history so the PK (ticker_id, trade_date)
+       -- range-scans instead of reading each ticker's full history. 420 calendar
+       -- days comfortably contains the last 252 trading rows kept by rn below.
+       and trade_date >= current_date - interval '420 days'
+),
+windowed as (
+    select ticker_id, trade_date, adj_close from ranked where rn <= $2
+),
+rets as (
+    select ticker_id,
+           ln(adj_close / lag(adj_close) over (
+               partition by ticker_id order by trade_date)) as ret
+      from windowed
+)
+select ticker_id,
+       case when count(ret) >= $3 and stddev_samp(ret) > 0
+            then (avg(ret) / stddev_samp(ret)) * sqrt(252.0)
+            else null end as sharpe
+  from rets
+ where ret is not null
+ group by ticker_id
+"""
+
+
+async def _trailing_sharpe(conn: asyncpg.Connection, ticker_ids: list[int]) -> dict[int, float]:
+    if not ticker_ids:
+        return {}
+    rows = await conn.fetch(_SHARPE_SQL, ticker_ids, _SHARPE_WINDOW, _SHARPE_MIN_OBS)
+    return {
+        int(r["ticker_id"]): float(r["sharpe"])
+        for r in rows
+        if r["sharpe"] is not None
+    }
+
+
+def _within_sector_ranks(rows) -> dict[int, tuple[float, str]]:
+    """Map ticker_id -> (within-sector percentile in [0, 1], "pos/n" label).
+
+    Rows must already be ordered by descending model score. Groups with fewer than
+    2 named members or a null sector are omitted (no meaningful within-sector rank).
+    """
+    by_sector: dict[str, list] = defaultdict(list)
+    for r in rows:
+        if r["sector"]:
+            by_sector[r["sector"]].append(r)
+    out: dict[int, tuple[float, str]] = {}
+    for members in by_sector.values():
+        n = len(members)
+        if n < 2:
+            continue
+        # members are in descending-score order; position 1 = best in sector.
+        ordered = sorted(members, key=lambda r: r["direction_prob"], reverse=True)
+        for i, r in enumerate(ordered):
+            pct = (n - 1 - i) / (n - 1)  # 1.0 = best, 0.0 = worst
+            out[int(r["ticker_id"])] = (pct, f"{i + 1}/{n}")
+    return out
 
 
 @router.get("", response_model=RankingResponse)
@@ -54,6 +129,9 @@ async def rankings(
             limit,
         )
 
+        sector_ranks = _within_sector_ranks(rows)
+        sharpe = await _trailing_sharpe(conn, [int(r["ticker_id"]) for r in rows])
+
     as_of = rows[0]["as_of_date"] if rows else None
     return RankingResponse(
         horizon=h,
@@ -68,6 +146,9 @@ async def rankings(
                 sector=r["sector"],
                 percentile_rank=float(r["direction_prob"]),
                 rank_std=float(r["confidence"]) if r["confidence"] is not None else None,
+                sector_rank=sector_ranks.get(int(r["ticker_id"]), (None, None))[0],
+                sector_rank_label=sector_ranks.get(int(r["ticker_id"]), (None, None))[1],
+                sharpe=sharpe.get(int(r["ticker_id"])),
             )
             for r in rows
         ],

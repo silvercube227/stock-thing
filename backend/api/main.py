@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.quotes import router as quotes_router
+from backend.api.valuation import router as valuation_router
 from backend.api.routers.portfolio import router as portfolio_router
 from backend.api.routers.rankings import router as rankings_router
 from backend.api.routers.tickers import router as tickers_router
@@ -49,6 +50,7 @@ app.include_router(portfolio_router)
 app.include_router(tickers_router)
 app.include_router(rankings_router)
 app.include_router(quotes_router)
+app.include_router(valuation_router)
 
 
 @app.get("/health")

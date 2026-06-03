@@ -97,6 +97,28 @@ class SentimentSnapshot(BaseModel):
     rolling_14d: float | None = None
 
 
+class ValuationSnapshot(BaseModel):
+    """Live valuation + fundamentals from yfinance `.info` (delayed).
+
+    Fetched on demand and cached; not stored in Postgres. All fields nullable —
+    yfinance omits them for some instruments (e.g. ETFs, unprofitable names).
+    The `revenue`..`fcf` fundamentals fields are a fallback for off-index names
+    that have no SEC/EDGAR filing on record; the dashboard prefers EDGAR when
+    available. (Debt/equity is intentionally not pulled from yfinance — its scale
+    convention is inconsistent across versions.)
+    """
+
+    symbol: str
+    trailing_pe: float | None = None
+    price_to_sales: float | None = None
+    ebitda: float | None = None
+    revenue: float | None = None
+    net_income: float | None = None
+    gross_margin: float | None = None
+    operating_margin: float | None = None
+    fcf: float | None = None
+
+
 class TickerSummary(BaseModel):
     ticker_id: int
     symbol: str
@@ -145,6 +167,11 @@ class TickerDetail(BaseModel):
 class PricePoint(BaseModel):
     date: date
     close: float
+    # OHLC + volume for the candlestick view (nullable — older rows may lack them).
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    volume: int | None = None
 
 
 # =============================================================
@@ -159,6 +186,16 @@ class RankingRow(BaseModel):
     sector: str | None = None
     percentile_rank: float
     rank_std: float | None = None
+    # Within-(sector) percentile rank of the same model score, in [0, 1]. Null when
+    # the sector is unknown or has fewer than 2 covered names. Surfaces the
+    # within-sector selection the model is actually trained on (sector_return).
+    sector_rank: float | None = None
+    # Ordinal position within sector, e.g. "3/42". Null under the same conditions.
+    sector_rank_label: str | None = None
+    # Trailing realized annualized Sharpe of daily log returns over the last ~1y of
+    # price history. Backward-looking diagnostic, NOT a forecast. Null when there is
+    # too little history.
+    sharpe: float | None = None
 
 
 class RankingResponse(BaseModel):

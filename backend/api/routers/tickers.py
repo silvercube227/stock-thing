@@ -321,19 +321,43 @@ async def ticker_prices(
         days = _LOOKBACK_DAYS.get(lookback.lower())
         if days is None and lookback.lower() != "max":
             days = 366
+        # OHLC are raw; close has a split/dividend-adjusted twin (adj_close). Scale
+        # open/high/low by adj_close/close so the candles sit on the same adjusted
+        # axis as the area line (no discontinuity at split dates). adj_factor is null
+        # when raw close is missing/zero.
+        select_cols = (
+            "trade_date, adj_close, volume, "
+            "adj_close / nullif(close, 0) as adj_factor, open, high, low"
+        )
         if days is None:  # "max"
             rows = await conn.fetch(
-                "select trade_date, adj_close from price_history "
+                f"select {select_cols} from price_history "
                 "where ticker_id = $1 and adj_close is not null order by trade_date",
                 ticker_id,
             )
         else:
             rows = await conn.fetch(
-                "select trade_date, adj_close from price_history "
+                f"select {select_cols} from price_history "
                 "where ticker_id = $1 and adj_close is not null "
                 "and trade_date >= (current_date - make_interval(days => $2)) "
                 "order by trade_date",
                 ticker_id,
                 days,
             )
-    return [PricePoint(date=r["trade_date"], close=float(r["adj_close"])) for r in rows]
+
+    def _adj(raw, factor):
+        if raw is None or factor is None:
+            return None
+        return float(raw) * float(factor)
+
+    return [
+        PricePoint(
+            date=r["trade_date"],
+            close=float(r["adj_close"]),
+            open=_adj(r["open"], r["adj_factor"]),
+            high=_adj(r["high"], r["adj_factor"]),
+            low=_adj(r["low"], r["adj_factor"]),
+            volume=int(r["volume"]) if r["volume"] is not None else None,
+        )
+        for r in rows
+    ]

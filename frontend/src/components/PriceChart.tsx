@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import {
   AreaSeries,
+  CandlestickSeries,
   ColorType,
   createChart,
   type IChartApi,
@@ -10,11 +11,21 @@ import {
 } from "lightweight-charts";
 import type { PricePoint } from "@/lib/api";
 
-export function PriceChart({ data }: { data: PricePoint[] }) {
+export type ChartMode = "area" | "candles";
+
+export function PriceChart({
+  data,
+  mode = "area",
+}: {
+  data: PricePoint[];
+  mode?: ChartMode;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const seriesRef = useRef<ISeriesApi<"Area"> | null>(null);
+  const seriesRef = useRef<ISeriesApi<"Area"> | ISeriesApi<"Candlestick"> | null>(null);
 
+  // Recreate the chart + series when the series type (mode) changes; the data
+  // effect below repopulates it.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -40,13 +51,24 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
       },
     });
 
-    const series = chart.addSeries(AreaSeries, {
-      lineColor: "#38bdf8",
-      lineWidth: 2,
-      topColor: "rgba(56, 189, 248, 0.20)",
-      bottomColor: "rgba(56, 189, 248, 0.01)",
-      priceLineVisible: false,
-    });
+    const series =
+      mode === "candles"
+        ? chart.addSeries(CandlestickSeries, {
+            upColor: "#22c55e",
+            downColor: "#ef4444",
+            borderUpColor: "#22c55e",
+            borderDownColor: "#ef4444",
+            wickUpColor: "#22c55e",
+            wickDownColor: "#ef4444",
+            priceLineVisible: false,
+          })
+        : chart.addSeries(AreaSeries, {
+            lineColor: "#38bdf8",
+            lineWidth: 2,
+            topColor: "rgba(56, 189, 248, 0.20)",
+            bottomColor: "rgba(56, 189, 248, 0.01)",
+            priceLineVisible: false,
+          });
 
     chartRef.current = chart;
     seriesRef.current = series;
@@ -62,15 +84,31 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
       chartRef.current = null;
       seriesRef.current = null;
     };
-  }, []);
+  }, [mode]);
 
   useEffect(() => {
-    if (!seriesRef.current) return;
-    seriesRef.current.setData(
-      data.map((p) => ({ time: p.date, value: p.close })),
-    );
+    const series = seriesRef.current;
+    if (!series) return;
+    if (mode === "candles") {
+      // Candlesticks need full OHLC; older rows may lack it — drop those.
+      (series as ISeriesApi<"Candlestick">).setData(
+        data
+          .filter((p) => p.open != null && p.high != null && p.low != null)
+          .map((p) => ({
+            time: p.date,
+            open: p.open as number,
+            high: p.high as number,
+            low: p.low as number,
+            close: p.close,
+          })),
+      );
+    } else {
+      (series as ISeriesApi<"Area">).setData(
+        data.map((p) => ({ time: p.date, value: p.close })),
+      );
+    }
     chartRef.current?.timeScale().fitContent();
-  }, [data]);
+  }, [data, mode]);
 
   return <div ref={containerRef} className="w-full" />;
 }
