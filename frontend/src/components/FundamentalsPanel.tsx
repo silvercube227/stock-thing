@@ -5,9 +5,9 @@ import { compactMoney, num } from "@/lib/format";
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-xl border border-border bg-surface-2 px-3.5 py-3">
+    <div>
       <div className="text-[10px] uppercase tracking-widest text-faint">{label}</div>
-      <div className="nums mt-1 text-sm font-medium">{value}</div>
+      <div className="nums mt-0.5 text-sm font-medium">{value}</div>
     </div>
   );
 }
@@ -27,6 +27,7 @@ export function FundamentalsPanel({
   const hasVal =
     !!valuation &&
     (valuation.trailing_pe != null ||
+      valuation.forward_pe != null ||
       valuation.price_to_sales != null ||
       valuation.ebitda != null);
 
@@ -73,7 +74,7 @@ export function FundamentalsPanel({
   return (
     <div>
       {fnd && (
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
           <Metric label="Revenue" value={compactMoney(fnd.revenue)} />
           <Metric label="Net income" value={compactMoney(fnd.net_income)} />
           <Metric label="Free cash flow" value={compactMoney(fnd.fcf)} />
@@ -84,16 +85,17 @@ export function FundamentalsPanel({
       )}
 
       {hasVal && (
-        <div className={fnd ? "mt-2" : ""}>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <div className={fnd ? "mt-4" : ""}>
+          <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3">
             <Metric label="P / E (TTM)" value={num(valuation!.trailing_pe, 1)} />
+            <Metric label="P / E (fwd)" value={num(valuation!.forward_pe, 1)} />
             <Metric label="P / S (TTM)" value={num(valuation!.price_to_sales, 1)} />
             <Metric label="EBITDA" value={compactMoney(valuation!.ebitda)} />
           </div>
         </div>
       )}
 
-      <p className="mt-3 text-[10px] text-faint border-t border-border/40 pt-3">
+      <p className="mt-4 text-[10px] text-faint">
         {f ? (
           <>
             {f.filing_type ?? "Latest filing"}

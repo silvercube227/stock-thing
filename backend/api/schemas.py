@@ -110,6 +110,9 @@ class ValuationSnapshot(BaseModel):
 
     symbol: str
     trailing_pe: float | None = None
+    # Forward P/E — a fallback for names with negative trailing EPS (no trailing
+    # P/E exists), e.g. a turnaround like INTC.
+    forward_pe: float | None = None
     price_to_sales: float | None = None
     ebitda: float | None = None
     revenue: float | None = None

@@ -83,6 +83,7 @@ export interface SentimentSnapshot {
 export interface ValuationSnapshot {
   symbol: string;
   trailing_pe: number | null;
+  forward_pe: number | null;
   price_to_sales: number | null;
   ebitda: number | null;
   // Fundamentals fallback for off-index names with no EDGAR filing.

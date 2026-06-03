@@ -63,6 +63,7 @@ async def fetch_valuation(symbol: str) -> ValuationSnapshot:
     snap = ValuationSnapshot(
         symbol=sym,
         trailing_pe=_num(info, "trailingPE"),
+        forward_pe=_num(info, "forwardPE"),
         price_to_sales=_num(info, "priceToSalesTrailing12Months"),
         ebitda=_num(info, "ebitda"),
         revenue=_num(info, "totalRevenue"),
