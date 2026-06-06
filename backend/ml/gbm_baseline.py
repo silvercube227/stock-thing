@@ -197,6 +197,11 @@ class HorizonSpec:
     # (unchanged behavior); >0 blends a ridge model at this rank weight.
     linear_blend: float = 0.0
     ridge_alpha: float = 10.0
+    # Cross-date prediction smoothing: EWMA span for the name's percentile rank
+    # over consecutive scoring dates (0 = off). Averages out per-date estimation
+    # noise in a persistent signal → higher ICIR + much lower turnover. Helps most
+    # on the noisiest horizons (3M, 1Y); 6M is already stable so it's left off.
+    smooth_span: int = 0
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -236,11 +241,20 @@ class HorizonSpec:
 #     ≥ +rev +0.0501) so 1Y is left unchanged pending a parsimony cleanup.
 _BASELINE_PLUS_SURPRISE = FEATURE_COLS + ESTIMATE_SURPRISE_FEATURES
 _BASELINE_PLUS_REVMOM = FEATURE_COLS + REVISION_MOMENTUM_FEATURES
+#   - 3M / 1Y smooth_span: cross-date EWMA rank smoothing PROMOTED (2026-06-05,
+#     8-seed walk-forward, SECB). The noisiest horizons gain the most from averaging
+#     out per-date estimation noise:
+#         3M (span 3): SECB IC +0.0496→+0.0575, ICIR +0.424→+0.494, t_block
+#                      +2.93→+3.41, turnover 0.133→0.067 (−50%)
+#         1Y (span 4): SECB IC +0.0388→+0.0405, ICIR +0.446→+0.525, t_block
+#                      +1.44→+1.70, turnover 0.091→0.042 (−54%)
+#     6M is left UNSMOOTHED: it's the strongest/most stable horizon, so smoothing
+#     was ~flat on IC/ICIR (span 2: −0.0004 IC) — only a turnover trade, not promoted.
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
-    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM),
+    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM, smooth_span=3),
     "6M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE),
-    "1Y": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE),
+    "1Y": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
 }
 
 
@@ -1333,6 +1347,58 @@ def within_sector_ic(
     return float(np.mean(ics)) if ics else float("nan")
 
 
+def ewma_rank_by_ticker(
+    records: list[dict], span: int
+) -> list[np.ndarray]:
+    """Causal EWMA of each name's within-date percentile rank across scoring dates.
+
+    `records` is the per-fold list (chronological) built by `walk_forward_ic`, each
+    `{"ticker_ids": int array, "pred": float array, ...}`. We rank-transform each
+    fold's raw predictions to [0, 1] (scale-free, since every fold refits a fresh
+    model whose raw outputs aren't comparable across dates), then exponentially
+    smooth each ticker's rank with `alpha = 2/(span+1)`, carrying state forward.
+    A name's first appearance seeds its state with its raw rank. Returns one
+    smoothed-rank array per fold, aligned to `records`.
+
+    This mirrors the production blend (which smooths the stored percentile rank),
+    so the walk-forward measures exactly what inference would ship.
+    """
+    alpha = 2.0 / (span + 1.0)
+    state: dict[int, float] = {}
+    out: list[np.ndarray] = []
+    for rec in records:
+        tids = rec["ticker_ids"]
+        raw_rank = _rank01(rec["pred"])
+        sm = np.empty(len(tids), dtype=float)
+        for i, t in enumerate(tids):
+            t = int(t)
+            state[t] = raw_rank[i] if t not in state else alpha * raw_rank[i] + (1 - alpha) * state[t]
+            sm[i] = state[t]
+        out.append(sm)
+    return out
+
+
+def rank_turnover(records: list[dict], rank_series: list[np.ndarray] | None = None) -> float:
+    """Mean |Δ percentile-rank| of a name between consecutive scoring dates.
+
+    A turnover proxy: lower = the model's relative view of names is steadier. Uses
+    the raw within-date rank of each fold's predictions unless `rank_series`
+    (e.g. the smoothed ranks from `ewma_rank_by_ticker`) is supplied. Averages the
+    per-pair mean over names present in both consecutive cross-sections.
+    """
+    prev: dict[int, float] | None = None
+    diffs: list[float] = []
+    for idx, rec in enumerate(records):
+        ranks = rank_series[idx] if rank_series is not None else _rank01(rec["pred"])
+        cur = {int(t): float(ranks[i]) for i, t in enumerate(rec["ticker_ids"])}
+        if prev is not None:
+            shared = cur.keys() & prev.keys()
+            if shared:
+                diffs.append(float(np.mean([abs(cur[t] - prev[t]) for t in shared])))
+        prev = cur
+    return float(np.mean(diffs)) if diffs else float("nan")
+
+
 def walk_forward_ic(
     panel,
     horizon: str = "1M",
@@ -1348,11 +1414,20 @@ def walk_forward_ic(
     sector_group_col: str = "sector",
     linear_blend: float = 0.0,
     ridge_alpha: float = 10.0,
+    smooth_span: int = 0,
+    return_records: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
 
     Trains on `target_mode` (return/rank/quantile) but always SCORES rank-IC against
     the realized demeaned return `r_{horizon}`, so modes are directly comparable.
+
+    `smooth_span > 0` post-processes the per-fold predictions with a causal EWMA of
+    each name's percentile rank across scoring dates (`ewma_rank_by_ticker`) BEFORE
+    scoring — a pure post-step that leaves the fit untouched but measures the
+    smoothed signal inference would ship. The result always carries `rank_turnover`
+    (mean |Δ rank| between consecutive dates) for the raw signal, and the smoothed
+    turnover when smoothing is on.
     """
     import pandas as pd
 
@@ -1366,6 +1441,7 @@ def walk_forward_ic(
     folds = walk_forward_folds(grid_dates, wf_cfg.min_train_months, embargo_steps)
 
     fold_rows: list[dict] = []
+    records: list[dict] = []  # per-fold (ticker_ids, raw pred, realized r, sector) for smoothing/turnover
     for fi, (test_date, cutoff) in enumerate(folds):
         train = panel[(panel["date"] <= cutoff) & panel[m_col] & panel[t_col].notna()]
         if wf_cfg.max_train_months is not None:
@@ -1399,12 +1475,37 @@ def walk_forward_ic(
                 preds, test, r_col, group_col=sector_group_col
             )
         fold_rows.append(fold)
+        records.append({
+            "ticker_ids": test["ticker_id"].to_numpy(),
+            "pred": np.asarray(preds, dtype=float),
+            "r": test[r_col].to_numpy(dtype=float),
+            "sector": test[sector_group_col].to_numpy() if sector_group_col in test.columns else None,
+        })
         log(
             f"  fold {test_date}  ic {ic:+.4f}  "
             f"n_test={test.shape[0]:>4d}  n_train={train.shape[0]}"
         )
 
+    # Smoothing: recompute each fold's IC / SECB on the causal EWMA of each name's
+    # percentile rank (records is 1:1 aligned with fold_rows). Spearman is invariant
+    # to the final re-rank, so scoring on the smoothed rank == scoring on its rank.
+    turnover_smoothed = None
+    if smooth_span > 0 and records:
+        smoothed = ewma_rank_by_ticker(records, smooth_span)
+        for fold, rec, sm in zip(fold_rows, records, smoothed, strict=True):
+            fold["ic"] = float(pd.Series(sm).corr(pd.Series(rec["r"]), method="spearman"))
+            if compute_sector_ic and rec["sector"] is not None:
+                sdf = pd.DataFrame({r_col: rec["r"], sector_group_col: rec["sector"]})
+                fold["sector_ic"] = within_sector_ic(sm, sdf, r_col, group_col=sector_group_col)
+        turnover_smoothed = rank_turnover(records, rank_series=smoothed)
+
     result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
+    result["turnover_raw"] = rank_turnover(records)
+    result["turnover_smoothed"] = turnover_smoothed
+    if return_records:
+        # Raw per-fold (ticker_ids, pred, r, sector) so a caller can sweep smoothing
+        # spans / turnover WITHOUT refitting (the fits dominate cost).
+        result["records"] = records
     if compute_sector_ic:
         # sector_summary uses the same naive ICIR×√N formula as universe — caller
         # should apply block_bootstrap_summary on sector_ic_values for honest t.
@@ -1660,12 +1761,21 @@ async def run(args) -> None:
                                compute_sector_ic=args.sector_neutral_ic,
                                sector_group_col=args.neutralize_by,
                                linear_blend=args.with_linear_blend,
-                               ridge_alpha=args.ridge_alpha)
+                               ridge_alpha=args.ridge_alpha,
+                               smooth_span=args.smooth_span)
         block_size = args.block_size or max(
             1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
         )
+        smooth_tag = f", smooth_span={args.smooth_span}" if args.smooth_span > 0 else ""
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
-              f"(expanding walk-forward, target={args.target}) ---")
+              f"(expanding walk-forward, target={args.target}{smooth_tag}) ---")
+        if real.get("turnover_raw") is not None:
+            tr = real["turnover_raw"]
+            line = f"[turnover] mean |Δ rank| consecutive dates: raw={tr:.4f}"
+            if real.get("turnover_smoothed") is not None:
+                ts = real["turnover_smoothed"]
+                line += f"  smoothed={ts:.4f}  ({(1 - ts / tr) * 100:+.0f}% vs raw)"
+            print(line)
 
         # HEADLINE: within-sector stock selection — the bar a horizon must clear.
         sec_boot = None
@@ -1705,7 +1815,8 @@ async def run(args) -> None:
                                       compute_sector_ic=args.sector_neutral_ic,
                                       sector_group_col=args.neutralize_by,
                                       linear_blend=args.with_linear_blend,
-                                      ridge_alpha=args.ridge_alpha)
+                                      ridge_alpha=args.ridge_alpha,
+                                      smooth_span=args.smooth_span)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 if args.sector_neutral_ic and "sector_summary" in res:
@@ -1768,6 +1879,11 @@ def main() -> None:
     p.add_argument("--n-seeds", type=int, default=1,
                    help="seed-ensemble size for walk-forward (default 1; use 8 for "
                         "production-equivalent smoothed IC estimate)")
+    p.add_argument("--smooth-span", type=int, default=0, metavar="N",
+                   help="EWMA span for cross-date prediction smoothing (0 = off). "
+                        "Causally smooths each name's percentile rank over scoring "
+                        "dates before scoring, then reports turnover raw vs smoothed. "
+                        "Reduces drift/turnover; longer spans suit longer horizons.")
     p.add_argument("--symbols", nargs="*", help="restrict to these symbols")
     p.add_argument("--refresh-cache", action="store_true",
                    help="re-pull frames from Supabase and overwrite the local "

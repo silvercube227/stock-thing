@@ -246,6 +246,47 @@ def apply_cross_horizon_shrink(
     return prediction_rows
 
 
+def apply_rank_smoothing(
+    prediction_rows: list[dict],
+    specs: dict,
+    prior_ranks: dict[tuple[int, str], list[float]],
+) -> list[dict]:
+    """EWMA-smooth each name's percentile rank toward its most recent stored rank.
+
+    For horizons whose `HorizonSpec.smooth_span > 0` (3M/1Y in production), blend the
+    current `relative_rank` with the name's last stored (already-smoothed) rank using
+    `alpha = 2/(span+1)`, then re-rank within the horizon to a clean percentile so the
+    stored value stays a uniform [0,1] rank. This is the online one-step form of the
+    walk-forward's `ewma_rank_by_ticker`: the previously stored rank is the carried
+    state. Names with no prior keep their raw rank; single-name horizons are skipped.
+
+    `prior_ranks` maps (ticker_id, horizon) -> [most-recent-first stored ranks]; only
+    the newest (index 0) is used. Mutates and returns `prediction_rows`.
+    """
+    if not isinstance(specs, dict):
+        return prediction_rows
+
+    import pandas as pd
+
+    for h, spec in specs.items():
+        span = getattr(spec, "smooth_span", 0)
+        if span <= 0:
+            continue
+        rows = [r for r in prediction_rows if r["horizon"] == h]
+        if len(rows) < 2:
+            continue
+        alpha = 2.0 / (span + 1.0)
+        blended = np.array([
+            alpha * r["relative_rank"] + (1.0 - alpha) * prior_ranks[(r["ticker_id"], h)][0]
+            if prior_ranks.get((r["ticker_id"], h)) else r["relative_rank"]
+            for r in rows
+        ], dtype=float)
+        ranks = (pd.Series(blended).rank(method="average").to_numpy() - 1.0) / (len(rows) - 1)
+        for r, rank in zip(rows, ranks, strict=True):
+            r["relative_rank"] = float(rank)
+    return prediction_rows
+
+
 def rank_stability(ranks: list[float]) -> float | None:
     """Std of predicted percentile rank across the last few scoring dates.
 
@@ -319,6 +360,7 @@ def _specs_from_serialized(serialized: dict) -> dict[str, HorizonSpec]:
             feature_cols=d.get("feature_cols"),
             linear_blend=d.get("linear_blend", 0.0),
             ridge_alpha=d.get("ridge_alpha", 10.0),
+            smooth_span=d.get("smooth_span", 0),
         )
     return out
 
@@ -362,6 +404,7 @@ def _serialize_spec(spec: HorizonSpec) -> dict:
         "feature_cols": _spec_feature_cols(spec),
         "linear_blend": getattr(spec, "linear_blend", 0.0),
         "ridge_alpha": getattr(spec, "ridge_alpha", 10.0),
+        "smooth_span": getattr(spec, "smooth_span", 0),
     }
 
 
@@ -386,6 +429,7 @@ def build_specs_from_args(args) -> dict[str, HorizonSpec]:
                 feature_cols=spec.feature_cols,
                 linear_blend=spec.linear_blend,
                 ridge_alpha=spec.ridge_alpha,
+                smooth_span=spec.smooth_span,
             )
         base[h] = spec
     return base
@@ -434,6 +478,12 @@ async def run(args) -> None:
         prediction_rows = score_current_cross_section(
             panel, models, specs, as_of, active_ids, linear_models=linear_models
         )
+        # Cross-date smoothing: EWMA each name's rank toward its last stored rank
+        # for horizons whose spec sets smooth_span>0 (3M/1Y in production). Fetch
+        # priors once here and reuse them for the confidence/stability metric below.
+        ticker_ids = sorted({r["ticker_id"] for r in prediction_rows})
+        prior = await fetch_prior_ranks(pool, ticker_ids, horizons, as_of)
+        prediction_rows = apply_rank_smoothing(prediction_rows, specs, prior)
         if args.shrink_1y_toward_6m > 0 and {"6M", "1Y"} <= set(horizons):
             prediction_rows = apply_cross_horizon_shrink(
                 prediction_rows, source="6M", target="1Y",
@@ -492,8 +542,8 @@ async def run(args) -> None:
         }
         # Rank stability: std of each name's predicted rank across the last
         # up-to-3 scoring dates (this run + the two most recent prior dates).
-        ticker_ids = sorted({r["ticker_id"] for r in prediction_rows})
-        prior = await fetch_prior_ranks(pool, ticker_ids, horizons, as_of)
+        # `prior` was fetched above (before smoothing) and is reused here; the
+        # series now ends on the smoothed rank, which is what we store.
         for r in prediction_rows:
             series = prior.get((r["ticker_id"], r["horizon"]), []) + [r["relative_rank"]]
             r["confidence"] = rank_stability(series)
@@ -640,7 +690,13 @@ async def score_single_ticker(pool, symbol: str) -> dict:
         return {"status": "insufficient_history", "symbol": symbol}
 
     horizons = list(specs.keys())
-    prior = await fetch_prior_ranks(pool, [new_id], horizons, as_of)
+    # Smooth against the full (reconstructed) cross-section so the new name's rank
+    # is re-ranked among the smoothed S&P, consistent with a full inference pass.
+    # Mutates `mine`'s rows in place (same dict objects). Needs priors for all
+    # scored ids; one indexed query on a user-initiated add — cost is negligible.
+    all_ids = sorted({r["ticker_id"] for r in prediction_rows})
+    prior = await fetch_prior_ranks(pool, all_ids, horizons, as_of)
+    apply_rank_smoothing(prediction_rows, specs, prior)
     for r in mine:
         series = prior.get((new_id, r["horizon"]), []) + [r["relative_rank"]]
         r["confidence"] = rank_stability(series)
