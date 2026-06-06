@@ -51,8 +51,13 @@ from backend.ml.gbm_baseline import (
     blend_gbdt_linear,
     fit_linear_model,
     fit_lgbm_model,
+    knife_overlay_ranks,
     prepare_panel,
 )
+
+# Rank-normalized risk features the falling-knife overlay consumes (present on the
+# scored cross-section because they're part of FEATURE_COLS).
+_KNIFE_RISK_COLS = (("vol_120d", "vol"), ("ma_gap_200", "trend"), ("dist_low_252", "dlow"))
 from backend.ml.model import HORIZONS
 
 DEFAULT_INFERENCE_HORIZONS = ("3M", "6M", "1Y")
@@ -162,15 +167,24 @@ def score_current_cross_section(
         raise ValueError(f"no active ticker rows available for as_of={as_of}")
 
     if isinstance(specs, dict):
-        iter_pairs = [(h, _spec_feature_cols(s)) for h, s in specs.items()]
+        iter_pairs = [(h, _spec_feature_cols(s), getattr(s, "knife_lambda", 0.0))
+                      for h, s in specs.items()]
     else:
-        iter_pairs = [(h, list(FEATURE_COLS)) for h in specs]
+        iter_pairs = [(h, list(FEATURE_COLS), 0.0) for h in specs]
 
     import pandas as pd
 
+    # Risk features for the falling-knife overlay (one cross-section), read from the
+    # rank-normalized panel; reused across horizons since they're horizon-agnostic.
+    knife_risk = {
+        key: current[col].to_numpy(dtype=float)
+        for col, key in _KNIFE_RISK_COLS
+        if col in current.columns
+    }
+
     rows: list[dict] = []
     n = len(current)
-    for h, cols in iter_pairs:
+    for h, cols, knife_lambda in iter_pairs:
         # Predictions are mapped to within-cross-section percentile rank in [0, 1]
         # before storage. The previous "clip to [0,1]" path worked for `rank`-mode
         # training where preds were already roughly in that range, but a
@@ -193,6 +207,10 @@ def score_current_cross_section(
         if n > 1:
             ranks_raw = pd.Series(preds).rank(method="average").to_numpy()
             ranks = (ranks_raw - 1.0) / (n - 1)
+            # Falling-knife overlay (3M in production): demote vol×downtrend names
+            # out of the top before the rank is stored / smoothed. No-op when
+            # knife_lambda=0 or the risk features are absent.
+            ranks = knife_overlay_ranks(ranks, knife_risk, knife_lambda)
         else:
             ranks = np.full_like(preds, 0.5, dtype=float)
         for ticker_id, rank in zip(current["ticker_id"].to_numpy(), ranks, strict=True):
@@ -361,6 +379,7 @@ def _specs_from_serialized(serialized: dict) -> dict[str, HorizonSpec]:
             linear_blend=d.get("linear_blend", 0.0),
             ridge_alpha=d.get("ridge_alpha", 10.0),
             smooth_span=d.get("smooth_span", 0),
+            knife_lambda=d.get("knife_lambda", 0.0),
         )
     return out
 
@@ -405,6 +424,7 @@ def _serialize_spec(spec: HorizonSpec) -> dict:
         "linear_blend": getattr(spec, "linear_blend", 0.0),
         "ridge_alpha": getattr(spec, "ridge_alpha", 10.0),
         "smooth_span": getattr(spec, "smooth_span", 0),
+        "knife_lambda": getattr(spec, "knife_lambda", 0.0),
     }
 
 

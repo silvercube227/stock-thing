@@ -126,12 +126,21 @@ REVISION_MOMENTUM_FEATURES = [
 FORWARD_VALUATION_FEATURES = [
     "forward_earnings_yield", "forward_ebitda_yield", "price_target_upside",
 ]
+# Lottery / idiosyncratic-vol pack (Experiment 1): the volatility variants that
+# carry the documented NEGATIVE cross-sectional signal, which total realized vol
+# (vol_20/60/120) conflates with priced risk and loads on POSITIVELY.
+#   max_ret_21d : max daily return over the last ~month — lottery-demand proxy
+#                 (Bali-Cakici-Whitelaw 2011; subsumes the IVOL puzzle, robust in
+#                 large caps). Expect a negative loading.
+#   idio_vol    : residual daily-return vol vs the universe (stock − beta·market),
+#                 the idiosyncratic-volatility puzzle factor (Ang et al 2006).
+LOTTERY_FEATURES = ["max_ret_21d", "idio_vol"]
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
 EXPERIMENTAL_FEATURES = (
     VALUATION_FEATURES + QUALITY_FEATURES + RESIDUAL_MOM_FEATURES + EARNINGS_REACTION_FEATURES
     + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + EPS_SURPRISE_FEATURES
-    + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES
+    + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES + LOTTERY_FEATURES
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /
 # earnings-reaction features already adjust for market or filing context so they
@@ -202,6 +211,11 @@ class HorizonSpec:
     # noise in a persistent signal → higher ICIR + much lower turnover. Helps most
     # on the noisiest horizons (3M, 1Y); 6M is already stable so it's left off.
     smooth_span: int = 0
+    # Falling-knife output overlay: re-rank weight in [0, 1] (0 = off). Demotes
+    # names that are BOTH high-vol AND downtrending (vol × downtrend) out of the
+    # top of the ranking. Applied at score time before smoothing. Promoted at 3M
+    # only — it's a downside/quality lever, NOT a churn lever (smoothing owns that).
+    knife_lambda: float = 0.0
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -250,9 +264,19 @@ _BASELINE_PLUS_REVMOM = FEATURE_COLS + REVISION_MOMENTUM_FEATURES
 #                      +1.44→+1.70, turnover 0.091→0.042 (−54%)
 #     6M is left UNSMOOTHED: it's the strongest/most stable horizon, so smoothing
 #     was ~flat on IC/ICIR (span 2: −0.0004 IC) — only a turnover trade, not promoted.
+#   - 3M knife_lambda: falling-knife output overlay PROMOTED (2026-06-06, 8-seed
+#     walk-forward, SECB, composed with smooth_span=3). Re-ranks vol×downtrend names
+#     out of the top: top-decile knife score −47%, realized downside −7%, top-decile
+#     mean return still positive, for only SECB IC +0.0575→+0.0563 (t_block +3.41→
+#     +2.89, p 0.0005→0.0020 — still strongly significant). 6M/1Y NOT promoted: a
+#     poor trade (6M erodes SECB ~6%/0.10λ for negligible downside; 1Y is power-
+#     limited and drops below its detection floor). NOT a churn lever — turnover was
+#     ~flat under the overlay (smoothing already owns turnover). See sweep CLI
+#     `--knife-sweep` / `--knife-lambda` and `knife-overlay-falling-knife` memo.
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
-    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM, smooth_span=3),
+    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM,
+                      smooth_span=3, knife_lambda=0.20),
     "6M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE),
     "1Y": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
 }
@@ -332,6 +356,21 @@ def _price_features(
     feats["vol_20d"] = _std(daily[-20:])
     feats["vol_60d"] = _std(daily[-60:])
     feats["vol_120d"] = _std(daily[-120:])
+
+    # --- Lottery / idiosyncratic-vol pack (Experiment 1) ---
+    # max_ret_21d: largest single-day SIMPLE return over the last ~month (Bali 2011
+    # lottery proxy). daily is log returns; expm1(max log) = max simple return.
+    last21 = daily[-21:]
+    last21 = last21[~np.isnan(last21)]
+    feats["max_ret_21d"] = float(np.expm1(last21.max())) if last21.size else 0.0
+    # idio_vol: residual daily-return vol vs the universe (stock − beta·market),
+    # reusing the aligned stock/market series + beta built above. Falls back to
+    # total daily vol when the market series is too short (keeps it finite).
+    if len(stock_daily) >= 60:
+        resid = np.asarray(stock_daily, dtype=float) - feats["beta_252d"] * np.asarray(market_daily, dtype=float)
+        feats["idio_vol"] = float(resid.std())
+    else:
+        feats["idio_vol"] = _std(daily[-120:])
 
     hi, lo = np.nanmax(window), np.nanmin(window)
     feats["dist_high_252"] = _log_ratio(P, hi)
@@ -1348,7 +1387,7 @@ def within_sector_ic(
 
 
 def ewma_rank_by_ticker(
-    records: list[dict], span: int
+    records: list[dict], span: int, rank_series: list[np.ndarray] | None = None
 ) -> list[np.ndarray]:
     """Causal EWMA of each name's within-date percentile rank across scoring dates.
 
@@ -1360,15 +1399,19 @@ def ewma_rank_by_ticker(
     A name's first appearance seeds its state with its raw rank. Returns one
     smoothed-rank array per fold, aligned to `records`.
 
+    Pass `rank_series` (per-fold rank arrays already in [0, 1], e.g. the output of
+    `apply_knife_overlay`) to smooth THOSE instead of the raw-prediction ranks — this
+    is how the knife overlay composes ahead of cross-date smoothing.
+
     This mirrors the production blend (which smooths the stored percentile rank),
     so the walk-forward measures exactly what inference would ship.
     """
     alpha = 2.0 / (span + 1.0)
     state: dict[int, float] = {}
     out: list[np.ndarray] = []
-    for rec in records:
+    for idx, rec in enumerate(records):
         tids = rec["ticker_ids"]
-        raw_rank = _rank01(rec["pred"])
+        raw_rank = rank_series[idx] if rank_series is not None else _rank01(rec["pred"])
         sm = np.empty(len(tids), dtype=float)
         for i, t in enumerate(tids):
             t = int(t)
@@ -1399,6 +1442,155 @@ def rank_turnover(records: list[dict], rank_series: list[np.ndarray] | None = No
     return float(np.mean(diffs)) if diffs else float("nan")
 
 
+def _knife_components(
+    risk: dict | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Falling-knife components from a fold's carried risk features.
+
+    `risk` holds the cross-sectionally rank-normalized [-1, 1] features
+    (`vol`=vol_120d, `trend`=ma_gap_200, `dlow`=dist_low_252) attached to each
+    record by `walk_forward_ic`. Map to [0, 1] percentiles: vol high = volatile;
+    trend/dlow LOW = below the 200d MA / near the 52w low = falling. Returns
+    `(knife, vol_p, downtrend_p)` where `downtrend_p = 1 - mean(trend_p, dlow_p)`
+    and `knife = vol_p * downtrend_p` — high ONLY in the high-vol-AND-falling
+    corner. Rare NaNs (a name missing a price feature) are neutralized to the
+    cross-section median so they neither earn nor dodge the penalty. Returns
+    `None` when the volatility feature or both trend features are absent.
+    """
+    if not risk or "vol" not in risk:
+        return None
+    to01 = lambda x: (np.asarray(x, dtype=float) + 1.0) / 2.0
+    vol_p = to01(risk["vol"])
+    trend_parts = [to01(risk[k]) for k in ("trend", "dlow") if k in risk]
+    if not trend_parts:
+        return None
+    downtrend_p = 1.0 - np.mean(trend_parts, axis=0)
+    knife = vol_p * downtrend_p
+    if np.isnan(knife).any():
+        med = np.nanmedian(knife)
+        if not np.isfinite(med):
+            return None
+        knife = np.where(np.isnan(knife), med, knife)
+        vol_p = np.nan_to_num(vol_p, nan=0.5)
+        downtrend_p = np.nan_to_num(downtrend_p, nan=0.5)
+    return knife, vol_p, downtrend_p
+
+
+def _knife_score(risk: dict | None) -> np.ndarray | None:
+    """The falling-knife penalty score in [0, 1] (see `_knife_components`)."""
+    comp = _knife_components(risk)
+    return None if comp is None else comp[0]
+
+
+def knife_overlay_ranks(
+    model_ranks: np.ndarray, risk: dict | None, lam: float
+) -> np.ndarray:
+    """Falling-knife overlay for ONE cross-section: re-rank model percentile ranks.
+
+        adj = (1-lam)*model_p - lam*knife_p ;  final = rank01(adj)
+    pushes high-vol-AND-falling names down while sparing high-vol uptrenders and
+    low-vol fallers. Returns `model_ranks` unchanged when `lam<=0` or `risk` lacks
+    the features (exact no-op). Shared by the walk-forward (`apply_knife_overlay`)
+    and production inference so both apply byte-identical math.
+    """
+    model_p = np.asarray(model_ranks, dtype=float)
+    knife = _knife_score(risk) if lam > 0 else None
+    if knife is None:
+        return model_p
+    return _rank01((1.0 - lam) * model_p - lam * _rank01(knife))
+
+
+def apply_knife_overlay(records: list[dict], lam: float) -> list[np.ndarray]:
+    """Per-fold rank arrays after the falling-knife output overlay (see
+    `knife_overlay_ranks`). `lam=0` returns each fold's model ranks unchanged.
+    """
+    return [knife_overlay_ranks(_rank01(rec["pred"]), rec.get("risk"), lam)
+            for rec in records]
+
+
+def top_decile_risk(
+    records: list[dict], rank_series: list[np.ndarray], decile: float = 0.1
+) -> dict:
+    """Risk character of each fold's top-decile names, averaged across folds.
+
+    `rank_series` is the per-fold FINAL rank arrays (e.g. from
+    `apply_knife_overlay`), aligned to `records`. For each fold we take the top
+    `ceil(decile*n)` names by rank and collect:
+      knife      mean falling-knife score of the top names (ex-ante)
+      vol_p      mean volatility percentile of the top names (ex-ante)
+      downtrend  fraction of top names with downtrend_p > 0.5 (ex-ante)
+      mean_r     mean realized demeaned return of the top names (ex-post alpha check)
+      downside   downside semi-deviation sqrt(mean(min(r,0)^2)) of the top names
+      tail_frac  fraction of top names whose realized r is below the fold's 10th pct
+    Lower knife/vol_p/downtrend/downside/tail_frac at steady-or-higher mean_r is the
+    win condition. Folds lacking risk features are skipped.
+    """
+    keys = ("knife", "vol_p", "downtrend", "mean_r", "downside", "tail_frac")
+    acc: dict[str, list[float]] = {k: [] for k in keys}
+    for rec, rk in zip(records, rank_series, strict=True):
+        comp = _knife_components(rec.get("risk"))
+        if comp is None:
+            continue
+        knife, vol_p, downtrend_p = comp
+        r = np.asarray(rec["r"], dtype=float)
+        rk = np.asarray(rk, dtype=float)
+        n = rk.size
+        k = max(1, math.ceil(decile * n))
+        top = np.argsort(rk)[-k:]  # indices of the highest-ranked names
+        rt = r[top]
+        neg = np.minimum(rt, 0.0)
+        tail = np.nanpercentile(r, 10)
+        acc["knife"].append(float(np.mean(knife[top])))
+        acc["vol_p"].append(float(np.mean(vol_p[top])))
+        acc["downtrend"].append(float(np.mean(downtrend_p[top] > 0.5)))
+        acc["mean_r"].append(float(np.nanmean(rt)))
+        acc["downside"].append(float(np.sqrt(np.nanmean(neg ** 2))))
+        acc["tail_frac"].append(float(np.nanmean(rt < tail)))
+    return {k: (float(np.mean(v)) if v else float("nan")) for k, v in acc.items()}
+
+
+def knife_sweep_table(
+    records: list[dict],
+    lambdas: list[float],
+    smooth_span: int = 0,
+    sector_group_col: str = "sector",
+    compute_sector_ic: bool = True,
+) -> list[dict]:
+    """Evaluate the knife overlay across `lambdas` with NO refit (reuses records).
+
+    For each lambda: overlay → optional cross-date smoothing → score mean rank-IC,
+    within-sector IC, turnover, and the top-decile risk metric. `lambdas[0]` is the
+    baseline (use 0.0). Mirrors the `--smooth-span` post-hoc sweep.
+    """
+    import pandas as pd
+
+    rows: list[dict] = []
+    for lam in lambdas:
+        ranks = apply_knife_overlay(records, lam)
+        if smooth_span > 0:
+            ranks = ewma_rank_by_ticker(records, smooth_span, rank_series=ranks)
+        ics: list[float] = []
+        sec_ics: list[float] = []
+        for rec, rk in zip(records, ranks, strict=True):
+            ic = pd.Series(rk).corr(pd.Series(rec["r"]), method="spearman")
+            if ic == ic:
+                ics.append(float(ic))
+            if compute_sector_ic and rec.get("sector") is not None:
+                sdf = pd.DataFrame({"r": rec["r"], sector_group_col: rec["sector"]})
+                s = within_sector_ic(rk, sdf, "r", group_col=sector_group_col)
+                if s == s:
+                    sec_ics.append(float(s))
+        row = {
+            "lam": lam,
+            "mean_ic": float(np.mean(ics)) if ics else float("nan"),
+            "sec_ic": float(np.mean(sec_ics)) if sec_ics else float("nan"),
+            "turnover": rank_turnover(records, rank_series=ranks),
+        }
+        row.update(top_decile_risk(records, ranks))
+        rows.append(row)
+    return rows
+
+
 def walk_forward_ic(
     panel,
     horizon: str = "1M",
@@ -1415,6 +1607,7 @@ def walk_forward_ic(
     linear_blend: float = 0.0,
     ridge_alpha: float = 10.0,
     smooth_span: int = 0,
+    knife_lambda: float = 0.0,
     return_records: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
@@ -1422,12 +1615,13 @@ def walk_forward_ic(
     Trains on `target_mode` (return/rank/quantile) but always SCORES rank-IC against
     the realized demeaned return `r_{horizon}`, so modes are directly comparable.
 
-    `smooth_span > 0` post-processes the per-fold predictions with a causal EWMA of
-    each name's percentile rank across scoring dates (`ewma_rank_by_ticker`) BEFORE
-    scoring — a pure post-step that leaves the fit untouched but measures the
-    smoothed signal inference would ship. The result always carries `rank_turnover`
-    (mean |Δ rank| between consecutive dates) for the raw signal, and the smoothed
-    turnover when smoothing is on.
+    `knife_lambda > 0` applies the falling-knife output overlay (`apply_knife_overlay`)
+    and `smooth_span > 0` the causal cross-date EWMA (`ewma_rank_by_ticker`) to the
+    per-fold ranks BEFORE scoring — pure post-steps that leave the fit untouched but
+    measure the de-risked / smoothed signal inference would ship. When both are on the
+    overlay composes first, then smoothing. The result always carries `rank_turnover`
+    (mean |Δ rank| between consecutive dates) for the raw signal, and the transformed
+    turnover (`turnover_smoothed`) when either post-step is on.
     """
     import pandas as pd
 
@@ -1475,29 +1669,40 @@ def walk_forward_ic(
                 preds, test, r_col, group_col=sector_group_col
             )
         fold_rows.append(fold)
+        risk = {
+            key: test[col].to_numpy(dtype=float)
+            for col, key in (("vol_120d", "vol"), ("ma_gap_200", "trend"),
+                             ("dist_low_252", "dlow"))
+            if col in test.columns
+        }
         records.append({
             "ticker_ids": test["ticker_id"].to_numpy(),
             "pred": np.asarray(preds, dtype=float),
             "r": test[r_col].to_numpy(dtype=float),
             "sector": test[sector_group_col].to_numpy() if sector_group_col in test.columns else None,
+            "risk": risk,
         })
         log(
             f"  fold {test_date}  ic {ic:+.4f}  "
             f"n_test={test.shape[0]:>4d}  n_train={train.shape[0]}"
         )
 
-    # Smoothing: recompute each fold's IC / SECB on the causal EWMA of each name's
-    # percentile rank (records is 1:1 aligned with fold_rows). Spearman is invariant
-    # to the final re-rank, so scoring on the smoothed rank == scoring on its rank.
+    # Post-hoc rank transforms (no refit): falling-knife overlay, then cross-date
+    # EWMA smoothing. Recompute each fold's IC / SECB on the transformed ranks
+    # (records is 1:1 aligned with fold_rows). Spearman is invariant to the final
+    # re-rank, so scoring on the transformed rank == scoring on its rank. lam/span = 0
+    # are no-ops, so the default path keeps the raw per-fold IC scored in the loop.
     turnover_smoothed = None
-    if smooth_span > 0 and records:
-        smoothed = ewma_rank_by_ticker(records, smooth_span)
-        for fold, rec, sm in zip(fold_rows, records, smoothed, strict=True):
-            fold["ic"] = float(pd.Series(sm).corr(pd.Series(rec["r"]), method="spearman"))
+    if (knife_lambda > 0 or smooth_span > 0) and records:
+        ranks = apply_knife_overlay(records, knife_lambda)  # lam=0 → model ranks
+        if smooth_span > 0:
+            ranks = ewma_rank_by_ticker(records, smooth_span, rank_series=ranks)
+        for fold, rec, rk in zip(fold_rows, records, ranks, strict=True):
+            fold["ic"] = float(pd.Series(rk).corr(pd.Series(rec["r"]), method="spearman"))
             if compute_sector_ic and rec["sector"] is not None:
                 sdf = pd.DataFrame({r_col: rec["r"], sector_group_col: rec["sector"]})
-                fold["sector_ic"] = within_sector_ic(sm, sdf, r_col, group_col=sector_group_col)
-        turnover_smoothed = rank_turnover(records, rank_series=smoothed)
+                fold["sector_ic"] = within_sector_ic(rk, sdf, r_col, group_col=sector_group_col)
+        turnover_smoothed = rank_turnover(records, rank_series=ranks)
 
     result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
     result["turnover_raw"] = rank_turnover(records)
@@ -1705,6 +1910,8 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(REVISION_MOMENTUM_FEATURES)
     if args.with_forward_valuation:
         cols += list(FORWARD_VALUATION_FEATURES)
+    if args.with_lottery:
+        cols += list(LOTTERY_FEATURES)
     # De-dupe while preserving order.
     seen: set[str] = set()
     out: list[str] = []
@@ -1753,6 +1960,9 @@ async def run(args) -> None:
             f"range={dates[0]}..{dates[-1]}  tickers={panel['ticker_id'].nunique()}"
         )
 
+        knife_grid = (
+            [float(x) for x in args.knife_sweep.split(",")] if args.knife_sweep else None
+        )
         real = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                seed=args.seed, shuffle=False, target_mode=args.target,
                                log=print if args.verbose else (lambda *_: None),
@@ -1762,19 +1972,40 @@ async def run(args) -> None:
                                sector_group_col=args.neutralize_by,
                                linear_blend=args.with_linear_blend,
                                ridge_alpha=args.ridge_alpha,
-                               smooth_span=args.smooth_span)
+                               smooth_span=args.smooth_span,
+                               knife_lambda=args.knife_lambda,
+                               return_records=knife_grid is not None)
         block_size = args.block_size or max(
             1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
         )
         smooth_tag = f", smooth_span={args.smooth_span}" if args.smooth_span > 0 else ""
+        knife_tag = f", knife_lambda={args.knife_lambda}" if args.knife_lambda > 0 else ""
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
-              f"(expanding walk-forward, target={args.target}{smooth_tag}) ---")
+              f"(expanding walk-forward, target={args.target}{smooth_tag}{knife_tag}) ---")
+        if knife_grid is not None and real.get("records"):
+            print(f"\n[knife sweep] vol×downtrend output overlay (no refit, "
+                  f"smooth_span={args.smooth_span}); SECB={args.sector_neutral_ic}:")
+            print(f"  {'lam':>5} {'mean_ic':>8} {'sec_ic':>8} {'turnover':>9} "
+                  f"{'td_knife':>9} {'td_vol_p':>9} {'td_down':>8} {'td_meanr':>9} "
+                  f"{'td_dnside':>10} {'td_tail':>8}")
+            for row in knife_sweep_table(
+                real["records"], knife_grid, smooth_span=args.smooth_span,
+                sector_group_col=args.neutralize_by,
+                compute_sector_ic=args.sector_neutral_ic,
+            ):
+                print(f"  {row['lam']:>5.2f} {row['mean_ic']:>+8.4f} "
+                      f"{row['sec_ic']:>+8.4f} {row['turnover']:>9.4f} "
+                      f"{row['knife']:>9.4f} {row['vol_p']:>9.4f} "
+                      f"{row['downtrend']:>8.3f} {row['mean_r']:>+9.4f} "
+                      f"{row['downside']:>10.4f} {row['tail_frac']:>8.3f}")
         if real.get("turnover_raw") is not None:
             tr = real["turnover_raw"]
             line = f"[turnover] mean |Δ rank| consecutive dates: raw={tr:.4f}"
             if real.get("turnover_smoothed") is not None:
                 ts = real["turnover_smoothed"]
-                line += f"  smoothed={ts:.4f}  ({(1 - ts / tr) * 100:+.0f}% vs raw)"
+                post_label = "knife" if args.knife_lambda > 0 and args.smooth_span == 0 else (
+                    "knife+smooth" if args.knife_lambda > 0 else "smoothed")
+                line += f"  {post_label}={ts:.4f}  ({(1 - ts / tr) * 100:+.0f}% vs raw)"
             print(line)
 
         # HEADLINE: within-sector stock selection — the bar a horizon must clear.
@@ -1816,7 +2047,8 @@ async def run(args) -> None:
                                       sector_group_col=args.neutralize_by,
                                       linear_blend=args.with_linear_blend,
                                       ridge_alpha=args.ridge_alpha,
-                                      smooth_span=args.smooth_span)
+                                      smooth_span=args.smooth_span,
+                                      knife_lambda=args.knife_lambda)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 if args.sector_neutral_ic and "sector_summary" in res:
@@ -1884,6 +2116,16 @@ def main() -> None:
                         "Causally smooths each name's percentile rank over scoring "
                         "dates before scoring, then reports turnover raw vs smoothed. "
                         "Reduces drift/turnover; longer spans suit longer horizons.")
+    p.add_argument("--knife-lambda", type=float, default=0.0, metavar="L",
+                   help="falling-knife output-overlay weight (0 = off). Re-ranks each "
+                        "cross-section toward names that are NOT both high-vol and "
+                        "downtrending; composes ahead of --smooth-span. Suppresses "
+                        "'falling knife' picks at the top and lowers turnover.")
+    p.add_argument("--knife-sweep", default=None, metavar="L1,L2,...",
+                   help="comma-separated knife-lambda grid for a no-refit sweep table "
+                        "(e.g. '0,0.05,0.1,0.2'); reports mean/within-sector IC, "
+                        "turnover, and top-decile risk per lambda. Composes with "
+                        "--smooth-span.")
     p.add_argument("--symbols", nargs="*", help="restrict to these symbols")
     p.add_argument("--refresh-cache", action="store_true",
                    help="re-pull frames from Supabase and overwrite the local "
@@ -1913,6 +2155,9 @@ def main() -> None:
     p.add_argument("--with-forward-valuation", action="store_true",
                    help="add LSEG forward-valuation pack (forward earnings/ebitda yield, "
                         "price-target upside)")
+    p.add_argument("--with-lottery", action="store_true",
+                   help="add lottery / idiosyncratic-vol pack (max_ret_21d, idio_vol); "
+                        "the volatility variants with the documented NEGATIVE sign")
     p.add_argument("--industry-relative", action="store_true",
                    help="rank-normalize price/fundamental/valuation/quality "
                         "features within (date, industry) instead of universe-wide")

@@ -23,6 +23,7 @@ from backend.ml.gbm_baseline import (
     RESIDUAL_MOM_FEATURES,
     WalkForwardConfig,
     add_industry_neutral_momentum,
+    apply_knife_overlay,
     apply_target_modes,
     block_bootstrap_summary,
     build_market_horizon_returns,
@@ -30,10 +31,12 @@ from backend.ml.gbm_baseline import (
     build_universe_return_map,
     demean_cross_sectional,
     ewma_rank_by_ticker,
+    knife_sweep_table,
     prepare_panel,
     rank_normalize_features,
     rank_turnover,
     summarize,
+    top_decile_risk,
     walk_forward_folds,
     walk_forward_ic,
     within_sector_ic,
@@ -169,6 +172,37 @@ def test_residual_momentum_collapses_when_ticker_equals_market():
     for r in rows:
         for c in RESIDUAL_MOM_FEATURES:
             assert np.isfinite(r[c]), f"{c} not finite"
+
+
+def test_lottery_features_finite_and_idio_vol_vanishes_vs_market():
+    # idio_vol = std(stock − beta·market). With a single-series universe the stock
+    # IS the market (beta≈1), so the residual — and idio_vol — should collapse to ~0.
+    frame_a = make_frame(n_days=900, trend=0.0005, tid=1, vol_seed=11)
+    frame_b = TickerFrame(2, 2, "T2", list(frame_a.prices), [], [])
+    market_returns = build_universe_return_map([frame_a, frame_b])
+    rows = build_ticker_rows(
+        frame_a, build_calendar_grid([frame_a, frame_b]), market_returns=market_returns
+    )
+    assert rows
+    for r in rows:
+        assert np.isfinite(r["max_ret_21d"]) and np.isfinite(r["idio_vol"])
+    late = rows[len(rows) // 2:]
+    assert all(r["idio_vol"] < 0.01 for r in late), "idio_vol should vanish when ticker == market"
+
+
+def test_max_ret_21d_detects_planted_single_day_spike():
+    # A smooth series has small daily moves; inject one +15% day and any row whose
+    # trailing-month window includes it must show max_ret_21d ≈ 0.15.
+    smooth = make_frame(n_days=420, trend=0.0003, tid=1, vol_seed=3)
+    base_rows = build_ticker_rows(smooth, build_calendar_grid([smooth]))
+    assert max(r["max_ret_21d"] for r in base_rows) < 0.08  # noise only
+
+    spiked_prices = [dict(p) for p in smooth.prices]
+    for i in range(380, len(spiked_prices)):       # one +15% jump at index 380
+        spiked_prices[i]["adj_close"] *= 1.15
+    spiked = TickerFrame(1, 1, "T1", spiked_prices, [], [])
+    spike_rows = build_ticker_rows(spiked, build_calendar_grid([spiked]))
+    assert max(r["max_ret_21d"] for r in spike_rows) > 0.10, "spike should surface in max_ret_21d"
 
 
 def test_mom_consistency_6m_on_steady_uptrend_is_high():
@@ -568,6 +602,41 @@ def test_score_current_cross_section_rank_transforms_regression_outputs():
     assert np.allclose(by_tid[50], 1.00)
 
 
+def test_score_current_cross_section_applies_knife_overlay():
+    # With a HorizonSpec carrying knife_lambda>0, the score path demotes a name
+    # that is the model's #1 pick but a falling knife (high vol + downtrend), and
+    # promotes a clean high-vol uptrender. A knife_lambda=0 spec is a no-op.
+    from backend.ml.gbm_baseline import HorizonSpec
+
+    class RampModel:
+        def predict(self, X):
+            return np.arange(len(X), dtype=float)  # name 5 ranked top
+
+    as_of = date(2026, 5, 29)
+    df = pd.DataFrame({"date": [as_of] * 5, "ticker_id": [1, 2, 3, 4, 5]})
+    for c in FEATURE_COLS:
+        df[c] = 0.0
+    # name 5 = falling knife; name 4 = clean high-vol uptrender; 1-3 neutral.
+    df["vol_120d"] = [0.0, 0.0, 0.0, 1.0, 1.0]
+    df["ma_gap_200"] = [0.0, 0.0, 0.0, 1.0, -1.0]
+    df["dist_low_252"] = [0.0, 0.0, 0.0, 1.0, -1.0]
+    ids = {1, 2, 3, 4, 5}
+
+    tilt = score_current_cross_section(
+        df, {"3M": [RampModel()]}, {"3M": HorizonSpec(knife_lambda=0.5)},
+        as_of=as_of, active_ids=ids,
+    )
+    by = {r["ticker_id"]: r["relative_rank"] for r in tilt}
+    assert by[5] < 1.0           # the knife is no longer the top pick
+    assert by[4] == pytest.approx(1.0)  # the clean uptrender takes the top
+
+    off = score_current_cross_section(
+        df, {"3M": [RampModel()]}, {"3M": HorizonSpec(knife_lambda=0.0)},
+        as_of=as_of, active_ids=ids,
+    )
+    assert {r["ticker_id"]: r["relative_rank"] for r in off}[5] == pytest.approx(1.0)
+
+
 def test_score_current_cross_section_blends_linear_model():
     # GBDT ranks ascending by ticker, ridge ranks descending — perfectly opposed.
     # At blend weight 0.5 every name's blended rank-score is identical (0.5*r +
@@ -707,6 +776,7 @@ def test_specs_from_serialized_roundtrips():
         linear_blend=0.3,
         ridge_alpha=5.0,
         smooth_span=4,
+        knife_lambda=0.2,
     )
     rebuilt = _specs_from_serialized({"6M": _serialize_spec(spec)})["6M"]
     assert rebuilt.target_mode == "sector_return"
@@ -714,6 +784,7 @@ def test_specs_from_serialized_roundtrips():
     assert rebuilt.linear_blend == 0.3
     assert rebuilt.ridge_alpha == 5.0
     assert rebuilt.smooth_span == 4
+    assert rebuilt.knife_lambda == 0.2
     assert rebuilt.lgb_cfg.n_estimators == 123
     assert rebuilt.lgb_cfg.num_leaves == 9
 
@@ -842,6 +913,17 @@ def test_production_specs_promoted_smooth_spans():
     assert PRODUCTION_HORIZON_SPECS["1M"].smooth_span == 0
 
 
+def test_production_specs_promoted_knife_lambda():
+    # Lock the 2026-06-06 promotion: falling-knife overlay at 3M only (λ=0.20);
+    # 6M/1Y/1M stay at 0 (poor trade / power-limited). Trips on accidental edits.
+    from backend.ml.gbm_baseline import PRODUCTION_HORIZON_SPECS
+
+    assert PRODUCTION_HORIZON_SPECS["3M"].knife_lambda == 0.20
+    assert PRODUCTION_HORIZON_SPECS["6M"].knife_lambda == 0.0
+    assert PRODUCTION_HORIZON_SPECS["1Y"].knife_lambda == 0.0
+    assert PRODUCTION_HORIZON_SPECS["1M"].knife_lambda == 0.0
+
+
 def test_apply_rank_smoothing_blends_toward_prior_and_noops_off():
     from backend.ml.gbm_baseline import HorizonSpec
     from backend.ml.gbm_inference import apply_rank_smoothing
@@ -865,6 +947,147 @@ def test_apply_rank_smoothing_blends_toward_prior_and_noops_off():
     specs3 = {"3M": HorizonSpec(smooth_span=3)}
     out2 = apply_rank_smoothing([dict(r) for r in rows], specs3, {})
     assert [r["relative_rank"] for r in out2] == [r["relative_rank"] for r in rows]
+
+
+# =============================================================
+# Falling-knife output overlay (vol × downtrend) + top-decile risk
+# =============================================================
+
+
+def _knife_records(n_dates: int = 3, n_names: int = 10):
+    """Records where the model's #1 name is a falling knife and its #2 is a clean,
+    high-vol UPtrending name.
+
+    The overlay should demote the knife below the uptrender — cutting top-decile
+    knife score and realized downside WITHOUT lowering volatility (high-vol winners
+    are intentionally spared by the vol×downtrend gate). Mid names are neutral.
+    Risk features are the cross-sectional rank-normalized [-1, 1] values the overlay
+    consumes; `r` is the realized demeaned return (the knife cuts, the uptrender wins).
+    """
+    knife_i, clean_i = n_names - 1, n_names - 2
+    vol = np.zeros(n_names)
+    trend = np.zeros(n_names)
+    dlow = np.zeros(n_names)
+    r = np.zeros(n_names)
+    vol[knife_i], trend[knife_i], dlow[knife_i] = 1.0, -1.0, -1.0   # high-vol downtrend
+    vol[clean_i], trend[clean_i], dlow[clean_i] = 1.0, 1.0, 1.0     # high-vol uptrend
+    r[knife_i], r[clean_i] = -0.30, 0.05
+    records = []
+    for _ in range(n_dates):
+        records.append({
+            "ticker_ids": np.arange(n_names),
+            "pred": np.arange(n_names, dtype=float),  # knife (idx n-1) ranked #1
+            "r": r.copy(),
+            "sector": None,
+            "risk": {"vol": vol.copy(), "trend": trend.copy(), "dlow": dlow.copy()},
+        })
+    return records
+
+
+def test_knife_score_is_high_only_for_high_vol_and_downtrend():
+    from backend.ml.gbm_baseline import _knife_score
+
+    # A: high vol + downtrend + near low (true knife). B: high vol but uptrend.
+    # C: low vol but downtrend. Only A should score high.
+    risk = {
+        "vol": np.array([1.0, 1.0, -1.0]),
+        "trend": np.array([-1.0, 1.0, -1.0]),
+        "dlow": np.array([-1.0, 1.0, -1.0]),
+    }
+    knife = _knife_score(risk)
+    assert knife[0] > knife[1]            # downtrend beats uptrend at equal vol
+    assert knife[0] > knife[2]            # high vol beats low vol at equal trend
+    assert knife[0] == pytest.approx(1.0)  # vol_p=1 * downtrend_p=1
+    assert knife[1] == pytest.approx(0.0)  # uptrend → downtrend_p=0
+    assert knife[2] == pytest.approx(0.0)  # low vol → vol_p=0
+
+
+def test_knife_score_none_without_risk_features():
+    from backend.ml.gbm_baseline import _knife_score
+
+    assert _knife_score(None) is None
+    assert _knife_score({}) is None
+    assert _knife_score({"trend": np.array([0.0])}) is None  # no vol
+
+
+def test_knife_overlay_lambda_zero_is_exact_noop():
+    records = _knife_records()
+    out = apply_knife_overlay(records, 0.0)
+    for rec, rk in zip(records, out):
+        np.testing.assert_array_equal(rk, _rank01_of(rec["pred"]))
+
+
+def test_knife_overlay_demotes_a_top_ranked_knife():
+    # Single cross-section: the model's #1 name is a falling knife. After the
+    # overlay it must no longer sit at the top of the ranking.
+    records = _knife_records(n_dates=1)
+    top_idx = int(np.argmax(records[0]["pred"]))  # the knife
+    overlaid = apply_knife_overlay(records, 0.5)[0]
+    assert overlaid[top_idx] < _rank01_of(records[0]["pred"])[top_idx]
+    assert overlaid[top_idx] < overlaid.max()  # something cleaner is now on top
+
+
+def test_knife_overlay_lowers_top_decile_knife_and_downside():
+    records = _knife_records()
+    base = top_decile_risk(records, apply_knife_overlay(records, 0.0))
+    tilt = top_decile_risk(records, apply_knife_overlay(records, 0.5))
+    # The overlay swaps the knife out of the top decile for the clean uptrender:
+    # lower knife score, fewer downtrending names, less realized downside up top —
+    # while top-decile volatility is unchanged (the uptrender is also high-vol).
+    assert tilt["knife"] < base["knife"]
+    assert tilt["downtrend"] < base["downtrend"]
+    assert tilt["downside"] < base["downside"]
+    assert tilt["vol_p"] == pytest.approx(base["vol_p"])
+
+
+def test_top_decile_risk_metric_math():
+    # n=4 → top decile is ceil(0.4)=1 name; rank puts index 3 on top.
+    rec = {
+        "ticker_ids": np.arange(4),
+        "pred": np.zeros(4),
+        "r": np.array([0.10, -0.20, 0.05, -0.50]),
+        "sector": None,
+        "risk": {
+            "vol": np.array([-1.0, 0.0, 0.0, 1.0]),
+            "trend": np.array([1.0, 0.0, 0.0, -1.0]),
+            "dlow": np.array([1.0, 0.0, 0.0, -1.0]),
+        },
+    }
+    ranks = [np.array([0.2, 0.4, 0.6, 1.0])]  # index 3 ranked top
+    out = top_decile_risk([rec], ranks)
+    assert out["mean_r"] == pytest.approx(-0.50)              # r of the top name
+    assert out["downside"] == pytest.approx(0.50)             # sqrt(min(-0.5,0)^2)
+    assert out["knife"] == pytest.approx(1.0)                 # top name is a pure knife
+    assert out["downtrend"] == pytest.approx(1.0)             # its downtrend_p > 0.5
+
+
+def test_knife_sweep_table_baseline_row_matches_raw():
+    records = _knife_records()
+    rows = knife_sweep_table(records, [0.0, 0.3], compute_sector_ic=False)
+    assert rows[0]["lam"] == 0.0 and rows[1]["lam"] == 0.3
+    # Baseline turnover equals raw turnover; lam>0 cuts top-decile knife.
+    assert rows[0]["turnover"] == pytest.approx(rank_turnover(records))
+    assert rows[1]["knife"] < rows[0]["knife"]
+
+
+def test_walk_forward_knife_lambda_zero_is_noop():
+    panel = _planted_panel(n_dates=36, n_names=40, beta=1.0, seed=3)
+    wf = WalkForwardConfig(min_train_months=12, min_names=15)
+    cfg = LGBMConfig(n_estimators=80)
+    base = walk_forward_ic(panel, "1M", cfg, wf, seed=1, target_mode="return")
+    same = walk_forward_ic(panel, "1M", cfg, wf, seed=1, target_mode="return",
+                           knife_lambda=0.0)
+    assert [f["ic"] for f in base["folds"]] == [f["ic"] for f in same["folds"]]
+    assert same["turnover_smoothed"] is None  # no post-transform when lam=0
+
+
+def test_walk_forward_knife_lambda_changes_ranks_and_reports_turnover():
+    panel = _planted_panel(n_dates=36, n_names=40, beta=1.0, seed=3)
+    wf = WalkForwardConfig(min_train_months=12, min_names=15)
+    cfg = LGBMConfig(n_estimators=80)
+    res = walk_forward_ic(panel, "1M", cfg, wf, seed=1, target_mode="return",
+                          knife_lambda=0.2)
+    assert res["turnover_smoothed"] is not None  # overlay is a post-transform
 
 
 # =============================================================

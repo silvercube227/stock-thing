@@ -28,9 +28,14 @@ from backend.ingestion.calendar import expected_bar_count
 log = logging.getLogger(__name__)
 
 # Relative-difference threshold above which we conclude that a split or
-# dividend has shifted the adjusted-close series for a ticker and the full
-# history must be re-pulled.
+# dividend has shifted the adjusted-close series for a ticker and its history
+# must be re-pulled (from HISTORY_START) to re-derive adj_close.
 DRIFT_REL_THRESHOLD: float = 1e-3
+
+# Earliest date we keep price history from. Both the initial backfill and the
+# on-drift re-pull use this floor, so the panel stays rectangular — a drifted
+# ticker doesn't get a deeper history than the rest of the universe.
+HISTORY_START: date = date(2010, 1, 1)
 
 # Cap on concurrent yfinance fetches. yfinance unofficially rate-limits at
 # the cookie level; 4 is a reasonable balance for ~35 tickers without 429s.
@@ -250,7 +255,6 @@ async def _ingest_one(
     symbol: str,
     period: str | None = None,
     start: date | None = None,
-    redrift_full_period: str = "max",
 ) -> TickerResult:
     """Pull, optionally re-pull on drift, upsert."""
     try:
@@ -261,29 +265,36 @@ async def _ingest_one(
     if df is None or df.empty:
         return TickerResult(ticker_id, symbol, 0, error="empty dataframe")
 
-    async with pool.acquire() as conn:
-        drifted = False
-        # Only run drift detection on incremental pulls (when start is given).
-        # On full-period pulls we're already overwriting everything.
-        if start is not None:
-            drifted = await _check_drift_against_db(conn, ticker_id, df)
-            if drifted:
-                log.warning(
-                    "drift detected for %s — re-pulling %s", symbol, redrift_full_period
-                )
-                try:
-                    df = await asyncio.to_thread(
-                        _yf_history, symbol, period=redrift_full_period
+    drifted = False
+    try:
+        async with pool.acquire() as conn:
+            # Only run drift detection on incremental pulls (when start is given).
+            # On full-period pulls we're already overwriting everything.
+            if start is not None:
+                drifted = await _check_drift_against_db(conn, ticker_id, df)
+                if drifted:
+                    log.warning(
+                        "drift detected for %s — re-pulling from %s", symbol, HISTORY_START
                     )
-                except Exception as exc:  # noqa: BLE001
-                    return TickerResult(
-                        ticker_id, symbol, 0, drifted=True,
-                        error=f"redrift fetch failed: {exc}",
-                    )
+                    try:
+                        df = await asyncio.to_thread(
+                            _yf_history, symbol, start=HISTORY_START
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        return TickerResult(
+                            ticker_id, symbol, 0, drifted=True,
+                            error=f"redrift fetch failed: {exc}",
+                        )
 
-        rows = _df_to_rows(ticker_id, df)
-        async with conn.transaction():
-            await conn.executemany(_UPSERT_SQL, rows)
+            rows = _df_to_rows(ticker_id, df)
+            async with conn.transaction():
+                await conn.executemany(_UPSERT_SQL, rows)
+    except Exception as exc:  # noqa: BLE001 — a Supabase pooler connection drop / DB error
+        # becomes a per-ticker failure instead of aborting the whole gather and
+        # orphaning the prices_daily run row as "running".
+        return TickerResult(
+            ticker_id, symbol, 0, drifted=drifted, error=f"db write failed: {exc}"
+        )
 
     # NYSE-calendar gap check (informational only — logged to metadata).
     missing = 0
@@ -308,7 +319,7 @@ async def _ingest_one(
 async def ingest_full_history(
     pool: asyncpg.Pool,
     tickers: Iterable[tuple[int, str]] | None = None,
-    start_date: date = date(2010, 1, 1),
+    start_date: date = HISTORY_START,
     concurrency: int = DEFAULT_CONCURRENCY,
 ) -> IngestionResult:
     """Pull history from `start_date` for each ticker and overwrite price_history.
@@ -352,7 +363,7 @@ async def ingest_recent(
     """Daily incremental ingest: pull the last `days` of bars and upsert.
 
     If the earliest pulled bar's adj_close diverges from the stored value, the
-    ticker is re-pulled at period='max' to absorb the split/dividend.
+    ticker is re-pulled from HISTORY_START to absorb the split/dividend.
     """
     if tickers is None:
         tickers = await _fetch_active_tickers(pool)
@@ -368,7 +379,17 @@ async def ingest_recent(
         async with sem:
             return await _ingest_one(pool, tid, sym, start=start_date)
 
-    per_ticker = await asyncio.gather(*(_wrapped(t, s) for t, s in tickers))
+    per_ticker_raw = await asyncio.gather(
+        *(_wrapped(t, s) for t, s in tickers), return_exceptions=True
+    )
+    # Map any exception that still escaped _ingest_one to a failed TickerResult, so
+    # one bad ticker can't abort the batch (which would skip _log_run_finish and
+    # leave the run row stuck at "running").
+    per_ticker = [
+        res if isinstance(res, TickerResult)
+        else TickerResult(tid, sym, 0, error=f"unhandled: {res}")
+        for (tid, sym), res in zip(tickers, per_ticker_raw)
+    ]
     finished = datetime.now(timezone.utc)
 
     result = IngestionResult(
