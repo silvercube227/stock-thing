@@ -29,8 +29,10 @@ from backend.ml.gbm_baseline import (
     build_ticker_rows,
     build_universe_return_map,
     demean_cross_sectional,
+    ewma_rank_by_ticker,
     prepare_panel,
     rank_normalize_features,
+    rank_turnover,
     summarize,
     walk_forward_folds,
     walk_forward_ic,
@@ -704,12 +706,14 @@ def test_specs_from_serialized_roundtrips():
         feature_cols=["mom_1m", "vol_20d"],
         linear_blend=0.3,
         ridge_alpha=5.0,
+        smooth_span=4,
     )
     rebuilt = _specs_from_serialized({"6M": _serialize_spec(spec)})["6M"]
     assert rebuilt.target_mode == "sector_return"
     assert rebuilt.feature_cols == ["mom_1m", "vol_20d"]
     assert rebuilt.linear_blend == 0.3
     assert rebuilt.ridge_alpha == 5.0
+    assert rebuilt.smooth_span == 4
     assert rebuilt.lgb_cfg.n_estimators == 123
     assert rebuilt.lgb_cfg.num_leaves == 9
 
@@ -755,6 +759,112 @@ def test_rank_stability():
     assert abs(rank_stability([0.2, 0.8]) - 0.3) < 1e-9  # population std = 0.3
     # higher dispersion => larger std
     assert rank_stability([0.1, 0.9, 0.5]) > rank_stability([0.45, 0.55, 0.5])
+
+
+# =============================================================
+# Prediction smoothing (Workstream A): EWMA across scoring dates
+# =============================================================
+
+
+def _osc_records(n_dates: int = 20, n_names: int = 6):
+    """Two names whose ranks oscillate hard date-to-date around a stable mean.
+
+    Built as raw preds so `_rank01` inside the smoother maps them to percentile
+    ranks; the EWMA should damp the oscillation.
+    """
+    records = []
+    for k in range(n_dates):
+        # name 0 alternates extreme high/low; the rest fill the middle deterministically.
+        preds = np.linspace(0.0, 1.0, n_names)
+        preds[0] = 1.0 if k % 2 == 0 else 0.0
+        records.append({
+            "ticker_ids": np.arange(n_names),
+            "pred": preds.astype(float),
+            "r": np.zeros(n_names),
+            "sector": None,
+        })
+    return records
+
+
+def test_ewma_rank_smoothing_damps_oscillation():
+    records = _osc_records()
+    smoothed = ewma_rank_by_ticker(records, span=4)
+    # The oscillating name's smoothed rank should vary far less than its raw rank.
+    raw_name0 = np.array([_rank01_of(r["pred"])[0] for r in records])
+    sm_name0 = np.array([s[0] for s in smoothed])
+    assert sm_name0.std() < raw_name0.std()
+    # Shapes preserved per fold.
+    assert all(s.shape == r["pred"].shape for s, r in zip(smoothed, records))
+
+
+def _rank01_of(a):
+    from backend.ml.gbm_baseline import _rank01
+
+    return _rank01(a)
+
+
+def test_smoothing_reduces_rank_turnover():
+    records = _osc_records()
+    smoothed = ewma_rank_by_ticker(records, span=4)
+    assert rank_turnover(records, rank_series=smoothed) < rank_turnover(records)
+
+
+def test_walk_forward_smooth_span_zero_is_noop():
+    panel = _planted_panel(n_dates=36, n_names=40, beta=1.0, seed=3)
+    wf = WalkForwardConfig(min_train_months=12, min_names=15)
+    cfg = LGBMConfig(n_estimators=80)
+    base = walk_forward_ic(panel, "1M", cfg, wf, seed=1, target_mode="return")
+    same = walk_forward_ic(panel, "1M", cfg, wf, seed=1, target_mode="return", smooth_span=0)
+    assert [f["ic"] for f in base["folds"]] == [f["ic"] for f in same["folds"]]
+    # Turnover is reported even when smoothing is off; smoothed turnover stays None.
+    assert base["turnover_raw"] is not None
+    assert base["turnover_smoothed"] is None
+
+
+def test_walk_forward_smoothing_changes_ic_and_reports_turnover():
+    panel = _planted_panel(n_dates=36, n_names=40, beta=1.0, seed=3)
+    wf = WalkForwardConfig(min_train_months=12, min_names=15)
+    cfg = LGBMConfig(n_estimators=80)
+    res = walk_forward_ic(panel, "1M", cfg, wf, seed=1, target_mode="return", smooth_span=4)
+    assert res["turnover_smoothed"] is not None
+    # On a persistent planted signal, smoothing should not destroy it (mean IC stays positive).
+    assert res["summary"]["mean_ic"] > 0
+
+
+def test_production_specs_promoted_smooth_spans():
+    # Lock the 2026-06-05 promotion: smooth 3M (span 3) and 1Y (span 4) only;
+    # 6M and 1M stay unsmoothed. Trips if the spec dict is edited accidentally.
+    from backend.ml.gbm_baseline import PRODUCTION_HORIZON_SPECS
+
+    assert PRODUCTION_HORIZON_SPECS["3M"].smooth_span == 3
+    assert PRODUCTION_HORIZON_SPECS["1Y"].smooth_span == 4
+    assert PRODUCTION_HORIZON_SPECS["6M"].smooth_span == 0
+    assert PRODUCTION_HORIZON_SPECS["1M"].smooth_span == 0
+
+
+def test_apply_rank_smoothing_blends_toward_prior_and_noops_off():
+    from backend.ml.gbm_baseline import HorizonSpec
+    from backend.ml.gbm_inference import apply_rank_smoothing
+
+    # span>0: each name's rank is EWMA'd toward its prior, then re-ranked. With a
+    # full rank reversal vs the prior, smoothing should pull the new ranks back
+    # toward the prior ordering (the top-by-raw name should no longer be rank 1).
+    rows = [{"ticker_id": t, "horizon": "3M", "relative_rank": r}
+            for t, r in zip(range(1, 6), [0.0, 0.25, 0.5, 0.75, 1.0])]
+    prior = {(t, "3M"): [p] for t, p in zip(range(1, 6), [1.0, 0.75, 0.5, 0.25, 0.0])}
+    specs = {"3M": HorizonSpec(smooth_span=3)}
+    out = apply_rank_smoothing([dict(r) for r in rows], specs, prior)
+    # ticker 5 had raw rank 1.0 but prior 0.0 → its blended rank must drop below 1.0.
+    assert next(r["relative_rank"] for r in out if r["ticker_id"] == 5) < 1.0
+
+    # span=0 spec is an exact no-op.
+    specs0 = {"3M": HorizonSpec(smooth_span=0)}
+    rows0 = [dict(r) for r in rows]
+    assert apply_rank_smoothing(rows0, specs0, prior) == rows
+    # No prior for a name → that name keeps its raw rank under the relative re-rank.
+    specs3 = {"3M": HorizonSpec(smooth_span=3)}
+    out2 = apply_rank_smoothing([dict(r) for r in rows], specs3, {})
+    assert [r["relative_rank"] for r in out2] == [r["relative_rank"] for r in rows]
 
 
 # =============================================================
