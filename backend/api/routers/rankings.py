@@ -115,7 +115,7 @@ async def rankings(
         rows = await conn.fetch(
             """
             select t.ticker_id, t.symbol, t.name, t.sector,
-                   p.direction_prob, p.confidence, p.as_of_date
+                   p.direction_prob, p.confidence, p.risk_flag, p.as_of_date
               from predictions p
               join tickers t on t.ticker_id = p.ticker_id
              where p.model_version_id = $1 and p.horizon = $2
@@ -149,6 +149,7 @@ async def rankings(
                 sector=r["sector"],
                 percentile_rank=float(r["direction_prob"]),
                 rank_std=float(r["confidence"]) if r["confidence"] is not None else None,
+                risk_flag=r["risk_flag"] or "none",
                 sector_rank=sector_ranks.get(int(r["ticker_id"]), (None, None))[0],
                 sector_rank_label=sector_ranks.get(int(r["ticker_id"]), (None, None))[1],
                 sharpe=sharpe.get(int(r["ticker_id"])),

@@ -165,6 +165,9 @@ class TickerDetail(BaseModel):
     fundamentals: FundamentalsSnapshot | None = None
     sentiment: SentimentSnapshot | None = None
     last_close: float | None = None
+    # Falling-knife tag: 'high' / 'elevated' / 'none' — high realized vol AND
+    # below-trend / near 52w low (horizon-agnostic; descriptive only).
+    risk_flag: str = "none"
 
 
 class PricePoint(BaseModel):
@@ -189,6 +192,9 @@ class RankingRow(BaseModel):
     sector: str | None = None
     percentile_rank: float
     rank_std: float | None = None
+    # Falling-knife tag: 'high' / 'elevated' / 'none' — high realized vol AND
+    # below-trend / near 52w low. Descriptive only; does not affect the rank.
+    risk_flag: str = "none"
     # Within-(sector) percentile rank of the same model score, in [0, 1]. Null when
     # the sector is unknown or has fewer than 2 covered names. Surfaces the
     # within-sector selection the model is actually trained on (sector_return).

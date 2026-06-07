@@ -240,6 +240,10 @@ create table if not exists predictions (
     direction_prob      numeric not null check (direction_prob between 0 and 1),
     predicted_return    numeric,
     confidence          numeric,                 -- e.g. MC-dropout std or softmax margin
+    risk_flag           text check (risk_flag in ('none', 'elevated', 'high')),
+                                                 -- falling-knife tag: high realized vol AND
+                                                 -- below-trend/near-52w-low (transparency only,
+                                                 -- does not affect direction_prob)
     cold_start          boolean not null default false,
     created_at          timestamptz not null default now(),
     primary key (ticker_id, model_version_id, as_of_date, horizon)

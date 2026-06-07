@@ -7,6 +7,7 @@ import { useAuth } from "@/components/AuthProvider";
 import { AppHeader } from "@/components/AppHeader";
 import { PriceChart, type ChartMode } from "@/components/PriceChart";
 import { RankGaugeRow } from "@/components/RankGauge";
+import { KnifeBadge } from "@/components/KnifeBadge";
 import { FundamentalsPanel } from "@/components/FundamentalsPanel";
 import { SentimentGauge } from "@/components/SentimentGauge";
 import { useTickerDetail } from "@/hooks/useTickerDetail";
@@ -115,9 +116,12 @@ export default function TickerPage({
 
             <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
               <div>
-                <h1 className="text-2xl font-semibold tracking-tight">
-                  {detail.ticker.symbol}
-                </h1>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-2xl font-semibold tracking-tight">
+                    {detail.ticker.symbol}
+                  </h1>
+                  <KnifeBadge tier={detail.risk_flag} />
+                </div>
                 <p className="mt-1 text-sm text-muted">
                   {detail.ticker.name}
                   {detail.ticker.sector ? (

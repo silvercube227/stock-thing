@@ -240,12 +240,13 @@ async def ticker_detail(
 
         predictions: list[HorizonPrediction] = []
         as_of_date = model_version_id = model_status = None
+        risk_flag = "none"
         active = await _resolve_active_model(conn)
         if active is not None:
             model_version_id, model_status = active
             pred_rows = await conn.fetch(
                 """
-                select horizon, direction_prob, confidence, as_of_date
+                select horizon, direction_prob, confidence, risk_flag, as_of_date
                   from predictions
                  where ticker_id = $1 and model_version_id = $2
                    and as_of_date = (
@@ -262,6 +263,8 @@ async def ticker_detail(
                 if r is None:
                     continue
                 as_of_date = r["as_of_date"]
+                # risk_flag is horizon-agnostic (same across rows); take whichever.
+                risk_flag = r["risk_flag"] or "none"
                 predictions.append(
                     HorizonPrediction(
                         horizon=h,
@@ -298,6 +301,7 @@ async def ticker_detail(
         model_version_id=model_version_id,
         model_status=model_status,
         predictions=predictions,
+        risk_flag=risk_flag,
         fundamentals=FundamentalsSnapshot(**dict(f)) if f else None,
         sentiment=SentimentSnapshot(**dict(s)) if s else None,
         last_close=(

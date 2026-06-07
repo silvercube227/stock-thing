@@ -14,7 +14,7 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
 **Production: LightGBM GBDT cross-sectional ranker** (`backend/ml/gbm_inference.py`)
 - One shallow model per horizon (3M, 6M, 1Y) — 1M has no detectable signal, skip it
 - Per-horizon training target (`PRODUCTION_HORIZON_SPECS` in gbm_baseline.py): 3M/6M/1Y all train on `sector_return` (within-(date,sector)-relative return), which directly optimizes within-sector stock selection — the success bar. 1M stays `rank` (dead horizon, not scored). Scored by cross-sectional rank-IC; promotions are graded on the block-bootstrapped WITHIN-SECTOR IC (SECB).
-- 21 base features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, `fund_available` (binary: has SEC filing as-of date), 2 FinBERT sentiment rolling averages. **Per-horizon promoted packs (`PRODUCTION_HORIZON_SPECS`): 3M adds `revision_momentum` (forward-EPS estimate revisions + analyst-coverage / PT-estimate counts); 6M + 1Y add LSEG `revenue_surprise` (now computed from QUARTERLY `earnings_surprises`, was annual).** Opt-in `--with-*` packs built but NOT promoted: `eps_surprise` (PEAD — ablated & rejected at every horizon, even on quarterly data: negative standalone), `linear_blend` (GBDT+ridge stack), analyst revisions, forward valuation.
+- 21 base features: 4 momentum windows, log_market_cap, 3 volatility windows, 52w high/low distances, 2 MA gaps, vol_trend, 5 EDGAR fundamentals, `fund_available` (binary: has SEC filing as-of date), 2 FinBERT sentiment rolling averages. **Per-horizon promoted packs (`PRODUCTION_HORIZON_SPECS`): 3M adds `revision_momentum` (forward-EPS estimate revisions + analyst-coverage / PT-estimate counts); 6M + 1Y add LSEG `revenue_surprise` (now computed from QUARTERLY `earnings_surprises`, was annual).** Opt-in `--with-*` packs built but NOT promoted: `eps_surprise` (PEAD — ablated & rejected at every horizon, even on quarterly data: negative standalone), `linear_blend` (GBDT+ridge stack), analyst revisions, forward valuation, `microstructure` (price/volume higher-moment + liquidity: ret_skew_120d/downside_vol_ratio_120d/amihud_illiq_60d/turnover_60d/efficiency_ratio_120d — rejected at 6M: only amihud carries within-sector signal and it's ≈ the size factor already in `log_market_cap`). Candidate features are vetted before any fit by `feature_diagnostics()` / `--feature-diagnostics` (decorrelation vs the book + standalone within-sector block-IC + a Kaufman-efficiency-ratio tertile split that flags sideways/consolidation-only signal).
 - `n_jobs=1` required (MPS + multiprocessing conflict on M4)
 - Production inference: 8-seed ensemble per horizon (predictions averaged before rank-transform), reduces seed variance.
 - **Cross-date rank smoothing** (`HorizonSpec.smooth_span`, promoted 2026-06-05): EWMA each name's percentile rank toward its last stored rank (`alpha=2/(span+1)`), then re-rank — averages out per-date estimation noise in a persistent signal. Promoted at the noisiest horizons: **3M span 3, 1Y span 4** (8-seed SECB walk-forward — 3M ICIR +0.42→+0.49, t +2.93→+3.41, turnover −50%; 1Y ICIR +0.45→+0.53, t +1.44→+1.70, turnover −54%). **6M left unsmoothed**: already the most stable horizon, smoothing was ~flat on IC/ICIR (only a turnover trade). Applied in `gbm_inference.apply_rank_smoothing` (prod, online one-step recursion off the stored rank) and `walk_forward_ic(smooth_span=)` (eval, post-hoc `ewma_rank_by_ticker` — sweep with `--smooth-span`). Stability levers chosen over raw-IC ceiling because our IC is already at SOTA (Qlib LightGBM/Alpha158 ≈ 0.045); see [[ml-experiment-discipline]].
@@ -75,7 +75,14 @@ backend/
   ml/
     features.py           build_sample(): 12-feature point-in-time assembly, seq_len=252 (transformer path)
     dataset.py            TickerFrame, load_frames(+_cached experiment cache), train/val/holdout split
-    gbm_baseline.py       Walk-forward LightGBM, FEATURE_COLS + opt-in packs (valuation/quality/LSEG estimate/revision-momentum), rank-IC scoring, PRODUCTION_HORIZON_SPECS
+    factors/              Feature layer (extracted from gbm_baseline 2026-06-07; gbm_baseline re-exports for back-compat):
+      constants.py          all *_FEATURES column catalogs + FEATURE_COLS / EXPERIMENTAL_FEATURES
+      price.py              _price_features (momentum/vol/MA/52w + lottery + MICROSTRUCTURE pack)
+      fundamentals.py       _ttm_net_income_asof, _fundamental_context_asof (EDGAR TTM/valuation/quality)
+      estimates.py          _estimates_context_asof, _earnings_reaction_asof (LSEG + filing drift/surprise)
+      assembly.py           build_ticker_rows + universe/market-horizon return maps
+      util.py               _log_ratio, _safe_ratio
+    gbm_baseline.py       Walk-forward LightGBM, panel prep, rank-IC scoring, PRODUCTION_HORIZON_SPECS; opt-in packs via --with-*; experiment tooling: walk_forward_ic, knife/smooth/target_blend/regularization sweeps, feature_diagnostics
     gbm_inference.py      Production: fit per-horizon GBDTs, score cross-section, upsert predictions
     model.py              PatchTST transformer (shelved)
     train.py              Transformer training harness (shelved)
@@ -100,6 +107,9 @@ backend/
       003_ingestion_runs_skipped_status.sql
       004_analyst_estimates_eps.sql
       005_quarterly_surprises_and_counts.sql   earnings_surprises table + num_analysts/pt_num_estimates cols
+      006_normalize_sectors.sql
+      006_user_added_tickers.sql
+      007_predictions_risk_flag.sql            predictions.risk_flag (falling-knife tag: none/elevated/high)
   tests/                  ~134 tests (prices drift, features no-lookahead, dataset splits,
                           model arch, GBM baseline, API, sentiment, fundamentals parser, frame cache,
                           estimate ingestion + estimate-feature PIT)

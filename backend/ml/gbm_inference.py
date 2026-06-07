@@ -52,6 +52,7 @@ from backend.ml.gbm_baseline import (
     fit_linear_model,
     fit_lgbm_model,
     knife_overlay_ranks,
+    knife_tier,
     prepare_panel,
 )
 
@@ -181,6 +182,14 @@ def score_current_cross_section(
         for col, key in _KNIFE_RISK_COLS
         if col in current.columns
     }
+    # Transparency tag (none/elevated/high) for high-vol AND downtrending names — the
+    # same vol×downtrend signal the overlay uses, but surfaced instead of silently
+    # re-ranked. Horizon-agnostic, so compute once and map by ticker_id.
+    tiers = knife_tier(knife_risk)
+    tag_by_ticker = (
+        {int(t): tag for t, tag in zip(current["ticker_id"].to_numpy(), tiers)}
+        if tiers is not None else {}
+    )
 
     rows: list[dict] = []
     n = len(current)
@@ -218,6 +227,7 @@ def score_current_cross_section(
                 "ticker_id": int(ticker_id),
                 "horizon": h,
                 "relative_rank": float(rank),
+                "risk_flag": tag_by_ticker.get(int(ticker_id), "none"),
             })
     return rows
 
@@ -391,12 +401,13 @@ async def upsert_predictions(
         """
         insert into predictions (
             ticker_id, model_version_id, as_of_date, horizon, direction_prob,
-            predicted_return, confidence, cold_start
-        ) values ($1,$2,$3,$4,$5,$6,$7,false)
+            predicted_return, confidence, risk_flag, cold_start
+        ) values ($1,$2,$3,$4,$5,$6,$7,$8,false)
         on conflict (ticker_id, model_version_id, as_of_date, horizon) do update set
             direction_prob   = excluded.direction_prob,
             predicted_return = excluded.predicted_return,
             confidence       = excluded.confidence,
+            risk_flag        = excluded.risk_flag,
             cold_start       = excluded.cold_start,
             created_at       = now()
         """,
@@ -409,6 +420,7 @@ async def upsert_predictions(
                 r["relative_rank"],
                 None,
                 r["confidence"],
+                r.get("risk_flag", "none"),
             )
             for r in prediction_rows
         ],
