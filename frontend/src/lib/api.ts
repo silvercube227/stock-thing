@@ -103,6 +103,9 @@ export interface TickerDetail {
   fundamentals: FundamentalsSnapshot | null;
   sentiment: SentimentSnapshot | null;
   last_close: number | null;
+  // Falling-knife tag: "none" | "elevated" | "high" — high realized vol AND
+  // below-trend / near 52w low. Descriptive only; does not change the rank.
+  risk_flag: string;
 }
 
 export interface PricePoint {
@@ -122,6 +125,8 @@ export interface RankingRow {
   sector: string | null;
   percentile_rank: number;
   rank_std: number | null;
+  // Falling-knife tag: "none" | "elevated" | "high" (descriptive; rank unaffected).
+  risk_flag: string;
   // Within-sector percentile in [0, 1] (null when sector unknown or <2 names).
   sector_rank: number | null;
   // Ordinal position within sector, e.g. "3/42".

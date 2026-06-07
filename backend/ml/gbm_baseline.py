@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -44,102 +44,44 @@ from backend.ingestion.calendar import HORIZON_TRADING_DAYS
 from backend.ingestion.db import pool_context
 from backend.ml.dataset import (
     TickerFrame,
-    _as_date,
     build_calendar_grid,
-    compute_targets,
     cross_sectional_medians,
     load_frames_cached,
 )
-from backend.ml.features import (
-    SEQUENCE_LENGTH,
-    _annotate_fundamentals,
-    _build_fundamental_series,
-    _build_sentiment_series,
-    _fund_filing_mask,
+# Feature catalogs + per-ticker point-in-time builders live in backend/ml/factors/;
+# re-exported here so existing `from backend.ml.gbm_baseline import <feature symbol>`
+# imports (gbm_inference, tests, scripts) keep working unchanged.
+from backend.ml.factors import (  # noqa: F401
+    ANALYST_REVISION_FEATURES,
+    EARNINGS_REACTION_FEATURES,
+    EPS_SURPRISE_FEATURES,
+    ESTIMATE_SURPRISE_FEATURES,
+    EXPERIMENTAL_FEATURES,
+    FEATURE_COLS,
+    FORWARD_VALUATION_FEATURES,
+    FUNDAMENTAL_FEATURES,
+    FUNDAMENTAL_MISSING_FEATURES,
+    INDUSTRY_RELATIVE_FEATURES,
+    LOTTERY_FEATURES,
+    MICROSTRUCTURE_FEATURES,
+    PRICE_FEATURES,
+    QUALITY_FEATURES,
+    RESIDUAL_MOM_FEATURES,
+    REVISION_MOMENTUM_FEATURES,
+    SENTIMENT_FEATURES,
+    VALUATION_FEATURES,
+    _earnings_reaction_asof,
+    _estimates_context_asof,
+    _fundamental_context_asof,
+    _log_ratio,
+    _price_features,
+    _safe_ratio,
+    _ttm_net_income_asof,
+    build_market_horizon_returns,
+    build_ticker_rows,
+    build_universe_return_map,
 )
 from backend.ml.model import HORIZONS
-
-# Tabular factor columns the model trains on (order is informational only).
-PRICE_FEATURES = [
-    "mom_1m", "mom_3m", "mom_6m", "mom_12_1",   # momentum (12_1 skips the last month)
-    "log_market_cap",                           # log(adj_close × shares_outstanding)
-    "vol_20d", "vol_60d", "vol_120d",           # realized vol
-    "dist_high_252", "dist_low_252",            # distance to 52w extremes
-    "ma_gap_50", "ma_gap_200",                  # gap vs moving averages
-    "vol_trend",                                # 20d vs 120d dollar/volume trend
-]
-FUNDAMENTAL_FEATURES = [
-    "revenue_growth", "gross_margin", "operating_margin", "debt_equity", "fcf_revenue",
-]
-# Binary indicator: 1 = ticker has at least one SEC filing as-of the row date, 0 = none.
-# Lets the GBDT handle missing fundamentals explicitly rather than confounding "zero
-# value" (real) with "zero value" (no filing available). Critical for removed-from-index
-# names whose fundamental rows are absent.
-FUNDAMENTAL_MISSING_FEATURES = ["fund_available"]
-VALUATION_FEATURES = [
-    "earnings_yield", "book_to_market", "sales_to_price", "fcf_yield",
-]
-QUALITY_FEATURES = [
-    "roe_ttm", "net_margin_ttm", "fcf_margin_ttm",
-    "gross_margin_stability_4q", "operating_margin_stability_4q",
-    "revenue_growth_stability_4q",
-]
-# Test-4 phase-1 experimental packs (opt-in via CLI; not in production FEATURE_COLS).
-# resid_mom_*  : momentum after stripping out beta_252 * market move (structural mom)
-# mom_accel_3_6: 3M vs 6M momentum — captures inflection vs decay
-# mom_consistency_6m: fraction of last 6 monthly returns positive (smoothness)
-# industry_neutral_mom_12_1: mom_12_1 minus within-(date, industry) median (panel-level)
-RESIDUAL_MOM_FEATURES = [
-    "resid_mom_12_1", "resid_mom_6m", "mom_accel_3_6",
-    "mom_consistency_6m", "industry_neutral_mom_12_1",
-]
-# Filing-drift / surprise reaction features, derived purely from prices + filed_at.
-EARNINGS_REACTION_FEATURES = [
-    "filing_drift_30d", "filing_surprise_3d",
-    "filings_recency_days", "filings_in_90d",
-]
-# LSEG/I-B-E-S analyst-estimate packs (opt-in; require analyst_estimates ingested).
-# rec_mean is the consensus rating (1=Strong Buy .. 5=Sell), so a DROP = upgrades;
-# rec_rev_* are (prior - current) so "net upgrades" reads positive.
-ANALYST_REVISION_FEATURES = [
-    "rec_mean_level", "rec_rev_30d", "rec_rev_90d", "price_target_rev_90d",
-]
-ESTIMATE_SURPRISE_FEATURES = [
-    "revenue_surprise",
-]
-# Earnings-surprise / PEAD pack (Phase 2): the most-recent reported EPS vs its
-# pre-report consensus. Computed downstream from eps_mean/eps_actual (this LSEG
-# license has no direct EPSSurprise field). Earnings-surprise drift is a classic
-# WITHIN-INDUSTRY stock-selection signal, strongest 3-9M.
-EPS_SURPRISE_FEATURES = [
-    "eps_surprise",
-]
-# Earnings-revision momentum (Phase 3, 3M-focused): analysts revising the forward
-# EPS consensus up + rising coverage/PT-estimate breadth. This license has no
-# recommendation-bucket counts, so conviction is proxied by rec_rev (in the analyst
-# revision pack) + coverage/PT-estimate counts here. Strongest at short horizons.
-REVISION_MOMENTUM_FEATURES = [
-    "eps_est_rev_30d", "eps_est_rev_90d", "coverage_chg_90d", "pt_num_estimates",
-]
-# Forward valuation stored as yields (inverse multiples) so ranking is monotonic
-# and negative/near-zero denominators don't blow up — mirrors earnings_yield.
-FORWARD_VALUATION_FEATURES = [
-    "forward_earnings_yield", "forward_ebitda_yield", "price_target_upside",
-]
-SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
-FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
-EXPERIMENTAL_FEATURES = (
-    VALUATION_FEATURES + QUALITY_FEATURES + RESIDUAL_MOM_FEATURES + EARNINGS_REACTION_FEATURES
-    + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + EPS_SURPRISE_FEATURES
-    + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES
-)
-# The industry-relative *normalization* sweep (which hurt in test 3); residual /
-# earnings-reaction features already adjust for market or filing context so they
-# stay out of this list — double-grouping would re-shrink whatever signal they
-# carry.
-INDUSTRY_RELATIVE_FEATURES = (
-    PRICE_FEATURES + FUNDAMENTAL_FEATURES + VALUATION_FEATURES + QUALITY_FEATURES
-)
 
 
 # =============================================================
@@ -160,6 +102,7 @@ class LGBMConfig:
     subsample: float = 0.8          # row bagging
     colsample_bytree: float = 0.8   # feature bagging
     reg_lambda: float = 1.0
+    reg_alpha: float = 0.0          # L1 leaf penalty (LightGBM default 0)
     # n_jobs=1 is REQUIRED, not a perf choice: this process also loads torch
     # (dataset.py -> model.py), whose bundled libomp.dylib is a second LLVM
     # OpenMP runtime. LightGBM spawning its own OpenMP thread team alongside it
@@ -202,6 +145,11 @@ class HorizonSpec:
     # noise in a persistent signal → higher ICIR + much lower turnover. Helps most
     # on the noisiest horizons (3M, 1Y); 6M is already stable so it's left off.
     smooth_span: int = 0
+    # Falling-knife output overlay: re-rank weight in [0, 1] (0 = off). Demotes
+    # names that are BOTH high-vol AND downtrending (vol × downtrend) out of the
+    # top of the ranking. Applied at score time before smoothing. Promoted at 3M
+    # only — it's a downside/quality lever, NOT a churn lever (smoothing owns that).
+    knife_lambda: float = 0.0
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -250,676 +198,22 @@ _BASELINE_PLUS_REVMOM = FEATURE_COLS + REVISION_MOMENTUM_FEATURES
 #                      +1.44→+1.70, turnover 0.091→0.042 (−54%)
 #     6M is left UNSMOOTHED: it's the strongest/most stable horizon, so smoothing
 #     was ~flat on IC/ICIR (span 2: −0.0004 IC) — only a turnover trade, not promoted.
+#   - 3M knife_lambda: falling-knife output overlay PROMOTED (2026-06-06, 8-seed
+#     walk-forward, SECB, composed with smooth_span=3). Re-ranks vol×downtrend names
+#     out of the top: top-decile knife score −47%, realized downside −7%, top-decile
+#     mean return still positive, for only SECB IC +0.0575→+0.0563 (t_block +3.41→
+#     +2.89, p 0.0005→0.0020 — still strongly significant). 6M/1Y NOT promoted: a
+#     poor trade (6M erodes SECB ~6%/0.10λ for negligible downside; 1Y is power-
+#     limited and drops below its detection floor). NOT a churn lever — turnover was
+#     ~flat under the overlay (smoothing already owns turnover). See sweep CLI
+#     `--knife-sweep` / `--knife-lambda` and `knife-overlay-falling-knife` memo.
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
-    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM, smooth_span=3),
+    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM,
+                      smooth_span=3, knife_lambda=0.20),
     "6M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE),
     "1Y": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
 }
-
-
-# =============================================================
-# Per-ticker price-derived factors (point-in-time)
-# =============================================================
-
-
-def _log_ratio(a: float | None, b: float | None) -> float:
-    """log(a/b), or 0.0 if either price is missing/non-positive."""
-    if a is None or b is None or a <= 0 or b <= 0:
-        return 0.0
-    return math.log(a / b)
-
-
-def _safe_ratio(num: float | None, den: float | None) -> float:
-    if num is None or den is None or abs(den) <= 1e-9:
-        return 0.0
-    return float(num / den)
-
-
-def _price_features(
-    adj_close: list[float | None], volume: list[float], trade_dates: list, pos: int,
-    shares_outstanding: int | None = None,
-    market_returns: dict | None = None,
-) -> dict[str, float]:
-    """Factor features computed from the ticker's own series up to bar `pos`.
-
-    Requires pos >= SEQUENCE_LENGTH (252) so the 12-1 momentum and 52-week window
-    have full lookback — the same minimum the aligned assembler enforces.
-    """
-    P = adj_close[pos]
-    log_mcap = (
-        math.log(P * shares_outstanding)
-        if P and shares_outstanding and P > 0 and shares_outstanding > 0
-        else 0.0
-    )
-    feats = {
-        "mom_1m": _log_ratio(P, adj_close[pos - 21]),
-        "mom_3m": _log_ratio(P, adj_close[pos - 63]),
-        "mom_6m": _log_ratio(P, adj_close[pos - 126]),
-        "mom_12_1": _log_ratio(adj_close[pos - 21], adj_close[pos - 252]),
-        "log_market_cap": log_mcap,
-    }
-
-    stock_daily: list[float] = []
-    market_daily: list[float] = []
-    if market_returns:
-        for i in range(pos - 251 + 1, pos + 1):
-            r_stock = _log_ratio(adj_close[i], adj_close[i - 1])
-            r_mkt = market_returns.get(trade_dates[i])
-            if r_mkt is None or not np.isfinite(r_mkt):
-                continue
-            stock_daily.append(r_stock)
-            market_daily.append(float(r_mkt))
-    if len(stock_daily) >= 60:
-        x = np.asarray(stock_daily, dtype=float)
-        y = np.asarray(market_daily, dtype=float)
-        var_y = float(y.var())
-        feats["beta_252d"] = float(np.cov(x, y, ddof=0)[0, 1] / var_y) if var_y > 1e-12 else 0.0
-    else:
-        feats["beta_252d"] = 0.0
-
-    window = np.array(
-        [np.nan if v is None or v <= 0 else v for v in adj_close[pos - 251 : pos + 1]],
-        dtype=float,
-    )
-    logp = np.log(window)
-    daily = np.diff(logp)  # length 251
-
-    def _std(x: np.ndarray) -> float:
-        x = x[~np.isnan(x)]
-        return float(x.std()) if x.size > 1 else 0.0
-
-    feats["vol_20d"] = _std(daily[-20:])
-    feats["vol_60d"] = _std(daily[-60:])
-    feats["vol_120d"] = _std(daily[-120:])
-
-    hi, lo = np.nanmax(window), np.nanmin(window)
-    feats["dist_high_252"] = _log_ratio(P, hi)
-    feats["dist_low_252"] = _log_ratio(P, lo)
-    feats["ma_gap_50"] = _log_ratio(P, float(np.nanmean(window[-50:])))
-    feats["ma_gap_200"] = _log_ratio(P, float(np.nanmean(window[-200:])))
-
-    v = np.array(volume[pos - 119 : pos + 1], dtype=float)
-    v_recent = float(v[-20:].mean()) if v[-20:].size else 0.0
-    v_long = float(v.mean()) if v.size else 0.0
-    feats["vol_trend"] = math.log(v_recent / v_long) if v_recent > 0 and v_long > 0 else 0.0
-
-    # --- Test-4 phase-1: residual / structural momentum (opt-in pack) ---
-    # market_mom_* is the universe cumulative log return over the same trailing
-    # window as the matching mom_* feature. When market_returns is missing we
-    # fall back to zero, which makes resid_mom_* collapse to mom_* — the test
-    # in test_gbm_baseline.py exercises that path.
-    def _sum_mkt(start_idx: int, end_idx: int) -> float:
-        """Sum of universe log returns over (start_idx, end_idx] in trade_dates."""
-        if market_returns is None or end_idx <= start_idx:
-            return 0.0
-        total = 0.0
-        for k in range(start_idx + 1, end_idx + 1):
-            r = market_returns.get(trade_dates[k])
-            if r is not None and np.isfinite(r):
-                total += float(r)
-        return total
-
-    mkt_12_1 = _sum_mkt(pos - 252, pos - 21)
-    mkt_6m = _sum_mkt(pos - 126, pos)
-    beta = feats["beta_252d"]
-    feats["resid_mom_12_1"] = feats["mom_12_1"] - beta * mkt_12_1
-    feats["resid_mom_6m"] = feats["mom_6m"] - beta * mkt_6m
-    feats["mom_accel_3_6"] = feats["mom_3m"] - feats["mom_6m"]
-
-    monthly_pos = 0
-    n_monthly = 0
-    for i in range(1, 7):
-        p_end = adj_close[pos - 21 * (i - 1)]
-        p_start = adj_close[pos - 21 * i]
-        if p_end and p_start and p_end > 0 and p_start > 0:
-            if math.log(p_end / p_start) > 0:
-                monthly_pos += 1
-            n_monthly += 1
-    feats["mom_consistency_6m"] = float(monthly_pos / n_monthly) if n_monthly else 0.0
-    return feats
-
-
-def _ttm_net_income_asof(fund_rows: list[dict], as_of_dates: list) -> list[float]:
-    """Most recent point-in-time TTM net income for each as-of date.
-
-    10-K rows contribute their annual `net_income` directly. 10-Q rows use the
-    trailing four quarterly `net_income` values when available; otherwise we
-    fall back to the most recent annual filing already on file.
-    """
-    import bisect
-
-    rows_sorted = sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))
-    annotated: list[dict] = []
-    quarterly_history: list[tuple] = []
-    annual_history: list[tuple] = []
-
-    for row in rows_sorted:
-        filed_at = _as_date(row["filed_at"])
-        period_end = _as_date(row["period_end"])
-        try:
-            net_income = float(row["net_income"]) if row.get("net_income") is not None else None
-        except (TypeError, ValueError):
-            net_income = None
-
-        filing_type = row.get("filing_type")
-        ttm_net_income: float | None = None
-
-        if filing_type == "10-Q" and net_income is not None:
-            quarterly_history.append((period_end, net_income))
-            recent: list[tuple] = []
-            seen_periods: set = set()
-            for pe, ni in reversed(quarterly_history):
-                if pe in seen_periods:
-                    continue
-                seen_periods.add(pe)
-                recent.append((pe, ni))
-                if len(recent) == 4:
-                    break
-            if len(recent) == 4 and (period_end - recent[-1][0]).days <= 380:
-                ttm_net_income = float(sum(ni for _pe, ni in recent))
-        elif filing_type == "10-K" and net_income is not None:
-            annual_history.append((period_end, net_income))
-            ttm_net_income = net_income
-
-        if ttm_net_income is None:
-            for pe, ni in reversed(annual_history):
-                if abs((period_end - pe).days) <= 380:
-                    ttm_net_income = float(ni)
-                    break
-
-        annotated.append({"filed_at": filed_at, "ttm_net_income": float(ttm_net_income or 0.0)})
-
-    filed_ats = [r["filed_at"] for r in annotated]
-    out: list[float] = []
-    for d in as_of_dates:
-        idx = bisect.bisect_right(filed_ats, d) - 1
-        out.append(float(annotated[idx]["ttm_net_income"]) if idx >= 0 else 0.0)
-    return out
-
-
-def _fundamental_context_asof(fund_rows: list[dict], as_of_dates: list) -> dict[str, list[float]]:
-    """Point-in-time valuation + quality snapshots for each as-of date."""
-    import bisect
-
-    rows_sorted = sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))
-    if not rows_sorted:
-        return {
-            "ttm_revenue": [0.0] * len(as_of_dates),
-            "ttm_net_income": [0.0] * len(as_of_dates),
-            "ttm_fcf": [0.0] * len(as_of_dates),
-            "total_equity": [0.0] * len(as_of_dates),
-            "gross_margin": [0.0] * len(as_of_dates),
-            "operating_margin": [0.0] * len(as_of_dates),
-            "revenue_growth": [0.0] * len(as_of_dates),
-            "gross_margin_stability_4q": [0.0] * len(as_of_dates),
-            "operating_margin_stability_4q": [0.0] * len(as_of_dates),
-            "revenue_growth_stability_4q": [0.0] * len(as_of_dates),
-        }
-
-    annotated_core = _annotate_fundamentals(rows_sorted)
-    annotated: list[dict] = []
-    quarter_hist: dict[str, list[tuple]] = {"revenue": [], "net_income": [], "fcf": []}
-    annual_hist: dict[str, list[tuple]] = {"revenue": [], "net_income": [], "fcf": []}
-
-    def _safe_num(val) -> float | None:
-        try:
-            return float(val) if val is not None else None
-        except (TypeError, ValueError):
-            return None
-
-    def _compute_ttm(metric: str, period_end, filing_type: str) -> float:
-        q_hist = quarter_hist[metric]
-        a_hist = annual_hist[metric]
-        ttm_val: float | None = None
-        if filing_type == "10-Q":
-            recent: list[tuple] = []
-            seen_periods: set = set()
-            for pe, v in reversed(q_hist):
-                if pe in seen_periods:
-                    continue
-                seen_periods.add(pe)
-                recent.append((pe, v))
-                if len(recent) == 4:
-                    break
-            if len(recent) == 4 and (period_end - recent[-1][0]).days <= 380:
-                ttm_val = float(sum(v for _pe, v in recent))
-        elif filing_type == "10-K" and a_hist:
-            ttm_val = float(a_hist[-1][1])
-
-        if ttm_val is None:
-            for pe, v in reversed(a_hist):
-                if abs((period_end - pe).days) <= 380:
-                    ttm_val = float(v)
-                    break
-        return float(ttm_val or 0.0)
-
-    def _stability(field: str) -> float:
-        vals = [float(r[field]) for r in annotated[-4:] if field in r]
-        return float(-np.std(np.asarray(vals, dtype=float))) if len(vals) >= 2 else 0.0
-
-    for row, core in zip(rows_sorted, annotated_core, strict=False):
-        period_end = _as_date(row["period_end"])
-        filing_type = str(row.get("filing_type") or "")
-        for metric in ("revenue", "net_income", "fcf"):
-            val = _safe_num(row.get(metric))
-            if val is None:
-                continue
-            if filing_type == "10-Q":
-                quarter_hist[metric].append((period_end, val))
-            elif filing_type == "10-K":
-                annual_hist[metric].append((period_end, val))
-
-        current = {
-            "filed_at": _as_date(row["filed_at"]),
-            "ttm_revenue": _compute_ttm("revenue", period_end, filing_type),
-            "ttm_net_income": _compute_ttm("net_income", period_end, filing_type),
-            "ttm_fcf": _compute_ttm("fcf", period_end, filing_type),
-            "total_equity": float(_safe_num(row.get("total_equity")) or 0.0),
-            "gross_margin": float(core["gross_margin"]),
-            "operating_margin": float(core["operating_margin"]),
-            "revenue_growth": float(core["revenue_growth"]),
-        }
-        annotated.append(current)
-        current["gross_margin_stability_4q"] = _stability("gross_margin")
-        current["operating_margin_stability_4q"] = _stability("operating_margin")
-        current["revenue_growth_stability_4q"] = _stability("revenue_growth")
-
-    filed_ats = [r["filed_at"] for r in annotated]
-    out = {
-        "ttm_revenue": [],
-        "ttm_net_income": [],
-        "ttm_fcf": [],
-        "total_equity": [],
-        "gross_margin": [],
-        "operating_margin": [],
-        "revenue_growth": [],
-        "gross_margin_stability_4q": [],
-        "operating_margin_stability_4q": [],
-        "revenue_growth_stability_4q": [],
-    }
-    for d in as_of_dates:
-        idx = bisect.bisect_right(filed_ats, d) - 1
-        snap = annotated[idx] if idx >= 0 else None
-        for k in out:
-            out[k].append(float(snap[k]) if snap is not None else 0.0)
-    return out
-
-
-def _estimates_context_asof(
-    est_rows: list[dict], surprise_rows: list[dict], as_of_dates: list
-) -> dict[str, list[float]]:
-    """Point-in-time LSEG analyst-estimate features for each as-of date.
-
-    LSEG fields land on different dates (sparse rows), so each field is looked up
-    INDEPENDENTLY: the most recent non-null observation with as_of_date <= d.
-    Revisions compare against the value ~30/90 calendar days earlier. Forward
-    multiples become yields (inverse); non-positive ratios -> 0. Gaps -> 0.
-
-    Surprises come from the QUARTERLY `surprise_rows` (earnings_surprises), anchored
-    on report_date: each fiscal quarter's (actual - pre-report consensus)/|consensus|
-    carried forward from its report_date — proper quarterly PEAD, not annual.
-
-    Revision-momentum pack: `eps_est_rev_*` is the %Δ in the monthly forward EPS
-    consensus (analysts revising estimates); `coverage_chg_90d` the Δ in analyst
-    count; `pt_num_estimates` the price-target estimate count level.
-
-    `price_target_mean` is returned as an intermediate (build_ticker_rows turns it
-    into price_target_upside with the as-of price); it is not a feature itself.
-    """
-    import bisect
-    from datetime import timedelta
-
-    keys = ("rec_mean_level", "rec_rev_30d", "rec_rev_90d", "price_target_mean",
-            "price_target_rev_90d", "forward_earnings_yield", "forward_ebitda_yield",
-            "revenue_surprise", "eps_surprise",
-            "eps_est_rev_30d", "eps_est_rev_90d", "coverage_chg_90d", "pt_num_estimates")
-
-    snap_fields = ("rec_mean", "price_target_mean", "eps_mean",
-                   "fwd_pe", "fwd_ev_ebitda", "num_analysts", "pt_num_estimates")
-    series: dict[str, tuple[list, list]] = {f: ([], []) for f in snap_fields}
-    for r in sorted(est_rows or [], key=lambda r: _as_date(r["as_of_date"])):
-        d = _as_date(r["as_of_date"])
-        for f in snap_fields:
-            v = r.get(f)
-            if v is not None:
-                series[f][0].append(d)
-                series[f][1].append(float(v))
-
-    # Quarterly surprise per metric: (report_date, surprise) carried forward.
-    surp: dict[str, tuple[list, list]] = {"eps": ([], []), "revenue": ([], [])}
-    for r in sorted(surprise_rows or [], key=lambda r: _as_date(r["report_date"])):
-        rd = _as_date(r["report_date"])
-        for metric, acol, ccol in (("eps", "eps_actual", "eps_consensus"),
-                                    ("revenue", "rev_actual", "rev_consensus")):
-            act, cons = r.get(acol), r.get(ccol)
-            if act is not None and cons not in (None, 0):
-                surp[metric][0].append(rd)
-                surp[metric][1].append((float(act) - float(cons)) / abs(float(cons)))
-
-    def asof(field: str, target) -> float | None:
-        dates, vals = series[field]
-        i = bisect.bisect_right(dates, target) - 1
-        return vals[i] if i >= 0 else None
-
-    def surprise_asof(metric: str, target) -> float | None:
-        dates, vals = surp[metric]
-        i = bisect.bisect_right(dates, target) - 1
-        return vals[i] if i >= 0 else None
-
-    def pct_rev(field: str, d, days: int) -> float:
-        cur, prev = asof(field, d), asof(field, d - timedelta(days=days))
-        return (cur - prev) / abs(prev) if cur is not None and prev not in (None, 0) else 0.0
-
-    out: dict[str, list[float]] = {k: [] for k in keys}
-    for d in as_of_dates:
-        d = _as_date(d)
-        rec = asof("rec_mean", d)
-        rec30 = asof("rec_mean", d - timedelta(days=30))
-        rec90 = asof("rec_mean", d - timedelta(days=90))
-        pt = asof("price_target_mean", d)
-        pt90 = asof("price_target_mean", d - timedelta(days=90))
-        pe = asof("fwd_pe", d)
-        ev = asof("fwd_ev_ebitda", d)
-        na, na90 = asof("num_analysts", d), asof("num_analysts", d - timedelta(days=90))
-        ptn = asof("pt_num_estimates", d)
-
-        out["rec_mean_level"].append(rec if rec is not None else 0.0)
-        out["rec_rev_30d"].append((rec30 - rec) if rec is not None and rec30 is not None else 0.0)
-        out["rec_rev_90d"].append((rec90 - rec) if rec is not None and rec90 is not None else 0.0)
-        out["price_target_mean"].append(pt if pt is not None else 0.0)
-        out["price_target_rev_90d"].append(
-            (pt - pt90) / abs(pt90) if pt is not None and pt90 not in (None, 0) else 0.0)
-        out["forward_earnings_yield"].append(1.0 / pe if pe is not None and pe > 0 else 0.0)
-        out["forward_ebitda_yield"].append(1.0 / ev if ev is not None and ev > 0 else 0.0)
-        out["revenue_surprise"].append(surprise_asof("revenue", d) or 0.0)
-        out["eps_surprise"].append(surprise_asof("eps", d) or 0.0)
-        out["eps_est_rev_30d"].append(pct_rev("eps_mean", d, 30))
-        out["eps_est_rev_90d"].append(pct_rev("eps_mean", d, 90))
-        out["coverage_chg_90d"].append((na - na90) if na is not None and na90 is not None else 0.0)
-        out["pt_num_estimates"].append(ptn if ptn is not None else 0.0)
-    return out
-
-
-def _earnings_reaction_asof(
-    fund_rows: list[dict],
-    bar_positions: list[int],
-    bar_dates: list,
-    trade_dates: list,
-    adj_close: list[float | None],
-    market_returns: dict | None,
-) -> dict[str, list[float]]:
-    """Per-grid-date filing-reaction features built from prices + filed_at only.
-
-    For each grid date we look back to the most recent filing on/before that date
-    and summarize a few aspects of its market reaction:
-      filing_surprise_3d  — abnormal return over [filed_at-1, filed_at+1] trading
-                            days (proxy for what the market thought of the print).
-      filing_drift_30d    — abnormal return from the trading day after filed_at
-                            out to +30 trading days (or up to the grid date, if
-                            fewer days have elapsed). Post-earnings drift signal.
-      filings_recency_days — calendar days since the latest filing.
-      filings_in_90d      — count of filings within the trailing 90 calendar days.
-
-    PIT-safe by construction: we only ever index `adj_close` up to `pos` (the
-    grid-date bar position).
-    """
-    import bisect
-    from datetime import timedelta
-
-    n = len(bar_dates)
-    out: dict[str, list[float]] = {
-        "filing_drift_30d": [0.0] * n,
-        "filing_surprise_3d": [0.0] * n,
-        "filings_recency_days": [0.0] * n,
-        "filings_in_90d": [0.0] * n,
-    }
-    if not fund_rows or not trade_dates:
-        return out
-
-    filings_sorted = sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))
-    filed_ats = [_as_date(r["filed_at"]) for r in filings_sorted]
-
-    def _sum_mkt(start_idx: int, end_idx: int) -> float:
-        if market_returns is None or end_idx <= start_idx:
-            return 0.0
-        total = 0.0
-        for k in range(start_idx + 1, end_idx + 1):
-            r = market_returns.get(trade_dates[k])
-            if r is not None and np.isfinite(r):
-                total += float(r)
-        return total
-
-    for j, g in enumerate(bar_dates):
-        pos = bar_positions[j]
-        idx = bisect.bisect_right(filed_ats, g) - 1
-        if idx < 0:
-            continue
-        filed_at = filed_ats[idx]
-        # First trading day on or after filed_at (bisect_left returns the next
-        # bar when filed_at falls on a weekend/holiday; if equal to a trading
-        # day, that day itself is selected). Bound by pos so we never peek past
-        # the grid-date bar — PIT guard.
-        file_pos = bisect.bisect_left(trade_dates, filed_at)
-        if file_pos > pos:
-            # Filing recorded ahead of the price series for this grid date — can't
-            # measure reaction yet; recency + count are still valid.
-            out["filings_recency_days"][j] = float((g - filed_at).days)
-            cutoff = g - timedelta(days=90)
-            lo = bisect.bisect_left(filed_ats, cutoff)
-            out["filings_in_90d"][j] = float(idx + 1 - lo)
-            continue
-
-        out["filings_recency_days"][j] = float((g - filed_at).days)
-        cutoff = g - timedelta(days=90)
-        lo = bisect.bisect_left(filed_ats, cutoff)
-        out["filings_in_90d"][j] = float(idx + 1 - lo)
-
-        # 3-day surprise window: log return [file_pos-1, file_pos+1], minus market.
-        start_s = max(file_pos - 1, 0)
-        end_s = min(file_pos + 1, pos)
-        if end_s > start_s:
-            p_a = adj_close[start_s]
-            p_b = adj_close[end_s]
-            if p_a and p_b and p_a > 0 and p_b > 0:
-                out["filing_surprise_3d"][j] = float(
-                    math.log(p_b / p_a) - _sum_mkt(start_s, end_s)
-                )
-
-        # Post-filing drift: [file_pos+1, file_pos+31] or shorter if too fresh.
-        start_d = file_pos + 1
-        end_d = min(start_d + 30, pos)
-        # Require ≥ 5 trading days of post-filing data so the value isn't noise.
-        if start_d < len(adj_close) and end_d - start_d >= 5:
-            p_a = adj_close[start_d]
-            p_b = adj_close[end_d]
-            if p_a and p_b and p_a > 0 and p_b > 0:
-                out["filing_drift_30d"][j] = float(
-                    math.log(p_b / p_a) - _sum_mkt(start_d, end_d)
-                )
-
-    return out
-
-
-def build_universe_return_map(frames: list[TickerFrame]) -> dict:
-    """Equal-weight universe daily log return by trade date."""
-    by_date: dict = {}
-    for frame in frames:
-        prices = sorted(frame.prices, key=lambda r: _as_date(r["trade_date"]))
-        prev: float | None = None
-        for row in prices:
-            cur = float(row["adj_close"]) if row["adj_close"] is not None else None
-            if prev is not None and cur is not None and prev > 0 and cur > 0:
-                d = _as_date(row["trade_date"])
-                by_date.setdefault(d, []).append(math.log(cur / prev))
-            prev = cur
-    return {d: float(np.mean(vals)) for d, vals in by_date.items() if vals}
-
-
-def build_market_horizon_returns(
-    market_returns: dict,
-    grid: list,
-    horizons: tuple[str, ...] = HORIZONS,
-) -> dict[str, dict]:
-    """For each (horizon, grid_date), the universe log return over the next H
-    trading days starting at the first trade_date on or after grid_date.
-
-    Used by the `beta_resid` target (`y_h = r_h - beta_252 * market_r_h`) — the
-    market-return leg must be sampled on the same calendar window the ticker's
-    horizon return spans. Cumsum over the sorted daily series and slice by
-    bisect index, so this is O(len(grid)) per horizon after a one-time sort.
-
-    Returns: `{horizon: {grid_date: float}}`. Grid dates whose forward window
-    runs past the last trade_date are dropped (NaN downstream where used).
-    """
-    import bisect
-
-    out: dict[str, dict] = {h: {} for h in horizons}
-    if not market_returns:
-        return out
-
-    sorted_dates = sorted(market_returns.keys())
-    daily = np.asarray([float(market_returns[d]) for d in sorted_dates], dtype=float)
-    # cumsum[i] = sum of daily[0..i-1]; cumsum[end] - cumsum[start] = window log return.
-    cumsum = np.concatenate(([0.0], np.cumsum(daily)))
-    n = len(sorted_dates)
-
-    for h in horizons:
-        H = HORIZON_TRADING_DAYS[h]
-        bucket = out[h]
-        for g in grid:
-            # First trade_date on or after g — beta_resid is computed forward from
-            # the grid date, just like the ticker's forward return.
-            start_idx = bisect.bisect_left(sorted_dates, g)
-            end_idx = start_idx + H
-            if end_idx >= n + 1:
-                continue
-            bucket[g] = float(cumsum[end_idx] - cumsum[start_idx])
-    return out
-
-
-def build_ticker_rows(
-    frame: TickerFrame,
-    grid: list,
-    max_stale_days: int = 7,
-    market_returns: dict | None = None,
-) -> list[dict]:
-    """One feature+target row per grid date for a single ticker (raw, pre-demean).
-
-    Mirrors dataset.assemble_ticker_samples_aligned: use the ticker's last bar at
-    or before each grid date, set the row's date to the grid date so all tickers
-    on the same month-end share a cross-section. Forward returns/masks come from
-    the shared `compute_targets` (same label definition as the transformer).
-
-    `max_stale_days` prevents delisted/paused tickers from being repeated forever
-    on later month-end grid dates after their final available bar.
-    """
-    import bisect
-
-    prices = sorted(frame.prices, key=lambda r: _as_date(r["trade_date"]))
-    if len(prices) <= SEQUENCE_LENGTH:
-        return []
-    trade_dates = [_as_date(r["trade_date"]) for r in prices]
-    adj_close = [float(r["adj_close"]) if r["adj_close"] is not None else None for r in prices]
-    volume = [float(r.get("volume") or 0.0) for r in prices]
-    shares = frame.shares_outstanding
-
-    entries = []  # (grid_date, pos, bar_date)
-    for g in grid:
-        pos = bisect.bisect_right(trade_dates, g) - 1
-        if pos < SEQUENCE_LENGTH:
-            continue
-        if (g - trade_dates[pos]).days > max_stale_days:
-            continue
-        if adj_close[pos] is None or adj_close[pos] <= 0:
-            continue
-        entries.append((g, pos, trade_dates[pos]))
-    if not entries:
-        return []
-
-    bar_dates = [e[2] for e in entries]
-    bar_positions = [e[1] for e in entries]
-    fund = _build_fundamental_series(bar_dates, frame.fundamentals)  # (k, 5)
-    fund_avail = _fund_filing_mask(bar_dates, frame.fundamentals)    # (k,) bool
-    sent = _build_sentiment_series(bar_dates, frame.sentiment)       # (k, 2)
-    fund_ctx = _fundamental_context_asof(frame.fundamentals, bar_dates)
-    reaction = _earnings_reaction_asof(
-        frame.fundamentals,
-        bar_positions,
-        bar_dates,
-        trade_dates,
-        adj_close,
-        market_returns,
-    )
-    est_ctx = _estimates_context_asof(frame.estimates or [], frame.surprises or [], bar_dates)
-
-    rows: list[dict] = []
-    for j, (g, pos, _bd) in enumerate(entries):
-        feats = _price_features(
-            adj_close,
-            volume,
-            trade_dates,
-            pos,
-            shares_outstanding=shares,
-            market_returns=market_returns,
-        )
-        for i, name in enumerate(FUNDAMENTAL_FEATURES):
-            feats[name] = float(fund[j, i])
-        feats["fund_available"] = 1.0 if fund_avail[j] else 0.0
-        # Keep experimental factors on the row for quick ablations, but don't
-        # feed them into the default production baseline unless they win.
-        price = adj_close[pos]
-        market_cap = (
-            float(price * shares)
-            if price is not None and shares is not None and price > 0 and shares > 0
-            else 0.0
-        )
-        feats["earnings_yield"] = _safe_ratio(fund_ctx["ttm_net_income"][j], market_cap)
-        feats["book_to_market"] = _safe_ratio(fund_ctx["total_equity"][j], market_cap)
-        feats["sales_to_price"] = _safe_ratio(fund_ctx["ttm_revenue"][j], market_cap)
-        feats["fcf_yield"] = _safe_ratio(fund_ctx["ttm_fcf"][j], market_cap)
-        feats["roe_ttm"] = _safe_ratio(fund_ctx["ttm_net_income"][j], fund_ctx["total_equity"][j])
-        feats["net_margin_ttm"] = _safe_ratio(fund_ctx["ttm_net_income"][j], fund_ctx["ttm_revenue"][j])
-        feats["fcf_margin_ttm"] = _safe_ratio(fund_ctx["ttm_fcf"][j], fund_ctx["ttm_revenue"][j])
-        feats["gross_margin_stability_4q"] = fund_ctx["gross_margin_stability_4q"][j]
-        feats["operating_margin_stability_4q"] = fund_ctx["operating_margin_stability_4q"][j]
-        feats["revenue_growth_stability_4q"] = fund_ctx["revenue_growth_stability_4q"][j]
-        # Earnings-reaction features are precomputed once per ticker above.
-        for name in EARNINGS_REACTION_FEATURES:
-            feats[name] = reaction[name][j]
-        # LSEG analyst-estimate features (precomputed per ticker in est_ctx).
-        feats["rec_mean_level"] = est_ctx["rec_mean_level"][j]
-        feats["rec_rev_30d"] = est_ctx["rec_rev_30d"][j]
-        feats["rec_rev_90d"] = est_ctx["rec_rev_90d"][j]
-        feats["price_target_rev_90d"] = est_ctx["price_target_rev_90d"][j]
-        feats["forward_earnings_yield"] = est_ctx["forward_earnings_yield"][j]
-        feats["forward_ebitda_yield"] = est_ctx["forward_ebitda_yield"][j]
-        feats["revenue_surprise"] = est_ctx["revenue_surprise"][j]
-        feats["eps_surprise"] = est_ctx["eps_surprise"][j]
-        feats["eps_est_rev_30d"] = est_ctx["eps_est_rev_30d"][j]
-        feats["eps_est_rev_90d"] = est_ctx["eps_est_rev_90d"][j]
-        feats["coverage_chg_90d"] = est_ctx["coverage_chg_90d"][j]
-        feats["pt_num_estimates"] = est_ctx["pt_num_estimates"][j]
-        pt = est_ctx["price_target_mean"][j]
-        feats["price_target_upside"] = ((pt - price) / price) if price and price > 0 and pt else 0.0
-        # Panel-level demean overwrites this in `prepare_panel`; until then leave
-        # it equal to mom_12_1 so single-ticker callers see a finite value.
-        feats["industry_neutral_mom_12_1"] = feats["mom_12_1"]
-        feats["sentiment_7d"] = float(sent[j, 0])
-        feats["sentiment_14d"] = float(sent[j, 1])
-        _labels, returns, mask = compute_targets(adj_close, pos)
-        row = {
-            "date": g,
-            "ticker_id": frame.ticker_id,
-            "sector": frame.sector,
-            "industry": frame.industry,
-            **feats,
-        }
-        for h in HORIZONS:
-            row[f"r_{h}"] = returns[h]
-            row[f"mask_{h}"] = mask[h]
-        rows.append(row)
-    return rows
 
 
 # =============================================================
@@ -1219,6 +513,7 @@ def fit_lgbm_model(
         subsample_freq=1,
         colsample_bytree=cfg.colsample_bytree,
         reg_lambda=cfg.reg_lambda,
+        reg_alpha=cfg.reg_alpha,
         n_jobs=cfg.n_jobs,
         random_state=seed,
         verbose=-1,
@@ -1348,7 +643,7 @@ def within_sector_ic(
 
 
 def ewma_rank_by_ticker(
-    records: list[dict], span: int
+    records: list[dict], span: int, rank_series: list[np.ndarray] | None = None
 ) -> list[np.ndarray]:
     """Causal EWMA of each name's within-date percentile rank across scoring dates.
 
@@ -1360,15 +655,19 @@ def ewma_rank_by_ticker(
     A name's first appearance seeds its state with its raw rank. Returns one
     smoothed-rank array per fold, aligned to `records`.
 
+    Pass `rank_series` (per-fold rank arrays already in [0, 1], e.g. the output of
+    `apply_knife_overlay`) to smooth THOSE instead of the raw-prediction ranks — this
+    is how the knife overlay composes ahead of cross-date smoothing.
+
     This mirrors the production blend (which smooths the stored percentile rank),
     so the walk-forward measures exactly what inference would ship.
     """
     alpha = 2.0 / (span + 1.0)
     state: dict[int, float] = {}
     out: list[np.ndarray] = []
-    for rec in records:
+    for idx, rec in enumerate(records):
         tids = rec["ticker_ids"]
-        raw_rank = _rank01(rec["pred"])
+        raw_rank = rank_series[idx] if rank_series is not None else _rank01(rec["pred"])
         sm = np.empty(len(tids), dtype=float)
         for i, t in enumerate(tids):
             t = int(t)
@@ -1399,6 +698,385 @@ def rank_turnover(records: list[dict], rank_series: list[np.ndarray] | None = No
     return float(np.mean(diffs)) if diffs else float("nan")
 
 
+def _knife_components(
+    risk: dict | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Falling-knife components from a fold's carried risk features.
+
+    `risk` holds the cross-sectionally rank-normalized [-1, 1] features
+    (`vol`=vol_120d, `trend`=ma_gap_200, `dlow`=dist_low_252) attached to each
+    record by `walk_forward_ic`. Map to [0, 1] percentiles: vol high = volatile;
+    trend/dlow LOW = below the 200d MA / near the 52w low = falling. Returns
+    `(knife, vol_p, downtrend_p)` where `downtrend_p = 1 - mean(trend_p, dlow_p)`
+    and `knife = vol_p * downtrend_p` — high ONLY in the high-vol-AND-falling
+    corner. Rare NaNs (a name missing a price feature) are neutralized to the
+    cross-section median so they neither earn nor dodge the penalty. Returns
+    `None` when the volatility feature or both trend features are absent.
+    """
+    if not risk or "vol" not in risk:
+        return None
+    to01 = lambda x: (np.asarray(x, dtype=float) + 1.0) / 2.0
+    vol_p = to01(risk["vol"])
+    trend_parts = [to01(risk[k]) for k in ("trend", "dlow") if k in risk]
+    if not trend_parts:
+        return None
+    downtrend_p = 1.0 - np.mean(trend_parts, axis=0)
+    knife = vol_p * downtrend_p
+    if np.isnan(knife).any():
+        med = np.nanmedian(knife)
+        if not np.isfinite(med):
+            return None
+        knife = np.where(np.isnan(knife), med, knife)
+        vol_p = np.nan_to_num(vol_p, nan=0.5)
+        downtrend_p = np.nan_to_num(downtrend_p, nan=0.5)
+    return knife, vol_p, downtrend_p
+
+
+def _knife_score(risk: dict | None) -> np.ndarray | None:
+    """The falling-knife penalty score in [0, 1] (see `_knife_components`)."""
+    comp = _knife_components(risk)
+    return None if comp is None else comp[0]
+
+
+def knife_tier(risk: dict | None, hi: float = 0.8, mid: float = 0.6) -> list[str] | None:
+    """Per-name falling-knife transparency tag from the same vol×downtrend components
+    the overlay uses (`_knife_components`): vol_p and downtrend_p are cross-sectional
+    percentiles in [0, 1] (high vol / below 200d-MA & near 52w-low).
+
+        'high'     = vol_p >= hi  AND downtrend_p >= hi   (top-vol AND clearly falling)
+        'elevated' = vol_p >= mid AND downtrend_p >= mid  (and not 'high')
+        'none'     = otherwise
+
+    Unlike the overlay this does NOT touch the rank — it just labels the stock so the
+    dashboard can show *why* a high-vol downtrender sits where it does. Returns one tag
+    per name aligned to the risk arrays, or `None` if the risk features are absent (the
+    caller then defaults every name to 'none').
+    """
+    comp = _knife_components(risk)
+    if comp is None:
+        return None
+    _knife, vol_p, downtrend_p = comp
+    out: list[str] = []
+    for v, d in zip(np.asarray(vol_p, dtype=float), np.asarray(downtrend_p, dtype=float)):
+        if v >= hi and d >= hi:
+            out.append("high")
+        elif v >= mid and d >= mid:
+            out.append("elevated")
+        else:
+            out.append("none")
+    return out
+
+
+def knife_overlay_ranks(
+    model_ranks: np.ndarray, risk: dict | None, lam: float
+) -> np.ndarray:
+    """Falling-knife overlay for ONE cross-section: re-rank model percentile ranks.
+
+        adj = (1-lam)*model_p - lam*knife_p ;  final = rank01(adj)
+    pushes high-vol-AND-falling names down while sparing high-vol uptrenders and
+    low-vol fallers. Returns `model_ranks` unchanged when `lam<=0` or `risk` lacks
+    the features (exact no-op). Shared by the walk-forward (`apply_knife_overlay`)
+    and production inference so both apply byte-identical math.
+    """
+    model_p = np.asarray(model_ranks, dtype=float)
+    knife = _knife_score(risk) if lam > 0 else None
+    if knife is None:
+        return model_p
+    return _rank01((1.0 - lam) * model_p - lam * _rank01(knife))
+
+
+def apply_knife_overlay(records: list[dict], lam: float) -> list[np.ndarray]:
+    """Per-fold rank arrays after the falling-knife output overlay (see
+    `knife_overlay_ranks`). `lam=0` returns each fold's model ranks unchanged.
+    """
+    return [knife_overlay_ranks(_rank01(rec["pred"]), rec.get("risk"), lam)
+            for rec in records]
+
+
+def top_decile_risk(
+    records: list[dict], rank_series: list[np.ndarray], decile: float = 0.1
+) -> dict:
+    """Risk character of each fold's top-decile names, averaged across folds.
+
+    `rank_series` is the per-fold FINAL rank arrays (e.g. from
+    `apply_knife_overlay`), aligned to `records`. For each fold we take the top
+    `ceil(decile*n)` names by rank and collect:
+      knife      mean falling-knife score of the top names (ex-ante)
+      vol_p      mean volatility percentile of the top names (ex-ante)
+      downtrend  fraction of top names with downtrend_p > 0.5 (ex-ante)
+      mean_r     mean realized demeaned return of the top names (ex-post alpha check)
+      downside   downside semi-deviation sqrt(mean(min(r,0)^2)) of the top names
+      tail_frac  fraction of top names whose realized r is below the fold's 10th pct
+    Lower knife/vol_p/downtrend/downside/tail_frac at steady-or-higher mean_r is the
+    win condition. Folds lacking risk features are skipped.
+    """
+    keys = ("knife", "vol_p", "downtrend", "mean_r", "downside", "tail_frac")
+    acc: dict[str, list[float]] = {k: [] for k in keys}
+    for rec, rk in zip(records, rank_series, strict=True):
+        comp = _knife_components(rec.get("risk"))
+        if comp is None:
+            continue
+        knife, vol_p, downtrend_p = comp
+        r = np.asarray(rec["r"], dtype=float)
+        rk = np.asarray(rk, dtype=float)
+        n = rk.size
+        k = max(1, math.ceil(decile * n))
+        top = np.argsort(rk)[-k:]  # indices of the highest-ranked names
+        rt = r[top]
+        neg = np.minimum(rt, 0.0)
+        tail = np.nanpercentile(r, 10)
+        acc["knife"].append(float(np.mean(knife[top])))
+        acc["vol_p"].append(float(np.mean(vol_p[top])))
+        acc["downtrend"].append(float(np.mean(downtrend_p[top] > 0.5)))
+        acc["mean_r"].append(float(np.nanmean(rt)))
+        acc["downside"].append(float(np.sqrt(np.nanmean(neg ** 2))))
+        acc["tail_frac"].append(float(np.nanmean(rt < tail)))
+    return {k: (float(np.mean(v)) if v else float("nan")) for k, v in acc.items()}
+
+
+def knife_sweep_table(
+    records: list[dict],
+    lambdas: list[float],
+    smooth_span: int = 0,
+    sector_group_col: str = "sector",
+    compute_sector_ic: bool = True,
+) -> list[dict]:
+    """Evaluate the knife overlay across `lambdas` with NO refit (reuses records).
+
+    For each lambda: overlay → optional cross-date smoothing → score mean rank-IC,
+    within-sector IC, turnover, and the top-decile risk metric. `lambdas[0]` is the
+    baseline (use 0.0). Mirrors the `--smooth-span` post-hoc sweep.
+    """
+    import pandas as pd
+
+    rows: list[dict] = []
+    for lam in lambdas:
+        ranks = apply_knife_overlay(records, lam)
+        if smooth_span > 0:
+            ranks = ewma_rank_by_ticker(records, smooth_span, rank_series=ranks)
+        ics: list[float] = []
+        sec_ics: list[float] = []
+        for rec, rk in zip(records, ranks, strict=True):
+            ic = pd.Series(rk).corr(pd.Series(rec["r"]), method="spearman")
+            if ic == ic:
+                ics.append(float(ic))
+            if compute_sector_ic and rec.get("sector") is not None:
+                sdf = pd.DataFrame({"r": rec["r"], sector_group_col: rec["sector"]})
+                s = within_sector_ic(rk, sdf, "r", group_col=sector_group_col)
+                if s == s:
+                    sec_ics.append(float(s))
+        row = {
+            "lam": lam,
+            "mean_ic": float(np.mean(ics)) if ics else float("nan"),
+            "sec_ic": float(np.mean(sec_ics)) if sec_ics else float("nan"),
+            "turnover": rank_turnover(records, rank_series=ranks),
+        }
+        row.update(top_decile_risk(records, ranks))
+        rows.append(row)
+    return rows
+
+
+def target_blend_sweep(
+    records_base: list[dict],
+    records_alt: list[dict],
+    weights: list[float],
+    *,
+    block_size: int,
+    reps: int = 2000,
+    seed: int = 1337,
+    sector_group_col: str = "sector",
+    compute_sector_ic: bool = True,
+) -> list[dict]:
+    """Evaluate a two-target rank-ensemble across blend `weights` with NO refit.
+
+    `records_base` / `records_alt` come from two `walk_forward_ic(..., return_records=
+    True)` runs on the SAME horizon/panel but DIFFERENT `target_mode`. They are matched
+    by each fold's `date` (so a skipped fold on one side never misaligns the other) and
+    share that fold's realized `r` / sector. For weight `w` the per-fold final rank is
+    `rank01((1-w)*rank01(pred_base) + w*rank01(pred_alt))` — w=0 is the base-target
+    baseline, w=1 the pure alternate target. Decorrelated label errors average out, so
+    the blend trades a little bias for lower cross-date IC variance (higher ICIR).
+    Names absent from the matched alt fold keep their base rank. Reports mean rank-IC,
+    within-sector IC + its moving-block t / p, and turnover per weight. Mirrors
+    `knife_sweep_table`.
+    """
+    import pandas as pd
+
+    alt_by_date = {rec.get("date"): rec for rec in records_alt}
+    rows: list[dict] = []
+    for w in weights:
+        ranks_out: list[np.ndarray] = []
+        ics: list[float] = []
+        sec_ics: list[float] = []
+        for rec in records_base:
+            base_rank = _rank01(rec["pred"])
+            arec = alt_by_date.get(rec.get("date"))
+            if arec is None or w == 0.0:
+                final = base_rank
+            else:
+                alt_rank = _rank01(arec["pred"])
+                alt_map = {int(t): alt_rank[i] for i, t in enumerate(arec["ticker_ids"])}
+                blended = np.array([
+                    (1.0 - w) * base_rank[i] + w * alt_map.get(int(t), base_rank[i])
+                    for i, t in enumerate(rec["ticker_ids"])
+                ], dtype=float)
+                final = _rank01(blended)
+            ranks_out.append(final)
+            ic = pd.Series(final).corr(pd.Series(rec["r"]), method="spearman")
+            if ic == ic:
+                ics.append(float(ic))
+            if compute_sector_ic and rec.get("sector") is not None:
+                sdf = pd.DataFrame({"r": rec["r"], sector_group_col: rec["sector"]})
+                s = within_sector_ic(final, sdf, "r", group_col=sector_group_col)
+                if s == s:
+                    sec_ics.append(float(s))
+        boot = block_bootstrap_summary(sec_ics, block_size=block_size, reps=reps, seed=seed)
+        rows.append({
+            "w": w,
+            "mean_ic": float(np.mean(ics)) if ics else float("nan"),
+            "sec_ic": float(np.mean(sec_ics)) if sec_ics else float("nan"),
+            "sec_t_block": boot["t_block"],
+            "sec_p": boot["p_value"],
+            "turnover": rank_turnover(records_base, rank_series=ranks_out),
+        })
+    return rows
+
+
+def regularization_sweep(
+    panel,
+    horizon: str,
+    named_configs: list[tuple[str, "LGBMConfig"]],
+    *,
+    wf_cfg: "WalkForwardConfig",
+    target_mode: str,
+    feature_cols: list[str] | None,
+    n_seeds: int,
+    block_size: int,
+    reps: int = 2000,
+    seed: int = 1337,
+    sector_group_col: str = "sector",
+    compute_sector_ic: bool = True,
+    log=lambda *_: None,
+) -> list[dict]:
+    """Compare LightGBM regularization configs at one horizon — each a FULL refit.
+
+    Unlike the knife / target-blend sweeps this cannot reuse records (every config
+    changes the fit), so it re-runs `walk_forward_ic` per config. Reports mean rank-IC,
+    within-sector IC + its naive ICIR + moving-block t / p, and turnover so a config can
+    be judged on variance reduction (higher ICIR / block-t and/or lower turnover at
+    steady-or-higher mean IC). `named_configs[0]` should be the production baseline.
+    """
+    rows: list[dict] = []
+    for name, cfg in named_configs:
+        log(f"[reg-sweep] fitting '{name}' ...")
+        res = walk_forward_ic(
+            panel, horizon, cfg, wf_cfg, seed=seed, shuffle=False,
+            target_mode=target_mode, feature_cols=feature_cols, n_seeds=n_seeds,
+            compute_sector_ic=compute_sector_ic, sector_group_col=sector_group_col,
+        )
+        sec = res.get("sector_summary", {})
+        boot = block_bootstrap_summary(
+            res.get("sector_ic_values", []), block_size=block_size, reps=reps, seed=seed
+        )
+        rows.append({
+            "name": name,
+            "mean_ic": res["summary"]["mean_ic"],
+            "sec_ic": sec.get("mean_ic", float("nan")),
+            "sec_icir": sec.get("icir", float("nan")),
+            "sec_t_block": boot["t_block"],
+            "sec_p": boot["p_value"],
+            "turnover": res.get("turnover_raw", float("nan")),
+        })
+    return rows
+
+
+def feature_diagnostics(
+    panel,
+    horizon: str,
+    candidate_cols: list[str],
+    existing_cols: list[str] | None = None,
+    *,
+    consolidation_col: str = "efficiency_ratio_120d",
+    sector_group_col: str = "sector",
+    min_names: int = 30,
+    block_size: int | None = None,
+    reps: int = 2000,
+    seed: int = 1337,
+) -> list[dict]:
+    """Vet candidate features for decorrelation + standalone signal — NO model fits.
+
+    For each `candidate_col` (expects the rank-normalized prepared panel) this reports:
+      * mean_abs_corr / top_corr — mean |Spearman corr| vs each `existing_cols` feature
+        (the existing book) and the 3 highest individual correlations. Low = decorrelated.
+      * er_corr — |corr| vs the consolidation proxy (`efficiency_ratio_120d`); high means
+        the feature is largely a trend-vs-sideways proxy.
+      * sec_ic / sec_t_block / sec_p — standalone within-sector IC at `horizon` vs the
+        realized return, moving-block-bootstrapped (the gate's signal test; sign is
+        informational — the GBDT can use either direction).
+      * ic_sideways / ic_mid / ic_trending — the feature's plain cross-sectional IC within
+        low / mid / high efficiency-ratio tertiles. Signal that lives ONLY in `ic_sideways`
+        is a consolidation-regime bet, not broad alpha (the sideways-confound check).
+
+    A candidate should advance only if it is low-correlation AND carries a real standalone
+    SECB signal that is not confined to the sideways tertile. Pure panel statistics, so a
+    full sweep over candidates is cheap.
+    """
+    import pandas as pd
+
+    existing_cols = existing_cols or list(FEATURE_COLS)
+    r_col, m_col = f"r_{horizon}", f"mask_{horizon}"
+    block_size = block_size or max(1, math.ceil(HORIZON_TRADING_DAYS[horizon] / 21))
+    pdf = panel[panel[m_col].astype(bool) & panel[r_col].notna()]
+
+    rows: list[dict] = []
+    for cand in candidate_cols:
+        others = [c for c in existing_cols if c != cand]
+        corr_acc: dict[str, list[float]] = {c: [] for c in others}
+        er_corrs: list[float] = []
+        ic_all: list[float] = []
+        ic_tert: dict[int, list[float]] = {0: [], 1: [], 2: []}
+        for _d, g in pdf.groupby("date"):
+            if len(g) < min_names:
+                continue
+            cvals = g[cand]
+            for c in others:
+                cc = cvals.corr(g[c], method="spearman")
+                if cc == cc:
+                    corr_acc[c].append(abs(float(cc)))
+            if consolidation_col in g.columns and consolidation_col != cand:
+                ec = cvals.corr(g[consolidation_col], method="spearman")
+                if ec == ec:
+                    er_corrs.append(abs(float(ec)))
+            sec_ic = within_sector_ic(cvals.to_numpy(), g, r_col, group_col=sector_group_col)
+            if sec_ic == sec_ic:
+                ic_all.append(float(sec_ic))
+            if consolidation_col in g.columns:
+                er = g[consolidation_col].to_numpy(dtype=float)
+                q1, q2 = np.nanpercentile(er, [33.333, 66.667])
+                for t, sel in ((0, er <= q1), (1, (er > q1) & (er <= q2)), (2, er > q2)):
+                    sub = g[sel]
+                    if len(sub) >= 10:
+                        ic = sub[cand].corr(sub[r_col], method="spearman")
+                        if ic == ic:
+                            ic_tert[t].append(float(ic))
+        mean_abs = {c: float(np.mean(v)) for c, v in corr_acc.items() if v}
+        top3 = sorted(mean_abs.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        boot = block_bootstrap_summary(ic_all, block_size=block_size, reps=reps, seed=seed)
+        rows.append({
+            "feature": cand,
+            "mean_abs_corr": float(np.mean(list(mean_abs.values()))) if mean_abs else float("nan"),
+            "top_corr": top3,
+            "er_corr": float(np.mean(er_corrs)) if er_corrs else float("nan"),
+            "sec_ic": boot["mean_ic"],
+            "sec_t_block": boot["t_block"],
+            "sec_p": boot["p_value"],
+            "ic_sideways": float(np.mean(ic_tert[0])) if ic_tert[0] else float("nan"),
+            "ic_mid": float(np.mean(ic_tert[1])) if ic_tert[1] else float("nan"),
+            "ic_trending": float(np.mean(ic_tert[2])) if ic_tert[2] else float("nan"),
+        })
+    return rows
+
+
 def walk_forward_ic(
     panel,
     horizon: str = "1M",
@@ -1415,6 +1093,7 @@ def walk_forward_ic(
     linear_blend: float = 0.0,
     ridge_alpha: float = 10.0,
     smooth_span: int = 0,
+    knife_lambda: float = 0.0,
     return_records: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
@@ -1422,12 +1101,13 @@ def walk_forward_ic(
     Trains on `target_mode` (return/rank/quantile) but always SCORES rank-IC against
     the realized demeaned return `r_{horizon}`, so modes are directly comparable.
 
-    `smooth_span > 0` post-processes the per-fold predictions with a causal EWMA of
-    each name's percentile rank across scoring dates (`ewma_rank_by_ticker`) BEFORE
-    scoring — a pure post-step that leaves the fit untouched but measures the
-    smoothed signal inference would ship. The result always carries `rank_turnover`
-    (mean |Δ rank| between consecutive dates) for the raw signal, and the smoothed
-    turnover when smoothing is on.
+    `knife_lambda > 0` applies the falling-knife output overlay (`apply_knife_overlay`)
+    and `smooth_span > 0` the causal cross-date EWMA (`ewma_rank_by_ticker`) to the
+    per-fold ranks BEFORE scoring — pure post-steps that leave the fit untouched but
+    measure the de-risked / smoothed signal inference would ship. When both are on the
+    overlay composes first, then smoothing. The result always carries `rank_turnover`
+    (mean |Δ rank| between consecutive dates) for the raw signal, and the transformed
+    turnover (`turnover_smoothed`) when either post-step is on.
     """
     import pandas as pd
 
@@ -1475,29 +1155,41 @@ def walk_forward_ic(
                 preds, test, r_col, group_col=sector_group_col
             )
         fold_rows.append(fold)
+        risk = {
+            key: test[col].to_numpy(dtype=float)
+            for col, key in (("vol_120d", "vol"), ("ma_gap_200", "trend"),
+                             ("dist_low_252", "dlow"))
+            if col in test.columns
+        }
         records.append({
+            "date": test_date,
             "ticker_ids": test["ticker_id"].to_numpy(),
             "pred": np.asarray(preds, dtype=float),
             "r": test[r_col].to_numpy(dtype=float),
             "sector": test[sector_group_col].to_numpy() if sector_group_col in test.columns else None,
+            "risk": risk,
         })
         log(
             f"  fold {test_date}  ic {ic:+.4f}  "
             f"n_test={test.shape[0]:>4d}  n_train={train.shape[0]}"
         )
 
-    # Smoothing: recompute each fold's IC / SECB on the causal EWMA of each name's
-    # percentile rank (records is 1:1 aligned with fold_rows). Spearman is invariant
-    # to the final re-rank, so scoring on the smoothed rank == scoring on its rank.
+    # Post-hoc rank transforms (no refit): falling-knife overlay, then cross-date
+    # EWMA smoothing. Recompute each fold's IC / SECB on the transformed ranks
+    # (records is 1:1 aligned with fold_rows). Spearman is invariant to the final
+    # re-rank, so scoring on the transformed rank == scoring on its rank. lam/span = 0
+    # are no-ops, so the default path keeps the raw per-fold IC scored in the loop.
     turnover_smoothed = None
-    if smooth_span > 0 and records:
-        smoothed = ewma_rank_by_ticker(records, smooth_span)
-        for fold, rec, sm in zip(fold_rows, records, smoothed, strict=True):
-            fold["ic"] = float(pd.Series(sm).corr(pd.Series(rec["r"]), method="spearman"))
+    if (knife_lambda > 0 or smooth_span > 0) and records:
+        ranks = apply_knife_overlay(records, knife_lambda)  # lam=0 → model ranks
+        if smooth_span > 0:
+            ranks = ewma_rank_by_ticker(records, smooth_span, rank_series=ranks)
+        for fold, rec, rk in zip(fold_rows, records, ranks, strict=True):
+            fold["ic"] = float(pd.Series(rk).corr(pd.Series(rec["r"]), method="spearman"))
             if compute_sector_ic and rec["sector"] is not None:
                 sdf = pd.DataFrame({r_col: rec["r"], sector_group_col: rec["sector"]})
-                fold["sector_ic"] = within_sector_ic(sm, sdf, r_col, group_col=sector_group_col)
-        turnover_smoothed = rank_turnover(records, rank_series=smoothed)
+                fold["sector_ic"] = within_sector_ic(rk, sdf, r_col, group_col=sector_group_col)
+        turnover_smoothed = rank_turnover(records, rank_series=ranks)
 
     result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
     result["turnover_raw"] = rank_turnover(records)
@@ -1705,6 +1397,10 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(REVISION_MOMENTUM_FEATURES)
     if args.with_forward_valuation:
         cols += list(FORWARD_VALUATION_FEATURES)
+    if args.with_lottery:
+        cols += list(LOTTERY_FEATURES)
+    if args.with_microstructure:
+        cols += list(MICROSTRUCTURE_FEATURES)
     # De-dupe while preserving order.
     seen: set[str] = set()
     out: list[str] = []
@@ -1753,6 +1449,45 @@ async def run(args) -> None:
             f"range={dates[0]}..{dates[-1]}  tickers={panel['ticker_id'].nunique()}"
         )
 
+        if args.feature_diagnostics:
+            # Default the candidates to the packs the user opted into (everything beyond
+            # the production FEATURE_COLS). No model fits — just panel statistics.
+            candidates = [c for c in feature_cols if c not in FEATURE_COLS]
+            if not candidates:
+                raise SystemExit("--feature-diagnostics needs candidate features; "
+                                 "add a pack, e.g. --with-microstructure")
+            block_size = args.block_size or max(
+                1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
+            )
+            print(f"\n[feature diagnostics] {args.horizon}: decorrelation vs the book + "
+                  f"standalone within-{args.neutralize_by} IC (block={block_size}); "
+                  f"consolidation control = efficiency_ratio_120d:")
+            print(f"  {'feature':>24} {'|corr|bk':>9} {'|corr|ER':>9} {'sec_ic':>8} "
+                  f"{'sec_t':>7} {'sec_p':>8} {'ic_side':>8} {'ic_mid':>8} {'ic_trend':>8} "
+                  f"  top correlates")
+            for row in feature_diagnostics(
+                panel, args.horizon, candidates,
+                sector_group_col=args.neutralize_by,
+                min_names=args.min_names,
+                block_size=block_size,
+                reps=args.block_bootstrap_reps,
+                seed=args.seed,
+            ):
+                top = ", ".join(f"{n}={v:.2f}" for n, v in row["top_corr"])
+                print(f"  {row['feature']:>24} {row['mean_abs_corr']:>9.3f} "
+                      f"{row['er_corr']:>9.3f} {row['sec_ic']:>+8.4f} "
+                      f"{row['sec_t_block']:>+7.2f} {row['sec_p']:>8.4f} "
+                      f"{row['ic_sideways']:>+8.4f} {row['ic_mid']:>+8.4f} "
+                      f"{row['ic_trending']:>+8.4f}   {top}")
+            return
+
+        knife_grid = (
+            [float(x) for x in args.knife_sweep.split(",")] if args.knife_sweep else None
+        )
+        blend_grid = (
+            [float(x) for x in args.target_blend_sweep.split(",")]
+            if args.target_blend_sweep else None
+        )
         real = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                seed=args.seed, shuffle=False, target_mode=args.target,
                                log=print if args.verbose else (lambda *_: None),
@@ -1762,19 +1497,98 @@ async def run(args) -> None:
                                sector_group_col=args.neutralize_by,
                                linear_blend=args.with_linear_blend,
                                ridge_alpha=args.ridge_alpha,
-                               smooth_span=args.smooth_span)
+                               smooth_span=args.smooth_span,
+                               knife_lambda=args.knife_lambda,
+                               return_records=knife_grid is not None or blend_grid is not None)
         block_size = args.block_size or max(
             1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
         )
         smooth_tag = f", smooth_span={args.smooth_span}" if args.smooth_span > 0 else ""
+        knife_tag = f", knife_lambda={args.knife_lambda}" if args.knife_lambda > 0 else ""
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
-              f"(expanding walk-forward, target={args.target}{smooth_tag}) ---")
+              f"(expanding walk-forward, target={args.target}{smooth_tag}{knife_tag}) ---")
+        if knife_grid is not None and real.get("records"):
+            print(f"\n[knife sweep] vol×downtrend output overlay (no refit, "
+                  f"smooth_span={args.smooth_span}); SECB={args.sector_neutral_ic}:")
+            print(f"  {'lam':>5} {'mean_ic':>8} {'sec_ic':>8} {'turnover':>9} "
+                  f"{'td_knife':>9} {'td_vol_p':>9} {'td_down':>8} {'td_meanr':>9} "
+                  f"{'td_dnside':>10} {'td_tail':>8}")
+            for row in knife_sweep_table(
+                real["records"], knife_grid, smooth_span=args.smooth_span,
+                sector_group_col=args.neutralize_by,
+                compute_sector_ic=args.sector_neutral_ic,
+            ):
+                print(f"  {row['lam']:>5.2f} {row['mean_ic']:>+8.4f} "
+                      f"{row['sec_ic']:>+8.4f} {row['turnover']:>9.4f} "
+                      f"{row['knife']:>9.4f} {row['vol_p']:>9.4f} "
+                      f"{row['downtrend']:>8.3f} {row['mean_r']:>+9.4f} "
+                      f"{row['downside']:>10.4f} {row['tail_frac']:>8.3f}")
+        if blend_grid is not None and args.target_blend and real.get("records"):
+            print(f"\n[target-blend sweep] rank-ensemble {args.target} × "
+                  f"{args.target_blend} (no refit, second {args.n_seeds}-seed fit on "
+                  f"alt target); SECB={args.sector_neutral_ic}, block={block_size}:")
+            alt = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
+                                  seed=args.seed, shuffle=False,
+                                  target_mode=args.target_blend,
+                                  feature_cols=feature_cols, n_seeds=args.n_seeds,
+                                  compute_sector_ic=args.sector_neutral_ic,
+                                  sector_group_col=args.neutralize_by,
+                                  return_records=True)
+            print(f"  {'w':>5} {'mean_ic':>8} {'sec_ic':>8} {'sec_t':>7} "
+                  f"{'sec_p':>8} {'turnover':>9}")
+            for row in target_blend_sweep(
+                real["records"], alt["records"], blend_grid,
+                block_size=block_size, reps=args.block_bootstrap_reps, seed=args.seed,
+                sector_group_col=args.neutralize_by,
+                compute_sector_ic=args.sector_neutral_ic,
+            ):
+                print(f"  {row['w']:>5.2f} {row['mean_ic']:>+8.4f} "
+                      f"{row['sec_ic']:>+8.4f} {row['sec_t_block']:>+7.2f} "
+                      f"{row['sec_p']:>8.4f} {row['turnover']:>9.4f}")
+        elif blend_grid is not None and not args.target_blend:
+            print("\n[target-blend sweep] skipped: --target-blend-sweep requires "
+                  "--target-blend <alt target>")
+        if args.reg_sweep:
+            base = LGBMConfig()
+            reg_configs = [
+                ("baseline", base),
+                ("slow_shrink", replace(base, learning_rate=0.015, n_estimators=600)),
+                ("small_trees", replace(base, num_leaves=7, max_depth=3,
+                                        min_child_samples=100)),
+                ("decorrelate", replace(base, colsample_bytree=0.5, subsample=0.7)),
+                ("strong_l1l2", replace(base, reg_lambda=5.0, reg_alpha=1.0,
+                                        min_child_samples=100)),
+                ("conservative", replace(base, learning_rate=0.02, n_estimators=500,
+                                         num_leaves=7, max_depth=3, min_child_samples=100,
+                                         reg_lambda=5.0, reg_alpha=1.0,
+                                         colsample_bytree=0.6, subsample=0.7)),
+            ]
+            print(f"\n[reg sweep] per-horizon LightGBM regularization at {args.horizon} "
+                  f"(full refit each, {args.n_seeds}-seed, target={args.target}); "
+                  f"block={block_size}:")
+            print(f"  {'config':>13} {'mean_ic':>8} {'sec_ic':>8} {'sec_icir':>9} "
+                  f"{'sec_t':>7} {'sec_p':>8} {'turnover':>9}")
+            for row in regularization_sweep(
+                panel, args.horizon, reg_configs, wf_cfg=wf_cfg,
+                target_mode=args.target, feature_cols=feature_cols,
+                n_seeds=args.n_seeds, block_size=block_size,
+                reps=args.block_bootstrap_reps, seed=args.seed,
+                sector_group_col=args.neutralize_by,
+                compute_sector_ic=args.sector_neutral_ic,
+                log=print if args.verbose else (lambda *_: None),
+            ):
+                print(f"  {row['name']:>13} {row['mean_ic']:>+8.4f} "
+                      f"{row['sec_ic']:>+8.4f} {row['sec_icir']:>+9.3f} "
+                      f"{row['sec_t_block']:>+7.2f} {row['sec_p']:>8.4f} "
+                      f"{row['turnover']:>9.4f}")
         if real.get("turnover_raw") is not None:
             tr = real["turnover_raw"]
             line = f"[turnover] mean |Δ rank| consecutive dates: raw={tr:.4f}"
             if real.get("turnover_smoothed") is not None:
                 ts = real["turnover_smoothed"]
-                line += f"  smoothed={ts:.4f}  ({(1 - ts / tr) * 100:+.0f}% vs raw)"
+                post_label = "knife" if args.knife_lambda > 0 and args.smooth_span == 0 else (
+                    "knife+smooth" if args.knife_lambda > 0 else "smoothed")
+                line += f"  {post_label}={ts:.4f}  ({(1 - ts / tr) * 100:+.0f}% vs raw)"
             print(line)
 
         # HEADLINE: within-sector stock selection — the bar a horizon must clear.
@@ -1816,7 +1630,8 @@ async def run(args) -> None:
                                       sector_group_col=args.neutralize_by,
                                       linear_blend=args.with_linear_blend,
                                       ridge_alpha=args.ridge_alpha,
-                                      smooth_span=args.smooth_span)
+                                      smooth_span=args.smooth_span,
+                                      knife_lambda=args.knife_lambda)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 if args.sector_neutral_ic and "sector_summary" in res:
@@ -1884,6 +1699,33 @@ def main() -> None:
                         "Causally smooths each name's percentile rank over scoring "
                         "dates before scoring, then reports turnover raw vs smoothed. "
                         "Reduces drift/turnover; longer spans suit longer horizons.")
+    p.add_argument("--knife-lambda", type=float, default=0.0, metavar="L",
+                   help="falling-knife output-overlay weight (0 = off). Re-ranks each "
+                        "cross-section toward names that are NOT both high-vol and "
+                        "downtrending; composes ahead of --smooth-span. Suppresses "
+                        "'falling knife' picks at the top and lowers turnover.")
+    p.add_argument("--knife-sweep", default=None, metavar="L1,L2,...",
+                   help="comma-separated knife-lambda grid for a no-refit sweep table "
+                        "(e.g. '0,0.05,0.1,0.2'); reports mean/within-sector IC, "
+                        "turnover, and top-decile risk per lambda. Composes with "
+                        "--smooth-span.")
+    p.add_argument("--target-blend", default=None,
+                   choices=["return", "rank", "quantile", "sector_return",
+                            "beta_resid", "beta_sector_resid"],
+                   help="alternate training target to rank-ensemble with --target: "
+                        "fits a SECOND walk-forward on this target and averages the "
+                        "per-date percentile ranks (decorrelated label errors → lower "
+                        "cross-date IC variance). Pairs with --target-blend-sweep.")
+    p.add_argument("--target-blend-sweep", default=None, metavar="W1,W2,...",
+                   help="comma-separated alt-target blend-weight grid for a no-refit "
+                        "sweep (e.g. '0,0.25,0.5,0.75,1.0'); 0 = pure --target, "
+                        "1 = pure --target-blend. Requires --target-blend.")
+    p.add_argument("--reg-sweep", action="store_true",
+                   help="compare a curated grid of LightGBM regularization configs at "
+                        "this horizon (FULL refit each): baseline vs slower-shrink, "
+                        "smaller-trees, feature/row-decorrelation, stronger L1/L2, and "
+                        "a conservative combo. Reports within-sector IC/ICIR + block t/p "
+                        "and turnover to judge variance reduction.")
     p.add_argument("--symbols", nargs="*", help="restrict to these symbols")
     p.add_argument("--refresh-cache", action="store_true",
                    help="re-pull frames from Supabase and overwrite the local "
@@ -1913,6 +1755,17 @@ def main() -> None:
     p.add_argument("--with-forward-valuation", action="store_true",
                    help="add LSEG forward-valuation pack (forward earnings/ebitda yield, "
                         "price-target upside)")
+    p.add_argument("--with-lottery", action="store_true",
+                   help="add lottery / idiosyncratic-vol pack (max_ret_21d, idio_vol); "
+                        "the volatility variants with the documented NEGATIVE sign")
+    p.add_argument("--with-microstructure", action="store_true",
+                   help="add microstructure / higher-moment pack (ret_skew_120d, "
+                        "downside_vol_ratio_120d, amihud_illiq_60d, turnover_60d, "
+                        "efficiency_ratio_120d) — decorrelated 6M candidate (price/volume)")
+    p.add_argument("--feature-diagnostics", action="store_true",
+                   help="vet the opted-in pack features (--with-*) for decorrelation vs "
+                        "the book + standalone within-sector IC + a consolidation "
+                        "(efficiency-ratio tertile) breakdown, then exit — no model fits")
     p.add_argument("--industry-relative", action="store_true",
                    help="rank-normalize price/fundamental/valuation/quality "
                         "features within (date, industry) instead of universe-wide")

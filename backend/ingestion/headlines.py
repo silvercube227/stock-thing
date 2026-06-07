@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
@@ -33,6 +34,18 @@ NYSE_CLOSE_HOUR = 16  # 16:00 ET
 
 FINBERT_MODEL = "ProsusAI/finbert"
 FINBERT_BATCH_SIZE = 32
+
+# yfinance's news endpoint throttles aggressively: fetching ~500 symbols at high
+# concurrency reliably trips HTTP 429 ("Too Many Requests. Rate limited."). Keep
+# concurrency low and retry rate-limited fetches with exponential backoff + jitter.
+NEWS_FETCH_CONCURRENCY = 3
+RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_BASE_DELAY = 2.0  # seconds; doubles each retry (2, 4, 8, 16) + jitter
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "too many requests" in msg or "rate limit" in msg or "429" in msg
 
 
 # =============================================================
@@ -343,7 +356,7 @@ async def _fetch_active_tickers(pool: asyncpg.Pool) -> list[tuple[int, str]]:
 async def ingest_sentiment(
     pool: asyncpg.Pool,
     tickers: Iterable[tuple[int, str]] | None = None,
-    fetch_concurrency: int = 10,
+    fetch_concurrency: int = NEWS_FETCH_CONCURRENCY,
     upsert_concurrency: int = 5,
 ) -> SentimentResult:
     """Run the sentiment pipeline for all (or a given subset of) active tickers.
@@ -373,14 +386,25 @@ async def ingest_sentiment(
 
     async def _fetch_one(tid: int, sym: str) -> None:
         async with fetch_sem:
-            try:
-                items = await asyncio.to_thread(fetch_news_yf, sym)
-                ticker_news[tid] = items
-                log.debug("%s: fetched %d headlines", sym, len(items))
-            except Exception as exc:
-                log.warning("Failed to fetch news for %s: %s", sym, exc)
-                fetch_errors[tid] = str(exc)
-                ticker_news[tid] = []
+            for attempt in range(RATE_LIMIT_RETRIES + 1):
+                try:
+                    items = await asyncio.to_thread(fetch_news_yf, sym)
+                    ticker_news[tid] = items
+                    log.debug("%s: fetched %d headlines", sym, len(items))
+                    return
+                except Exception as exc:
+                    if _is_rate_limited(exc) and attempt < RATE_LIMIT_RETRIES:
+                        delay = RATE_LIMIT_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                        log.info(
+                            "%s: rate-limited, backing off %.1fs (retry %d/%d)",
+                            sym, delay, attempt + 1, RATE_LIMIT_RETRIES,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    log.warning("Failed to fetch news for %s: %s", sym, exc)
+                    fetch_errors[tid] = str(exc)
+                    ticker_news[tid] = []
+                    return
 
     await asyncio.gather(*(_fetch_one(tid, sym) for tid, sym in candidates))
 

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
 import { AppHeader } from "@/components/AppHeader";
+import { KnifeBadge } from "@/components/KnifeBadge";
 import { getRankings, type RankingResponse, type RankingRow } from "@/lib/api";
 import { percentileRank, num, changeColor } from "@/lib/format";
 import { usePortfolio } from "@/hooks/usePortfolio";
@@ -255,6 +256,7 @@ export default function ScreenerPage() {
                               held
                             </span>
                           )}
+                          <KnifeBadge tier={r.risk_flag} />
                         </div>
                         <div className="max-w-[16rem] truncate text-[11px] text-muted mt-0.5">
                           {sectorMode

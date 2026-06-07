@@ -263,14 +263,18 @@ def test_ticker_detail_no_model(client) -> None:
 def test_ticker_detail_with_predictions(client, store) -> None:
     store.active_model = ("mv-123", "candidate")
     store.predictions = [
-        {"horizon": "3M", "direction_prob": 0.82, "confidence": 0.64, "as_of_date": "2026-05-22"},
-        {"horizon": "6M", "direction_prob": 0.55, "confidence": 0.10, "as_of_date": "2026-05-22"},
+        {"horizon": "3M", "direction_prob": 0.82, "confidence": 0.64,
+         "risk_flag": "elevated", "as_of_date": "2026-05-22"},
+        {"horizon": "6M", "direction_prob": 0.55, "confidence": 0.10,
+         "risk_flag": "elevated", "as_of_date": "2026-05-22"},
     ]
     body = client.get("/tickers/AAPL").json()
     assert body["model_status"] == "candidate"
     assert body["model_version_id"] == "mv-123"
     horizons = {p["horizon"]: p["percentile_rank"] for p in body["predictions"]}
     assert horizons == {"3M": 0.82, "6M": 0.55}
+    # Horizon-agnostic falling-knife tag surfaces at the top level.
+    assert body["risk_flag"] == "elevated"
 
 
 def test_rankings_requires_auth(anon_client) -> None:
@@ -281,9 +285,11 @@ def test_rankings(client, store) -> None:
     store.active_model = ("mv-123", "production")
     store.rankings = [
         {"ticker_id": 2, "symbol": "MSFT", "name": "Microsoft", "sector": "Technology",
-         "direction_prob": 0.91, "confidence": 0.82, "as_of_date": "2026-05-22"},
+         "direction_prob": 0.91, "confidence": 0.82, "risk_flag": "none",
+         "as_of_date": "2026-05-22"},
         {"ticker_id": 1, "symbol": "AAPL", "name": "Apple Inc.", "sector": "Technology",
-         "direction_prob": 0.40, "confidence": 0.20, "as_of_date": "2026-05-22"},
+         "direction_prob": 0.40, "confidence": 0.20, "risk_flag": "high",
+         "as_of_date": "2026-05-22"},
     ]
     body = client.get("/rankings?horizon=6M").json()
     assert body["horizon"] == "6M"
@@ -292,6 +298,9 @@ def test_rankings(client, store) -> None:
     syms = [r["symbol"] for r in body["rows"]]
     assert syms == ["MSFT", "AAPL"]  # order preserved from the query
     assert body["rows"][0]["percentile_rank"] == 0.91
+    # Falling-knife tag surfaces per row (descriptive; rank is unchanged).
+    assert body["rows"][0]["risk_flag"] == "none"
+    assert body["rows"][1]["risk_flag"] == "high"
     # Within-sector rank: both are Technology, MSFT (higher score) tops the sector.
     msft, aapl = body["rows"][0], body["rows"][1]
     assert msft["sector_rank"] == 1.0 and msft["sector_rank_label"] == "1/2"
