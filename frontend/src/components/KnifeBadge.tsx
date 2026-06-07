@@ -13,7 +13,7 @@ export function KnifeBadge({ tier }: { tier: string | null | undefined }) {
         high ? "bg-down/20 text-down" : "bg-down/10 text-down/80"
       }`}
     >
-      {high ? "⚠ knife" : "elevated vol"}
+      {high ? "⚠ elevated vol + downward" : "elevated vol"}
     </span>
   );
 }
