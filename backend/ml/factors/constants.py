@@ -92,13 +92,35 @@ MICROSTRUCTURE_FEATURES = [
     "ret_skew_120d", "downside_vol_ratio_120d", "amihud_illiq_60d",
     "turnover_60d", "efficiency_ratio_120d",
 ]
+# Falling-knife composite score feature (opt-in via --with-knife-feature).
+# Computed from rank-normalized vol_120d / ma_gap_200 / dist_low_252 mapped to [0,1]:
+# knife_score = vol_p * (1 - mean(trend_p, dlow_p)). Already in [0,1] within-date so
+# it is NOT re-normalized in rank_normalize_features. Training signal: lets the GBDT
+# learn conditional demotion of high-vol-AND-falling names rather than the overlay's
+# unconditional rank penalty.
+KNIFE_FEATURES = ["knife_score"]
+# EPS estimate dispersion (Diether-Malloy-Scherbina 2002 short-selling proxy):
+# eps_dispersion = eps_std_dev / max(|eps_mean|, 0.01). Higher disagreement among
+# analysts → NEGATIVE expected return (short-selling constraint prevents full
+# arbitrage of disagreed-on names). Opt-in via --with-eps-dispersion.
+EPS_DISPERSION_FEATURES = ["eps_dispersion"]
+# Short interest (FINRA Reg SHO): days-to-cover ratio (short_interest /
+# avg_daily_volume). High DTC = crowded short = contrarian long candidate OR
+# further squeeze risk. PIT-safe on publication_date (~14d after settlement).
+# Requires short_interest table (migration 009) + backfill_short_interest.py.
+SHORT_INTEREST_FEATURES = ["short_ratio"]
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
+# EXPERIMENTAL_FEATURES: per-ticker features produced by build_ticker_rows (eligible for
+# `--feature-diagnostics` and `--with-*` packs). knife_score is excluded because it is a
+# PANEL-LEVEL feature computed by add_knife_score_feature AFTER cross-sectional normalization
+# — it is not produced per-ticker and must not appear in build_ticker_rows row dicts.
 EXPERIMENTAL_FEATURES = (
     VALUATION_FEATURES + QUALITY_FEATURES + RESIDUAL_MOM_FEATURES + EARNINGS_REACTION_FEATURES
     + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + EPS_SURPRISE_FEATURES
     + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES + LOTTERY_FEATURES
-    + MICROSTRUCTURE_FEATURES
+    + MICROSTRUCTURE_FEATURES + EPS_DISPERSION_FEATURES + SHORT_INTEREST_FEATURES
+    # KNIFE_FEATURES intentionally excluded — panel-level, not in build_ticker_rows
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /
 # earnings-reaction features already adjust for market or filing context so they

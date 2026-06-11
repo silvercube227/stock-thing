@@ -75,6 +75,8 @@ class TickerFrame:
     estimates: list[dict] | None = None
     # earnings_surprises rows (quarterly, report_date PIT); None tolerates older caches.
     surprises: list[dict] | None = None
+    # short_interest rows (publication_date PIT); None when table not yet populated.
+    short_interest: list[dict] | None = None
 
 
 @dataclass
@@ -407,7 +409,7 @@ select ticker_id, score_date, rolling_7d, rolling_14d
 _EST_SQL = """
 select ticker_id, as_of_date, rec_mean, price_target_mean,
        revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda,
-       num_analysts, pt_num_estimates
+       num_analysts, pt_num_estimates, eps_std_dev, eps_num_inc_estimates
   from analyst_estimates
  where ticker_id = any($1::bigint[])
  order by ticker_id, as_of_date
@@ -419,6 +421,14 @@ select ticker_id, period_end, report_date,
   from earnings_surprises
  where ticker_id = any($1::bigint[])
  order by ticker_id, report_date
+"""
+
+_SI_SQL = """
+select ticker_id, settlement_date, publication_date,
+       short_interest, avg_daily_volume, days_to_cover
+  from short_interest
+ where ticker_id = any($1::bigint[])
+ order by ticker_id, publication_date
 """
 
 
@@ -466,12 +476,19 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     sent_rows = await _fetch_chunked(pool, _SENT_SQL, ids)
     est_rows = await _fetch_chunked(pool, _EST_SQL, ids)
     surprise_rows = await _fetch_chunked(pool, _SURPRISE_SQL, ids)
+    # short_interest table is optional (migration 009). Tolerate its absence so
+    # existing load_frames callers work before the migration is applied.
+    try:
+        si_rows = await _fetch_chunked(pool, _SI_SQL, ids)
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        si_rows = []
 
     by_ticker_prices = _group(price_rows)
     by_ticker_fund = _group(fund_rows)
     by_ticker_sent = _group(sent_rows)
     by_ticker_est = _group(est_rows)
     by_ticker_surprise = _group(surprise_rows)
+    by_ticker_si = _group(si_rows)
 
     frames: list[TickerFrame] = []
     for r in ticker_rows:
@@ -489,6 +506,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 industry=r["industry"],
                 estimates=by_ticker_est.get(tid, []),
                 surprises=by_ticker_surprise.get(tid, []),
+                short_interest=by_ticker_si.get(tid, []),
             )
         )
     return frames

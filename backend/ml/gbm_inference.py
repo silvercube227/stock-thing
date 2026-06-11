@@ -116,6 +116,10 @@ def fit_horizon_models(
         ]
         if exclude_ids:
             train = train[~train["ticker_id"].isin(exclude_ids)]
+        if spec.max_train_months is not None:
+            train_dates = sorted(train["date"].unique())
+            if len(train_dates) > spec.max_train_months:
+                train = train[train["date"] >= train_dates[-spec.max_train_months]]
         if train.empty:
             raise ValueError(
                 f"no labeled training rows for {h} target={spec.target_mode}"
@@ -390,6 +394,7 @@ def _specs_from_serialized(serialized: dict) -> dict[str, HorizonSpec]:
             ridge_alpha=d.get("ridge_alpha", 10.0),
             smooth_span=d.get("smooth_span", 0),
             knife_lambda=d.get("knife_lambda", 0.0),
+            max_train_months=d.get("max_train_months", None),
         )
     return out
 
@@ -437,6 +442,7 @@ def _serialize_spec(spec: HorizonSpec) -> dict:
         "ridge_alpha": getattr(spec, "ridge_alpha", 10.0),
         "smooth_span": getattr(spec, "smooth_span", 0),
         "knife_lambda": getattr(spec, "knife_lambda", 0.0),
+        "max_train_months": getattr(spec, "max_train_months", None),
     }
 
 
@@ -462,6 +468,7 @@ def build_specs_from_args(args) -> dict[str, HorizonSpec]:
                 linear_blend=spec.linear_blend,
                 ridge_alpha=spec.ridge_alpha,
                 smooth_span=spec.smooth_span,
+                max_train_months=spec.max_train_months,
             )
         base[h] = spec
     return base

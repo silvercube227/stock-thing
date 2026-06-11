@@ -54,6 +54,7 @@ from backend.ml.dataset import (
 from backend.ml.factors import (  # noqa: F401
     ANALYST_REVISION_FEATURES,
     EARNINGS_REACTION_FEATURES,
+    EPS_DISPERSION_FEATURES,
     EPS_SURPRISE_FEATURES,
     ESTIMATE_SURPRISE_FEATURES,
     EXPERIMENTAL_FEATURES,
@@ -62,6 +63,7 @@ from backend.ml.factors import (  # noqa: F401
     FUNDAMENTAL_FEATURES,
     FUNDAMENTAL_MISSING_FEATURES,
     INDUSTRY_RELATIVE_FEATURES,
+    KNIFE_FEATURES,
     LOTTERY_FEATURES,
     MICROSTRUCTURE_FEATURES,
     PRICE_FEATURES,
@@ -69,6 +71,7 @@ from backend.ml.factors import (  # noqa: F401
     RESIDUAL_MOM_FEATURES,
     REVISION_MOMENTUM_FEATURES,
     SENTIMENT_FEATURES,
+    SHORT_INTEREST_FEATURES,
     VALUATION_FEATURES,
     _earnings_reaction_asof,
     _estimates_context_asof,
@@ -150,6 +153,10 @@ class HorizonSpec:
     # top of the ranking. Applied at score time before smoothing. Promoted at 3M
     # only — it's a downside/quality lever, NOT a churn lever (smoothing owns that).
     knife_lambda: float = 0.0
+    # Rolling training window in monthly grid dates (None = expanding from 2010).
+    # Mirrors WalkForwardConfig.max_train_months but lives on the spec so inference
+    # can apply a per-horizon window without touching the CLI flag machinery.
+    max_train_months: int | None = None
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -207,11 +214,19 @@ _BASELINE_PLUS_REVMOM = FEATURE_COLS + REVISION_MOMENTUM_FEATURES
 #     limited and drops below its detection floor). NOT a churn lever — turnover was
 #     ~flat under the overlay (smoothing already owns turnover). See sweep CLI
 #     `--knife-sweep` / `--knife-lambda` and `knife-overlay-falling-knife` memo.
+#   - 6M max_train_months=60: rolling-60 window PROMOTED (2026-06-09, 8-seed walk-
+#     forward, SECB). Focuses training on the most recent ~5 years, improving
+#     ICIR by reducing influence of structurally stale 2010–2016 data:
+#         6M: SECB IC +0.0474→+0.0556, ICIR 0.443→0.493 (+11.3%), t_block
+#             +2.12→+2.36, turnover flat. Clearly clears the +10% bar.
+#     3M/1Y left on expanding window: 3M +4.1% (below bar), 1Y −14.7% (kill —
+#     long-horizon regime memory matters more than regime recency at 1Y).
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
     "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM,
                       smooth_span=3, knife_lambda=0.20),
-    "6M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE),
+    "6M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE,
+                      max_train_months=60),
     "1Y": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
 }
 
@@ -326,6 +341,33 @@ def rank_normalize_features(
     return out
 
 
+def add_knife_score_feature(panel):
+    """Add `knife_score` column from rank-normalized price features.
+
+    Must be called AFTER `rank_normalize_features` (inputs are in [-1, 1]).
+    Byte-identical math to `_knife_components`: maps each input to [0, 1] via
+    (x+1)/2, then knife_score = vol_p * (1 - mean(trend_p, dlow_p)).
+    High only for names that are BOTH high-vol AND downtrending (below-200d-MA /
+    near-52w-low). NaN rows are neutralized to the per-date cross-section median
+    so no name is penalized for a missing price feature. The result is already in
+    [0, 1] within each date so it is NOT re-run through rank_normalize_features.
+    """
+    needed = {"vol_120d", "ma_gap_200", "dist_low_252"}
+    out = panel.copy()
+    if not needed.issubset(out.columns):
+        out["knife_score"] = 0.5
+        return out
+    to01 = lambda x: (x.astype(float) + 1.0) / 2.0
+    vol_p = to01(out["vol_120d"])
+    downtrend_p = 1.0 - (to01(out["ma_gap_200"]) + to01(out["dist_low_252"])) / 2.0
+    knife = (vol_p * downtrend_p).clip(0.0, 1.0)
+    if knife.isna().any():
+        med = knife.groupby(out["date"]).transform("median")
+        knife = knife.fillna(med).fillna(0.5)
+    out["knife_score"] = knife.astype(float)
+    return out
+
+
 def apply_target_modes(
     panel,
     n_buckets: int = 5,
@@ -392,6 +434,25 @@ def apply_target_modes(
         else:
             out[f"y_{h}_sector_return"] = valid
 
+        # --- Vol-scaled sector-relative target (lever 1, 6M-focused) ---
+        # Homoskedasticize label noise + shrink high-vol labels by dividing by
+        # raw realized vol. Floor the denominator at the per-date 20th percentile
+        # (PIT-safe: same-date cross-section only) so low-vol names are not
+        # inflated; no cap on the top so high-vol labels are genuinely shrunk.
+        # Requires `vol_120d_raw` stashed in prepare_panel before rank-normalization.
+        # Falls back to `sector_return` when the column is absent (direct callers
+        # of apply_target_modes in tests, or older inference paths).
+        if "vol_120d_raw" in out.columns:
+            vol = out["vol_120d_raw"].astype(float)
+            floor = vol.groupby(out["date"]).transform(
+                lambda s: np.nanpercentile(s, 20)
+            )
+            out[f"y_{h}_sector_return_vol"] = (
+                out[f"y_{h}_sector_return"] / np.maximum(vol, floor).clip(lower=1e-4)
+            )
+        else:
+            out[f"y_{h}_sector_return_vol"] = out[f"y_{h}_sector_return"]
+
         # --- Beta-residual target (test-4 phase 4) ---
         # If beta or market_r_h is missing for a row we deliberately emit NaN
         # rather than passing through `valid` — silently substituting the
@@ -448,12 +509,22 @@ def prepare_panel(
     medians = cross_sectional_medians(frames)
     panel = demean_cross_sectional(panel, medians)
     panel = add_industry_neutral_momentum(panel, min_group_size=min_group_size)
+    # Stash raw vol before normalization for the sector_return_vol target.
+    if "vol_120d" in panel.columns:
+        panel["vol_120d_raw"] = panel["vol_120d"].astype(float)
+    # knife_score is computed post-normalization from the [-1,1] inputs and is
+    # already [0,1] within-date — exclude it from the normalization step.
+    base_cols = rank_cols or FEATURE_COLS
+    norm_cols = [c for c in base_cols if c != "knife_score"]
     panel = rank_normalize_features(
         panel,
-        cols=rank_cols or FEATURE_COLS,
+        cols=norm_cols,
         industry_relative=industry_relative,
         min_group_size=min_group_size,
     )
+    # Add knife_score if requested (knife_score in base_cols means --with-knife-feature).
+    if "knife_score" in base_cols:
+        panel = add_knife_score_feature(panel)
     market_horizon_returns = build_market_horizon_returns(market_returns, grid)
     panel = apply_target_modes(
         panel, n_buckets, market_horizon_returns=market_horizon_returns
@@ -1401,6 +1472,12 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(LOTTERY_FEATURES)
     if args.with_microstructure:
         cols += list(MICROSTRUCTURE_FEATURES)
+    if args.with_eps_dispersion:
+        cols += list(EPS_DISPERSION_FEATURES)
+    if args.with_short_interest:
+        cols += list(SHORT_INTEREST_FEATURES)
+    if args.with_knife_feature:
+        cols += list(KNIFE_FEATURES)
     # De-dupe while preserving order.
     seen: set[str] = set()
     out: list[str] = []
@@ -1665,11 +1742,13 @@ def main() -> None:
     p.add_argument("--min-names", type=int, default=30, help="skip thinner test cross-sections")
     p.add_argument("--target", default="return",
                    choices=["return", "rank", "quantile", "sector_return",
-                            "beta_resid", "beta_sector_resid"],
+                            "sector_return_vol", "beta_resid", "beta_sector_resid"],
                    help="training target transform (scoring is always vs realized "
                         "universe-demeaned return; sector_return / beta_resid / "
-                        "beta_sector_resid are alpha-residual modes — the last "
-                        "strips both market beta and sector tilt)")
+                        "beta_sector_resid are alpha-residual modes; "
+                        "sector_return_vol divides sector_return by raw vol_120d "
+                        "floored at the per-date 20th pct — homoskedasticizes label "
+                        "noise and shrinks high-vol labels, goal A + B lever)")
     p.add_argument(
         "--n-buckets", type=int, default=5,
         help="equal-count buckets for --target quantile",
@@ -1711,7 +1790,7 @@ def main() -> None:
                         "--smooth-span.")
     p.add_argument("--target-blend", default=None,
                    choices=["return", "rank", "quantile", "sector_return",
-                            "beta_resid", "beta_sector_resid"],
+                            "sector_return_vol", "beta_resid", "beta_sector_resid"],
                    help="alternate training target to rank-ensemble with --target: "
                         "fits a SECOND walk-forward on this target and averages the "
                         "per-date percentile ranks (decorrelated label errors → lower "
@@ -1762,6 +1841,23 @@ def main() -> None:
                    help="add microstructure / higher-moment pack (ret_skew_120d, "
                         "downside_vol_ratio_120d, amihud_illiq_60d, turnover_60d, "
                         "efficiency_ratio_120d) — decorrelated 6M candidate (price/volume)")
+    p.add_argument("--with-eps-dispersion", action="store_true",
+                   help="add EPS estimate dispersion pack (eps_dispersion = "
+                        "eps_std_dev / |eps_mean|) — Diether-Malloy-Scherbina 2002 "
+                        "short-selling-constraint proxy; expected NEGATIVE loading; "
+                        "requires analyst_estimates.eps_std_dev populated via "
+                        "backfill_estimates.py after migration 008")
+    p.add_argument("--with-short-interest", action="store_true",
+                   help="add FINRA short interest pack (short_ratio = days-to-cover "
+                        "from bimonthly Reg SHO files); requires migration 009 + "
+                        "backfill_short_interest.py")
+    p.add_argument("--with-knife-feature", action="store_true",
+                   help="add knife_score as a training feature (vol_p × downtrend_p "
+                        "in [0,1], computed from rank-normalized vol_120d/ma_gap_200/"
+                        "dist_low_252); lets the GBDT learn conditional demotion of "
+                        "high-vol-AND-falling names instead of the overlay's "
+                        "unconditional rank penalty — lever 2 for 6M falling-knife "
+                        "reduction")
     p.add_argument("--feature-diagnostics", action="store_true",
                    help="vet the opted-in pack features (--with-*) for decorrelation vs "
                         "the book + standalone within-sector IC + a consolidation "

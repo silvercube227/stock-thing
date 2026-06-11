@@ -35,10 +35,12 @@ def _estimates_context_asof(
     keys = ("rec_mean_level", "rec_rev_30d", "rec_rev_90d", "price_target_mean",
             "price_target_rev_90d", "forward_earnings_yield", "forward_ebitda_yield",
             "revenue_surprise", "eps_surprise",
-            "eps_est_rev_30d", "eps_est_rev_90d", "coverage_chg_90d", "pt_num_estimates")
+            "eps_est_rev_30d", "eps_est_rev_90d", "coverage_chg_90d", "pt_num_estimates",
+            "eps_dispersion")
 
     snap_fields = ("rec_mean", "price_target_mean", "eps_mean",
-                   "fwd_pe", "fwd_ev_ebitda", "num_analysts", "pt_num_estimates")
+                   "fwd_pe", "fwd_ev_ebitda", "num_analysts", "pt_num_estimates",
+                   "eps_std_dev")
     series: dict[str, tuple[list, list]] = {f: ([], []) for f in snap_fields}
     for r in sorted(est_rows or [], key=lambda r: _as_date(r["as_of_date"])):
         d = _as_date(r["as_of_date"])
@@ -100,6 +102,14 @@ def _estimates_context_asof(
         out["eps_est_rev_90d"].append(pct_rev("eps_mean", d, 90))
         out["coverage_chg_90d"].append((na - na90) if na is not None and na90 is not None else 0.0)
         out["pt_num_estimates"].append(ptn if ptn is not None else 0.0)
+        # DMS dispersion: eps_std_dev / max(|eps_mean|, 0.01). Near-zero eps_mean
+        # makes the ratio unstable; we zero the feature rather than extrapolate.
+        eps_m = asof("eps_mean", d)
+        eps_s = asof("eps_std_dev", d)
+        if eps_s is not None and eps_m is not None and abs(eps_m) >= 0.01:
+            out["eps_dispersion"].append(float(eps_s) / abs(float(eps_m)))
+        else:
+            out["eps_dispersion"].append(0.0)
     return out
 
 

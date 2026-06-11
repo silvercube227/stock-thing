@@ -1418,3 +1418,202 @@ def test_prepare_panel_end_to_end_on_frames():
     # Rank-normalized features stay in range.
     for c in FEATURE_COLS:
         assert panel[c].min() >= -1.0001 and panel[c].max() <= 1.0001
+
+
+# =============================================================
+# Lever 1: sector_return_vol target mode
+# =============================================================
+
+
+def test_sector_return_vol_shrinks_high_vol_labels():
+    # 4 Tech names + 1 Energy; vol_120d_raw varies 10x across the set.
+    # The vol-scaling multiplier is 1/max(vol, floor). The HIGH-vol name (vol=0.50)
+    # has a SMALLER multiplier (=1/0.50=2.0) than the low-vol names (floored at the
+    # 20th-pct = 0.10 → multiplier = 1/0.10 = 10.0). So the high-vol name is
+    # "shrunk" relative to low-vol names — that is the homoskedasticity goal.
+    d = date(2020, 1, 31)
+    df = pd.DataFrame({
+        "date": [d] * 5,
+        "sector": ["Tech"] * 4 + ["Energy"],
+        "vol_120d_raw": [0.50, 0.10, 0.10, 0.10, 0.10],  # first Tech name is 5x more vol
+        "r_1M": [0.10, 0.05, 0.00, -0.05, 0.20],
+        "mask_1M": [True] * 5,
+    })
+    for h in HORIZONS:
+        if f"r_{h}" not in df:
+            df[f"r_{h}"] = 0.0
+        if f"mask_{h}" not in df:
+            df[f"mask_{h}"] = False
+    df["r_1M"] = [0.10, 0.05, 0.00, -0.05, 0.20]
+    df["mask_1M"] = [True] * 5
+
+    out = apply_target_modes(df, sector_min_group_size=4)
+
+    # sector_return_vol must exist and be finite for all rows.
+    assert "y_1M_sector_return_vol" in out.columns
+    assert out["y_1M_sector_return_vol"].notna().all()
+
+    sr = out["y_1M_sector_return"].to_numpy()
+    srv = out["y_1M_sector_return_vol"].to_numpy()
+
+    # The scaling factor for each name is sector_return_vol / sector_return = 1/max(vol,floor).
+    # High-vol name (index 0, vol=0.50) → factor = 1/0.50 = 2.0.
+    # Low-vol names (vol=0.10, floored at 0.10) → factor = 1/0.10 = 10.0.
+    # So the high-vol name has a SMALLER factor: it is shrunk relative to low-vol names.
+    scale = np.where(sr != 0, srv / sr, np.nan)
+    assert scale[0] < scale[1], "high-vol name must have smaller scaling factor"
+
+    # With vol_120d_raw absent the column falls back to sector_return.
+    df_no_vol = df.drop(columns=["vol_120d_raw"])
+    out_no = apply_target_modes(df_no_vol, sector_min_group_size=4)
+    np.testing.assert_array_equal(
+        out_no["y_1M_sector_return_vol"].to_numpy(),
+        out_no["y_1M_sector_return"].to_numpy(),
+    )
+
+
+def test_sector_return_vol_in_target_choices():
+    # _target_col must map sector_return_vol to the right column name.
+    from backend.ml.gbm_baseline import _target_col
+    assert _target_col("6M", "sector_return_vol") == "y_6M_sector_return_vol"
+
+
+# =============================================================
+# Lever 2: knife_score feature (add_knife_score_feature)
+# =============================================================
+
+
+def test_add_knife_score_feature_parity_with_knife_components():
+    # Build a synthetic panel with rank-normalized [-1,1] price features, then
+    # compare add_knife_score_feature output against the scalar formula in
+    # _knife_components. The two paths must produce byte-identical results.
+    from backend.ml.gbm_baseline import _knife_components, add_knife_score_feature
+
+    rng = np.random.default_rng(42)
+    n = 12
+    d = date(2021, 6, 30)
+    df = pd.DataFrame({
+        "date": [d] * n,
+        "vol_120d":   rng.uniform(-1, 1, n),
+        "ma_gap_200": rng.uniform(-1, 1, n),
+        "dist_low_252": rng.uniform(-1, 1, n),
+    })
+    for c in FEATURE_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    out = add_knife_score_feature(df)
+    assert "knife_score" in out.columns
+    ks = out["knife_score"].to_numpy(dtype=float)
+
+    # Manually compute via _knife_components using the same per-row inputs.
+    risk = {
+        "vol":   df["vol_120d"].to_numpy(dtype=float),
+        "trend": df["ma_gap_200"].to_numpy(dtype=float),
+        "dlow":  df["dist_low_252"].to_numpy(dtype=float),
+    }
+    expected, _, _ = _knife_components(risk)
+    np.testing.assert_allclose(ks, expected, rtol=1e-9)
+
+    # knife_score is bounded in [0, 1].
+    assert ks.min() >= 0.0 and ks.max() <= 1.0
+
+
+def test_add_knife_score_feature_high_only_for_knife_corner():
+    # Name A: max vol, max downtrend → score ≈ 1.0.
+    # Name B: max vol but uptrend → score ≈ 0.0.
+    # Name C: min vol but downtrend → score ≈ 0.0.
+    from backend.ml.gbm_baseline import add_knife_score_feature
+
+    d = date(2021, 6, 30)
+    df = pd.DataFrame({
+        "date": [d, d, d],
+        "vol_120d":    [1.0, 1.0, -1.0],
+        "ma_gap_200":  [-1.0, 1.0, -1.0],
+        "dist_low_252": [-1.0, 1.0, -1.0],
+    })
+    for c in FEATURE_COLS:
+        if c not in df.columns:
+            df[c] = 0.0
+
+    out = add_knife_score_feature(df)
+    ks = out["knife_score"].to_numpy(dtype=float)
+    assert ks[0] == pytest.approx(1.0)  # true knife
+    assert ks[1] == pytest.approx(0.0)  # clean uptrend
+    assert ks[2] == pytest.approx(0.0)  # low vol
+
+
+def test_add_knife_score_feature_neutral_fallback_without_price_cols():
+    # When required columns are missing, every name gets a neutral 0.5 score.
+    from backend.ml.gbm_baseline import add_knife_score_feature
+
+    df = pd.DataFrame({"date": [date(2021, 1, 31)] * 3, "some_col": [1.0, 2.0, 3.0]})
+    out = add_knife_score_feature(df)
+    assert "knife_score" in out.columns
+    np.testing.assert_array_equal(out["knife_score"].to_numpy(), [0.5, 0.5, 0.5])
+
+
+def test_prepare_panel_stashes_vol_raw_and_computes_knife_score():
+    # End-to-end: prepare_panel stashes vol_120d_raw (for the sector_return_vol
+    # target) and, when knife_score is in rank_cols, adds it after normalization.
+    from backend.ml.gbm_baseline import KNIFE_FEATURES
+
+    frames = [make_frame(n_days=800, trend=0.0003 * (k + 1), tid=k, vol_seed=k)
+              for k in range(6)]
+    grid = build_calendar_grid(frames)
+
+    # Without knife_score in rank_cols: knife_score should NOT be added.
+    panel_plain = prepare_panel(frames, grid)
+    assert "vol_120d_raw" in panel_plain.columns  # always stashed
+    assert "knife_score" not in panel_plain.columns
+
+    # With knife_score in rank_cols: it should be computed and bounded [0,1].
+    panel_knife = prepare_panel(frames, grid, rank_cols=list(FEATURE_COLS) + list(KNIFE_FEATURES))
+    assert "knife_score" in panel_knife.columns
+    ks = panel_knife["knife_score"].dropna()
+    assert ks.min() >= 0.0 and ks.max() <= 1.0
+    # vol_120d itself is still rank-normalized in [-1,1]; knife_score is not.
+    assert panel_knife["vol_120d"].min() >= -1.0001
+    assert panel_knife["vol_120d"].max() <= 1.0001
+
+
+def test_fit_horizon_models_rolling_window_trims_training_dates():
+    # A HorizonSpec with max_train_months=N should only use the last N monthly
+    # training dates when fitting — earlier rows must be dropped entirely.
+    from backend.ml.gbm_baseline import (
+        HorizonSpec, LGBMConfig, FEATURE_COLS, prepare_panel,
+        build_calendar_grid,
+    )
+    from backend.ml.gbm_inference import fit_horizon_models
+    import copy
+
+    frames = [make_frame(n_days=1800, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(12)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid)
+
+    as_of = sorted(panel["date"].unique())[-1]
+    all_train_dates = sorted(d for d in panel["date"].unique() if d < as_of)
+
+    # Rolling window: use only last 24 monthly dates.
+    window = 24
+    spec_rolling = HorizonSpec(target_mode="sector_return", max_train_months=window)
+    spec_expanding = HorizonSpec(target_mode="sector_return")
+
+    _, windows_rolling, _, _ = fit_horizon_models(
+        panel, {"3M": spec_rolling}, seed=0, as_of=as_of, n_seeds=1
+    )
+    _, windows_expanding, _, _ = fit_horizon_models(
+        panel, {"3M": spec_expanding}, seed=0, as_of=as_of, n_seeds=1
+    )
+
+    # Rolling must have fewer rows than expanding when the panel exceeds the window.
+    assert windows_rolling["3M"]["rows"] < windows_expanding["3M"]["rows"], (
+        "rolling window should train on fewer rows than expanding"
+    )
+    # Rolling must train on at most `window` distinct dates.
+    # (rows can exceed window because multiple tickers per date)
+    rolling_rows = windows_rolling["3M"]["rows"]
+    expanding_rows = windows_expanding["3M"]["rows"]
+    n_tickers = len(frames)
+    assert rolling_rows <= window * n_tickers

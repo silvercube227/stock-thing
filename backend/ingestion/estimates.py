@@ -48,6 +48,8 @@ ESTIMATE_FIELDS = [
     "TR.FwdEVToEBITDA",
     "TR.NumberOfAnalysts",                 # analyst coverage (revision-momentum pack)
     "TR.PriceTargetNumIncEstimates",       # # price-target estimates (revision-momentum pack)
+    "TR.EPSStdDev",                        # EPS estimate std dev (dispersion pack)
+    "TR.EPSNumIncEstimates",               # # EPS estimates included (dispersion pack)
 ]
 
 # Map a returned column's display label (substring, case-insensitive) -> db column.
@@ -55,6 +57,7 @@ ESTIMATE_FIELDS = [
 # trailing qualifiers ("(1-5)", "(Daily Time Series Ratio)"). The EPS labels are
 # best-guesses (Workspace wasn't available when this was added) — re-run
 # scripts/_probe_lseg.py and confirm the printed labels before the first backfill.
+# The eps_dispersion labels are also best-guesses; confirm against probe output.
 COLUMN_MATCHERS: list[tuple[str, str]] = [
     ("recommendation - mean", "rec_mean"),
     ("price target - mean", "price_target_mean"),
@@ -66,10 +69,12 @@ COLUMN_MATCHERS: list[tuple[str, str]] = [
     ("forward p/e", "fwd_pe"),
     ("price target - number of included estimates", "pt_num_estimates"),
     ("number of analysts", "num_analysts"),
+    ("earnings per share - standard deviation", "eps_std_dev"),
+    ("earnings per share - number of included estimates", "eps_num_inc_estimates"),
 ]
 DB_FIELDS = ["rec_mean", "price_target_mean", "revenue_mean",
              "revenue_actual", "eps_mean", "eps_actual", "fwd_pe", "fwd_ev_ebitda",
-             "num_analysts", "pt_num_estimates"]
+             "num_analysts", "pt_num_estimates", "eps_std_dev", "eps_num_inc_estimates"]
 
 
 # =============================================================
@@ -307,20 +312,22 @@ _UPSERT_SQL = """
 insert into analyst_estimates (
     ticker_id, as_of_date, rec_mean, price_target_mean,
     revenue_mean, revenue_actual, eps_mean, eps_actual, fwd_pe, fwd_ev_ebitda,
-    num_analysts, pt_num_estimates, ingested_at
-) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+    num_analysts, pt_num_estimates, eps_std_dev, eps_num_inc_estimates, ingested_at
+) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
 on conflict (ticker_id, as_of_date) do update set
-    rec_mean          = excluded.rec_mean,
-    price_target_mean = excluded.price_target_mean,
-    revenue_mean      = excluded.revenue_mean,
-    revenue_actual    = excluded.revenue_actual,
-    eps_mean          = excluded.eps_mean,
-    eps_actual        = excluded.eps_actual,
-    fwd_pe            = excluded.fwd_pe,
-    fwd_ev_ebitda     = excluded.fwd_ev_ebitda,
-    num_analysts      = excluded.num_analysts,
-    pt_num_estimates  = excluded.pt_num_estimates,
-    ingested_at       = now()
+    rec_mean              = excluded.rec_mean,
+    price_target_mean     = excluded.price_target_mean,
+    revenue_mean          = excluded.revenue_mean,
+    revenue_actual        = excluded.revenue_actual,
+    eps_mean              = excluded.eps_mean,
+    eps_actual            = excluded.eps_actual,
+    fwd_pe                = excluded.fwd_pe,
+    fwd_ev_ebitda         = excluded.fwd_ev_ebitda,
+    num_analysts          = excluded.num_analysts,
+    pt_num_estimates      = excluded.pt_num_estimates,
+    eps_std_dev           = excluded.eps_std_dev,
+    eps_num_inc_estimates = excluded.eps_num_inc_estimates,
+    ingested_at           = now()
 """
 
 
@@ -330,7 +337,8 @@ async def _upsert_estimates(conn: asyncpg.Connection, rows: list[dict]) -> int:
     payload = [
         (r["ticker_id"], r["as_of_date"], r["rec_mean"], r["price_target_mean"],
          r["revenue_mean"], r["revenue_actual"], r["eps_mean"], r["eps_actual"],
-         r["fwd_pe"], r["fwd_ev_ebitda"], r["num_analysts"], r["pt_num_estimates"])
+         r["fwd_pe"], r["fwd_ev_ebitda"], r["num_analysts"], r["pt_num_estimates"],
+         r.get("eps_std_dev"), r.get("eps_num_inc_estimates"))
         for r in rows
     ]
     async with conn.transaction():

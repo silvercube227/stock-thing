@@ -55,6 +55,19 @@ FIELD_GROUPS: dict[str, list[str]] = {
         "TR.FwdEVToEBITDA", "TR.EVToEBITDAFwd", "TR.EVToEBITDANTM",
         "TR.EVToEBITDASmartEst", "TR.EBITDAMean",
     ],
+    # Lever 3 (probe-only): EPS estimate dispersion / analyst disagreement.
+    # Diether-Malloy-Scherbina (2002): higher EPS forecast dispersion is a
+    # short-selling proxy (short-side constrained from selling most disagreed-on
+    # names) → NEGATIVE forward return. Cross-check: EPSNumIncEstimates validates
+    # that StdDev and IncEstimates fields are available and linked to the same
+    # consensus. Outcome (resolves + history ≥ 2018) decides whether lever 3
+    # enters the next pass.
+    "eps_dispersion": [
+        "TR.EPSStdDev",
+        "TR.EPSNumIncEstimates",
+        "TR.EPSMeanEstimate",   # cross-check vs quarterly EPSMean
+        "TR.NumberOfAnalysts",
+    ],
 }
 
 # A group is "TRAINABLE" only if at least one field has history this far back.

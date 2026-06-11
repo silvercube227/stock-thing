@@ -12,7 +12,7 @@ from backend.ml.dataset import TickerFrame, _as_date, compute_targets
 from backend.ml.factors.constants import EARNINGS_REACTION_FEATURES, FUNDAMENTAL_FEATURES
 from backend.ml.factors.estimates import _earnings_reaction_asof, _estimates_context_asof
 from backend.ml.factors.fundamentals import _fundamental_context_asof
-from backend.ml.factors.price import _price_features
+from backend.ml.factors.price import _price_features, _short_interest_asof
 from backend.ml.factors.util import _safe_ratio
 from backend.ml.features import (
     SEQUENCE_LENGTH,
@@ -130,6 +130,7 @@ def build_ticker_rows(
         market_returns,
     )
     est_ctx = _estimates_context_asof(frame.estimates or [], frame.surprises or [], bar_dates)
+    si_ctx = _short_interest_asof(frame.short_interest or [], bar_dates)
 
     rows: list[dict] = []
     for j, (g, pos, _bd) in enumerate(entries):
@@ -185,6 +186,8 @@ def build_ticker_rows(
         feats["industry_neutral_mom_12_1"] = feats["mom_12_1"]
         feats["sentiment_7d"] = float(sent[j, 0])
         feats["sentiment_14d"] = float(sent[j, 1])
+        feats["eps_dispersion"] = est_ctx["eps_dispersion"][j]
+        feats["short_ratio"] = si_ctx["short_ratio"][j]
         _labels, returns, mask = compute_targets(adj_close, pos)
         row = {
             "date": g,

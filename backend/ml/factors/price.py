@@ -171,3 +171,49 @@ def _price_features(
             n_monthly += 1
     feats["mom_consistency_6m"] = float(monthly_pos / n_monthly) if n_monthly else 0.0
     return feats
+
+
+def _short_interest_asof(
+    si_rows: list[dict], as_of_dates: list
+) -> dict[str, list[float]]:
+    """Point-in-time short interest features for each as-of date.
+
+    Looks up the most recent `short_interest` row whose `publication_date` is
+    <= the as-of date. Returns two features:
+      short_ratio    — short_interest / avg_daily_volume (= days_to_cover)
+      short_ratio_z  — (currently) alias of short_ratio; placeholder for
+                       cross-sectional z-score if we decide to apply it here
+
+    Gaps (no publication yet, or missing fields) → 0.0.
+    """
+    import bisect
+    from backend.ml.dataset import _as_date
+
+    keys = ("short_ratio",)
+    out: dict[str, list[float]] = {k: [] for k in keys}
+    if not si_rows:
+        for _ in as_of_dates:
+            out["short_ratio"].append(0.0)
+        return out
+
+    sorted_rows = sorted(si_rows, key=lambda r: _as_date(r["publication_date"]))
+    pub_dates = [_as_date(r["publication_date"]) for r in sorted_rows]
+
+    for d in as_of_dates:
+        d = _as_date(d)
+        i = bisect.bisect_right(pub_dates, d) - 1
+        if i < 0:
+            out["short_ratio"].append(0.0)
+            continue
+        row = sorted_rows[i]
+        dtc = row.get("days_to_cover")
+        si = row.get("short_interest")
+        adv = row.get("avg_daily_volume")
+        # Prefer the stored days_to_cover; fall back to computing it.
+        if dtc is not None and dtc > 0:
+            out["short_ratio"].append(float(dtc))
+        elif si is not None and adv is not None and adv > 0:
+            out["short_ratio"].append(float(si) / float(adv))
+        else:
+            out["short_ratio"].append(0.0)
+    return out
