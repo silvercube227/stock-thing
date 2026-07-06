@@ -109,6 +109,23 @@ EPS_DISPERSION_FEATURES = ["eps_dispersion"]
 # further squeeze risk. PIT-safe on publication_date (~14d after settlement).
 # Requires short_interest table (migration 009) + backfill_short_interest.py.
 SHORT_INTEREST_FEATURES = ["short_ratio"]
+# Insider transactions (Cohen-Malloy-Pomorski 2012): open-market insider buying
+# predicts positive abnormal returns. insider_net_buy_6m = signed P/S dollar flow
+# (183d) scaled by market cap; insider_buyers_90d = distinct-insider cluster-buy
+# breadth (90d); insider_net_ratio_12m = scale-free (buy-sell)/(buy+sell) value (365d).
+# PIT-safe on filing_date. Requires insider_transactions (migration 010) + backfill.
+INSIDER_FEATURES = [
+    "insider_net_buy_6m", "insider_buyers_90d", "insider_net_ratio_12m",
+]
+# Cross-sectional seasonality (Heston-Sadka 2008): same-calendar-month return
+# persistence. For the UPCOMING calendar month, `seasonal_same_month_5y` is the
+# mean of the ticker's own historical returns in that month (<=5y), `..._other`
+# the mean of the other months, and `..._gap` their difference (the promotable
+# differential factor). PIT-safe: only completed months strictly before the bar's
+# month are used (nearest same-month obs is ~11 months back, no forward overlap).
+SEASONALITY_FEATURES = [
+    "seasonal_same_month_5y", "seasonal_other_month_5y", "seasonal_gap_5y",
+]
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
 # EXPERIMENTAL_FEATURES: per-ticker features produced by build_ticker_rows (eligible for
@@ -120,6 +137,7 @@ EXPERIMENTAL_FEATURES = (
     + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + EPS_SURPRISE_FEATURES
     + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES + LOTTERY_FEATURES
     + MICROSTRUCTURE_FEATURES + EPS_DISPERSION_FEATURES + SHORT_INTEREST_FEATURES
+    + SEASONALITY_FEATURES + INSIDER_FEATURES
     # KNIFE_FEATURES intentionally excluded — panel-level, not in build_ticker_rows
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /

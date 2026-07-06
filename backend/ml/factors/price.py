@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 
 import numpy as np
@@ -171,6 +172,81 @@ def _price_features(
             n_monthly += 1
     feats["mom_consistency_6m"] = float(monthly_pos / n_monthly) if n_monthly else 0.0
     return feats
+
+
+def _seasonality_asof(
+    adj_close: list[float | None],
+    trade_dates: list,
+    bar_positions: list[int],
+    years: int = 5,
+    min_same_obs: int = 3,
+    min_other_obs: int = 24,
+) -> dict[str, list[float]]:
+    """Cross-sectional seasonality (Heston-Sadka 2008) for each bar position.
+
+    For the UPCOMING calendar month (the month AFTER the bar's month, i.e. the
+    first month the forward return spans), compares the ticker's own historical
+    returns in that calendar month vs the other months:
+      seasonal_same_month_5y  = mean of the target month's returns (<=`years` obs)
+      seasonal_other_month_5y = mean of the other months' returns in the window
+      seasonal_gap_5y         = same − other (the promotable differential factor)
+
+    PIT-safe: only monthly returns of completed calendar months STRICTLY BEFORE the
+    bar's month are used, so the current (partial) month and everything forward are
+    excluded — the nearest same-month observation is ~11 months back, no overlap
+    with the forward window. Insufficient history → 0.0 (codebase convention: new
+    names tie mid-rank after cross-sectional normalization).
+
+    The ticker's month-end series and monthly returns are precomputed ONCE; each bar
+    is an O(window) slice, not an O(len(prices)) rescan.
+    """
+    keys = ("seasonal_same_month_5y", "seasonal_other_month_5y", "seasonal_gap_5y")
+    out: dict[str, list[float]] = {k: [] for k in keys}
+
+    # Month-end close per (year, month), in chronological order. The last bar seen
+    # in a calendar month overwrites earlier ones, so we keep that month's last close.
+    month_end: list[list] = []  # [(year, month), close]
+    last_key = None
+    for d, c in zip(trade_dates, adj_close):
+        if c is None or c <= 0:
+            continue
+        k = (d.year, d.month)
+        if k != last_key:
+            month_end.append([k, float(c)])
+            last_key = k
+        else:
+            month_end[-1][1] = float(c)
+
+    # Monthly log return tagged by the END month (year, month). Chronological, so the
+    # key list is sorted and bisectable.
+    mret_keys: list[tuple[int, int]] = []
+    mret_vals: list[float] = []
+    for i in range(1, len(month_end)):
+        (_kp, cp), (kc, cc) = month_end[i - 1], month_end[i]
+        if cp > 0 and cc > 0:
+            mret_keys.append(kc)
+            mret_vals.append(math.log(cc / cp))
+
+    window = years * 12
+    for pos in bar_positions:
+        d = trade_dates[pos]
+        bar_key = (d.year, d.month)
+        target_month = (d.month % 12) + 1  # the upcoming calendar month
+        # Strictly-before the bar's month: returns whose end-month < bar_key.
+        idx = bisect.bisect_left(mret_keys, bar_key)
+        lo = max(0, idx - window)
+        same = [mret_vals[i] for i in range(lo, idx) if mret_keys[i][1] == target_month]
+        other = [mret_vals[i] for i in range(lo, idx) if mret_keys[i][1] != target_month]
+        same = same[-years:]  # at most one obs per year
+        same_val = float(np.mean(same)) if len(same) >= min_same_obs else None
+        other_val = float(np.mean(other)) if len(other) >= min_other_obs else None
+        out["seasonal_same_month_5y"].append(same_val if same_val is not None else 0.0)
+        out["seasonal_other_month_5y"].append(other_val if other_val is not None else 0.0)
+        if same_val is not None and other_val is not None:
+            out["seasonal_gap_5y"].append(same_val - other_val)
+        else:
+            out["seasonal_gap_5y"].append(0.0)
+    return out
 
 
 def _short_interest_asof(
