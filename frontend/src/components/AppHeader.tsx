@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/components/AuthProvider";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 export function AppHeader({ children }: { children?: React.ReactNode }) {
   const { user, signOut } = useAuth();
@@ -12,6 +13,10 @@ export function AppHeader({ children }: { children?: React.ReactNode }) {
     <header className="sticky top-0 z-20 border-b border-border/60 bg-background/85 backdrop-blur-md">
       <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-3.5">
         <div className="flex items-center gap-1">
+          <Link href="/" className="mr-2 flex items-center gap-2" aria-label="Cardinal home">
+            <span className="h-2.5 w-2.5 rounded-full bg-accent" />
+            <span className="text-sm font-semibold tracking-tight text-foreground">Cardinal</span>
+          </Link>
           <Link
             href="/"
             className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
@@ -43,6 +48,7 @@ export function AppHeader({ children }: { children?: React.ReactNode }) {
           <button onClick={signOut} className="transition-colors hover:text-foreground">
             Sign out
           </button>
+          <ThemeToggle />
         </div>
       </div>
     </header>

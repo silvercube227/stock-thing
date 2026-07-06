@@ -145,7 +145,7 @@ export function AddTickerControl({
               <button
                 onClick={addNew}
                 disabled={adding}
-                className="mt-2 w-full rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-background transition-opacity hover:opacity-90 disabled:opacity-40"
+                className="mt-2 w-full rounded-lg bg-accent px-3 py-2 text-xs font-semibold text-on-accent transition-opacity hover:opacity-90 disabled:opacity-40"
               >
                 {adding ? "Queuing…" : `Add & score "${query.trim().toUpperCase()}" (off-index)`}
               </button>
@@ -178,7 +178,7 @@ export function AddTickerControl({
         <button
           onClick={submit}
           disabled={!selected || !shares || busy}
-          className="rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-background transition-opacity hover:opacity-90 disabled:opacity-30"
+          className="rounded-xl bg-accent px-5 py-2.5 text-sm font-semibold text-on-accent transition-opacity hover:opacity-90 disabled:opacity-30"
         >
           {busy ? "…" : "Add"}
         </button>

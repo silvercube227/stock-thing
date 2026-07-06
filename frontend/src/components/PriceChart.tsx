@@ -10,8 +10,17 @@ import {
   type ISeriesApi,
 } from "lightweight-charts";
 import type { PricePoint } from "@/lib/api";
+import { useTheme } from "@/components/ThemeProvider";
 
 export type ChartMode = "area" | "candles";
+
+// Resolve a theme design token to its concrete color so the chart (which can't use
+// CSS utilities) matches light/dark. Falls back to a sane dark value off-DOM.
+function cssVar(name: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
 
 export function PriceChart({
   data,
@@ -23,50 +32,59 @@ export function PriceChart({
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Area"> | ISeriesApi<"Candlestick"> | null>(null);
+  const { theme } = useTheme();
 
-  // Recreate the chart + series when the series type (mode) changes; the data
-  // effect below repopulates it.
+  // Recreate the chart + series when the series type (mode) OR the theme changes;
+  // the data effect below repopulates it. Colors are read from the CSS tokens so
+  // they track light/dark.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+
+    const accent = cssVar("--color-accent", "#e11d48");
+    const grid = cssVar("--color-surface-2", "#1e0f1b");
+    const border = cssVar("--color-border", "#331823");
+    const text = cssVar("--color-faint", "#6e4c5c");
+    const up = cssVar("--color-up", "#10b981");
+    const down = cssVar("--color-down", "#fb7185");
 
     const chart = createChart(el, {
       width: el.clientWidth,
       height: 300,
       layout: {
         background: { type: ColorType.Solid, color: "transparent" },
-        textColor: "#384d6e",
+        textColor: text,
         fontFamily: "var(--font-geist-mono), monospace",
         attributionLogo: false,
       },
       grid: {
         vertLines: { visible: false },
-        horzLines: { color: "#0d1829" },
+        horzLines: { color: grid },
       },
-      rightPriceScale: { borderColor: "#162038" },
-      timeScale: { borderColor: "#162038", fixLeftEdge: true, fixRightEdge: true },
+      rightPriceScale: { borderColor: border },
+      timeScale: { borderColor: border, fixLeftEdge: true, fixRightEdge: true },
       crosshair: {
-        horzLine: { labelBackgroundColor: "#38bdf8" },
-        vertLine: { labelBackgroundColor: "#38bdf8" },
+        horzLine: { labelBackgroundColor: accent },
+        vertLine: { labelBackgroundColor: accent },
       },
     });
 
     const series =
       mode === "candles"
         ? chart.addSeries(CandlestickSeries, {
-            upColor: "#22c55e",
-            downColor: "#ef4444",
-            borderUpColor: "#22c55e",
-            borderDownColor: "#ef4444",
-            wickUpColor: "#22c55e",
-            wickDownColor: "#ef4444",
+            upColor: up,
+            downColor: down,
+            borderUpColor: up,
+            borderDownColor: down,
+            wickUpColor: up,
+            wickDownColor: down,
             priceLineVisible: false,
           })
         : chart.addSeries(AreaSeries, {
-            lineColor: "#38bdf8",
+            lineColor: accent,
             lineWidth: 2,
-            topColor: "rgba(56, 189, 248, 0.20)",
-            bottomColor: "rgba(56, 189, 248, 0.01)",
+            topColor: `${accent}33`,
+            bottomColor: `${accent}03`,
             priceLineVisible: false,
           });
 
@@ -84,7 +102,7 @@ export function PriceChart({
       chartRef.current = null;
       seriesRef.current = null;
     };
-  }, [mode]);
+  }, [mode, theme]);
 
   useEffect(() => {
     const series = seriesRef.current;
@@ -108,7 +126,7 @@ export function PriceChart({
       );
     }
     chartRef.current?.timeScale().fitContent();
-  }, [data, mode]);
+  }, [data, mode, theme]);
 
   return <div ref={containerRef} className="w-full" />;
 }
