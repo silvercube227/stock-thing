@@ -77,6 +77,8 @@ class TickerFrame:
     surprises: list[dict] | None = None
     # short_interest rows (publication_date PIT); None when table not yet populated.
     short_interest: list[dict] | None = None
+    # insider_transactions rows (filing_date PIT); None tolerates older pickled caches.
+    insiders: list[dict] | None = None
 
 
 @dataclass
@@ -431,6 +433,15 @@ select ticker_id, settlement_date, publication_date,
  order by ticker_id, publication_date
 """
 
+_INSIDER_SQL = """
+select ticker_id, accession_number, transaction_idx, insider_cik,
+       is_officer, is_director, is_ten_pct_owner, filing_date,
+       transaction_code, shares, price_per_share, value
+  from insider_transactions
+ where ticker_id = any($1::bigint[])
+ order by ticker_id, filing_date
+"""
+
 
 async def _fetch_chunked(pool, sql: str, ids: list[int], chunk: int = 100) -> list:
     """Run an `ids = any($1)` query in ticker-id batches and concatenate results.
@@ -482,6 +493,12 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
         si_rows = await _fetch_chunked(pool, _SI_SQL, ids)
     except Exception:  # noqa: BLE001 — table may not exist yet
         si_rows = []
+    # insider_transactions is optional (migration 010). Tolerate its absence so
+    # existing load_frames callers work before the migration is applied.
+    try:
+        ins_rows = await _fetch_chunked(pool, _INSIDER_SQL, ids)
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        ins_rows = []
 
     by_ticker_prices = _group(price_rows)
     by_ticker_fund = _group(fund_rows)
@@ -489,6 +506,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     by_ticker_est = _group(est_rows)
     by_ticker_surprise = _group(surprise_rows)
     by_ticker_si = _group(si_rows)
+    by_ticker_ins = _group(ins_rows)
 
     frames: list[TickerFrame] = []
     for r in ticker_rows:
@@ -507,6 +525,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 estimates=by_ticker_est.get(tid, []),
                 surprises=by_ticker_surprise.get(tid, []),
                 short_interest=by_ticker_si.get(tid, []),
+                insiders=by_ticker_ins.get(tid, []),
             )
         )
     return frames

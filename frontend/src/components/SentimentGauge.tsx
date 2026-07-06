@@ -6,7 +6,7 @@ function tone(v: number | null | undefined) {
   if (v == null) return { label: "No data", text: "text-muted", dot: "bg-muted" };
   if (v > 0.05) return { label: "Positive", text: "text-up", dot: "bg-up" };
   if (v < -0.05) return { label: "Negative", text: "text-down", dot: "bg-down" };
-  return { label: "Neutral", text: "text-accent", dot: "bg-accent" };
+  return { label: "Neutral", text: "text-muted", dot: "bg-muted" };
 }
 
 export function SentimentGauge({ s }: { s: SentimentSnapshot | null }) {

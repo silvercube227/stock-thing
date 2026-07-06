@@ -12,7 +12,12 @@ from backend.ml.dataset import TickerFrame, _as_date, compute_targets
 from backend.ml.factors.constants import EARNINGS_REACTION_FEATURES, FUNDAMENTAL_FEATURES
 from backend.ml.factors.estimates import _earnings_reaction_asof, _estimates_context_asof
 from backend.ml.factors.fundamentals import _fundamental_context_asof
-from backend.ml.factors.price import _price_features, _short_interest_asof
+from backend.ml.factors.insiders import _insider_context_asof
+from backend.ml.factors.price import (
+    _price_features,
+    _seasonality_asof,
+    _short_interest_asof,
+)
 from backend.ml.factors.util import _safe_ratio
 from backend.ml.features import (
     SEQUENCE_LENGTH,
@@ -131,6 +136,8 @@ def build_ticker_rows(
     )
     est_ctx = _estimates_context_asof(frame.estimates or [], frame.surprises or [], bar_dates)
     si_ctx = _short_interest_asof(frame.short_interest or [], bar_dates)
+    season_ctx = _seasonality_asof(adj_close, trade_dates, bar_positions)
+    ins_ctx = _insider_context_asof(getattr(frame, "insiders", None) or [], bar_dates)
 
     rows: list[dict] = []
     for j, (g, pos, _bd) in enumerate(entries):
@@ -188,6 +195,14 @@ def build_ticker_rows(
         feats["sentiment_14d"] = float(sent[j, 1])
         feats["eps_dispersion"] = est_ctx["eps_dispersion"][j]
         feats["short_ratio"] = si_ctx["short_ratio"][j]
+        feats["seasonal_same_month_5y"] = season_ctx["seasonal_same_month_5y"][j]
+        feats["seasonal_other_month_5y"] = season_ctx["seasonal_other_month_5y"][j]
+        feats["seasonal_gap_5y"] = season_ctx["seasonal_gap_5y"][j]
+        # Insider net-buy dollars scaled by market cap (valuation-feature convention);
+        # the breadth count and net ratio are already scale-free.
+        feats["insider_net_buy_6m"] = _safe_ratio(ins_ctx["net_buy_value_6m"][j], market_cap)
+        feats["insider_buyers_90d"] = ins_ctx["insider_buyers_90d"][j]
+        feats["insider_net_ratio_12m"] = ins_ctx["insider_net_ratio_12m"][j]
         _labels, returns, mask = compute_targets(adj_close, pos)
         row = {
             "date": g,

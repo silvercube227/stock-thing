@@ -48,12 +48,14 @@ from backend.ml.gbm_baseline import (
     PRODUCTION_HORIZON_SPECS,
     HorizonSpec,
     LGBMConfig,
+    assert_winsorizable_target,
     blend_gbdt_linear,
     fit_linear_model,
     fit_lgbm_model,
     knife_overlay_ranks,
     knife_tier,
     prepare_panel,
+    winsorize_by_date,
 )
 
 # Rank-normalized risk features the falling-knife overlay consumes (present on the
@@ -124,16 +126,28 @@ def fit_horizon_models(
             raise ValueError(
                 f"no labeled training rows for {h} target={spec.target_mode}"
             )
+        # Per-date winsorization of the training label (scoring is unaffected —
+        # it ranks the model output). Clip the retained training rows per date.
+        fit_col = t_col
+        wpct = getattr(spec, "winsorize_pct", 0.0)
+        if wpct and wpct > 0:
+            assert_winsorizable_target(spec.target_mode)
+            fit_col = f"{t_col}__wins"
+            train = train.assign(**{
+                fit_col: winsorize_by_date(
+                    train[t_col].to_numpy(dtype=float), train["date"].to_numpy(), wpct
+                )
+            })
         models[h] = [
             fit_lgbm_model(
-                train, t_col, spec.lgb_cfg, seed=seed + i + s * 997, shuffle=False, feature_cols=cols
+                train, fit_col, spec.lgb_cfg, seed=seed + i + s * 997, shuffle=False, feature_cols=cols
             )
             for s in range(max(1, n_seeds))
         ]
         if getattr(spec, "linear_blend", 0.0) > 0:
             linear_models[h] = (
                 fit_linear_model(
-                    train, t_col, feature_cols=cols, alpha=spec.ridge_alpha, seed=seed + i
+                    train, fit_col, feature_cols=cols, alpha=spec.ridge_alpha, seed=seed + i
                 ),
                 float(spec.linear_blend),
             )
@@ -395,6 +409,7 @@ def _specs_from_serialized(serialized: dict) -> dict[str, HorizonSpec]:
             smooth_span=d.get("smooth_span", 0),
             knife_lambda=d.get("knife_lambda", 0.0),
             max_train_months=d.get("max_train_months", None),
+            winsorize_pct=d.get("winsorize_pct", 0.0),
         )
     return out
 
@@ -443,6 +458,7 @@ def _serialize_spec(spec: HorizonSpec) -> dict:
         "smooth_span": getattr(spec, "smooth_span", 0),
         "knife_lambda": getattr(spec, "knife_lambda", 0.0),
         "max_train_months": getattr(spec, "max_train_months", None),
+        "winsorize_pct": getattr(spec, "winsorize_pct", 0.0),
     }
 
 

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/components/AuthProvider";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -47,11 +48,17 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex flex-1 items-center justify-center px-6">
+    <div className="relative flex flex-1 items-center justify-center px-6">
+      <div className="absolute right-5 top-5">
+        <ThemeToggle />
+      </div>
       <div className="w-full max-w-sm">
-        <div className="mb-8 text-center">
-          <h1 className="text-xl font-semibold text-accent">Portfolio</h1>
-          <p className="mt-1 text-sm text-muted">Long-only directional awareness.</p>
+        <div className="mb-8 flex flex-col items-center text-center">
+          <div className="flex items-center gap-2">
+            <span className="h-3 w-3 rounded-full bg-accent" />
+            <h1 className="text-xl font-semibold tracking-tight text-foreground">Cardinal</h1>
+          </div>
+          <p className="mt-1.5 text-sm text-muted">Long-only directional awareness.</p>
         </div>
 
         <form
@@ -106,7 +113,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={busy}
-            className="w-full rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-background transition-opacity hover:opacity-90 disabled:opacity-40"
+            className="w-full rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-on-accent transition-opacity hover:opacity-90 disabled:opacity-40"
           >
             {busy ? "…" : mode === "signin" ? "Sign in" : "Create account"}
           </button>

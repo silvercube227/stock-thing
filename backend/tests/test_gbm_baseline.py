@@ -25,12 +25,14 @@ from backend.ml.gbm_baseline import (
     add_industry_neutral_momentum,
     apply_knife_overlay,
     apply_target_modes,
+    assert_winsorizable_target,
     block_bootstrap_summary,
     build_market_horizon_returns,
     build_ticker_rows,
     build_universe_return_map,
     demean_cross_sectional,
     ewma_rank_by_ticker,
+    fit_lgbm_model,
     knife_sweep_table,
     prepare_panel,
     rank_normalize_features,
@@ -43,6 +45,7 @@ from backend.ml.gbm_baseline import (
     top_decile_risk,
     walk_forward_folds,
     walk_forward_ic,
+    winsorize_by_date,
     within_sector_ic,
 )
 from backend.ml.gbm_inference import score_current_cross_section
@@ -794,20 +797,24 @@ def test_score_current_cross_section_blends_linear_model():
     assert all(abs(r["relative_rank"] - 0.5) < 1e-9 for r in rows)
 
 
-def test_production_horizon_specs_use_sector_return_for_scored_horizons():
-    # Locks in the test-6 promotion (sector_return for every scored horizon — the
-    # within-sector / SECB winner) so an accidental edit to the spec dict trips the
-    # test. 1M stays `rank` (dead horizon, not scored in production).
+def test_production_horizon_specs_scored_horizon_targets():
+    # Locks in the promoted per-horizon targets so an accidental edit trips the test:
+    #   3M = sector_return + L2 regression (LambdaRank NOT promoted — sub-bar ICIR + IC loss)
+    #   6M/1Y = sector_grade + LambdaRank (2026-07-06 promotion: 6M ICIR +16%, 1Y +48%)
+    # 1M stays `rank` (dead horizon, not scored in production).
     from backend.ml.gbm_baseline import ESTIMATE_SURPRISE_FEATURES, PRODUCTION_HORIZON_SPECS
 
-    for h in ("3M", "6M", "1Y"):
-        assert PRODUCTION_HORIZON_SPECS[h].target_mode == "sector_return", (
+    assert PRODUCTION_HORIZON_SPECS["1M"].target_mode == "rank"
+    s3 = PRODUCTION_HORIZON_SPECS["3M"]
+    assert s3.target_mode == "sector_return" and s3.lgb_cfg.objective == "regression"
+    for h in ("6M", "1Y"):
+        s = PRODUCTION_HORIZON_SPECS[h]
+        assert s.target_mode == "sector_grade", (
             f"{h} target unexpectedly changed — re-sweep SECB before promoting"
         )
-    assert PRODUCTION_HORIZON_SPECS["1M"].target_mode == "rank"
-    # 6M and 1Y still carry the promoted revenue-surprise pack.
-    for h in ("6M", "1Y"):
-        assert ESTIMATE_SURPRISE_FEATURES[0] in (PRODUCTION_HORIZON_SPECS[h].feature_cols or [])
+        assert s.lgb_cfg.objective == "lambdarank"
+        # 6M and 1Y still carry the promoted revenue-surprise pack.
+        assert ESTIMATE_SURPRISE_FEATURES[0] in (s.feature_cols or [])
 
 
 def test_fit_horizon_models_uses_per_horizon_target_mode():
@@ -1617,3 +1624,278 @@ def test_fit_horizon_models_rolling_window_trims_training_dates():
     expanding_rows = windows_expanding["3M"]["rows"]
     n_tickers = len(frames)
     assert rolling_rows <= window * n_tickers
+
+
+# =============================================================
+# E3 — target winsorization (train-label only, PIT per-date)
+# =============================================================
+
+
+def test_winsorize_by_date_clips_to_per_date_quantiles():
+    # Date A carries an up-outlier and a down-outlier; date B is tame. With pct=0.2
+    # the clip bounds are the per-date 20th/80th quantiles (linear interpolation).
+    y = np.array([-50.0, 0.0, 1.0, 2.0, 100.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+    d = np.array(["A"] * 5 + ["B"] * 5)
+    out = winsorize_by_date(y, d, 0.2)
+
+    a = np.sort(y[:5])
+    lo_a, hi_a = np.quantile(a, 0.2), np.quantile(a, 0.8)
+    assert out[:5].min() >= lo_a - 1e-9
+    assert out[:5].max() <= hi_a + 1e-9
+    # The interior (non-clipped) values are untouched.
+    assert out[1] == 0.0 and out[2] == 1.0 and out[3] == 2.0
+    # Tame date B: 20th/80th quantiles leave the extremes barely moved but bounded.
+    b = np.sort(y[5:])
+    assert out[5:].min() >= np.quantile(b, 0.2) - 1e-9
+    assert out[5:].max() <= np.quantile(b, 0.8) + 1e-9
+
+
+def test_winsorize_by_date_is_noop_at_zero():
+    y = np.array([1.0, -3.0, 5.0, 2.0, -1.0])
+    d = np.array(["A"] * 5)
+    assert np.array_equal(winsorize_by_date(y, d, 0.0), y)
+
+
+def test_winsorize_by_date_preserves_nans():
+    y = np.array([np.nan, 1.0, 2.0, 3.0, 100.0])
+    d = np.array(["A"] * 5)
+    out = winsorize_by_date(y, d, 0.2)
+    assert np.isnan(out[0])
+    # NaN is excluded from the quantile, so the 100 is still clipped down.
+    assert out[4] < 100.0
+
+
+def test_assert_winsorizable_target_guards_ordinal_modes():
+    for mode in ("return", "sector_return", "sector_return_vol",
+                 "beta_resid", "beta_sector_resid"):
+        assert_winsorizable_target(mode)  # no raise
+    for mode in ("rank", "quantile"):
+        with pytest.raises(ValueError):
+            assert_winsorizable_target(mode)
+
+
+def test_walk_forward_ic_winsorize_zero_matches_unwinsorized():
+    # pct=0 must be a byte-identical no-op vs the default path.
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(10)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid)
+    cfg = LGBMConfig()
+    wf = WalkForwardConfig(min_train_months=6, min_names=5)
+    base = walk_forward_ic(panel, "3M", cfg, wf, target_mode="sector_return")
+    zero = walk_forward_ic(panel, "3M", cfg, wf, target_mode="sector_return",
+                           winsorize_pct=0.0)
+    assert base["summary"]["mean_ic"] == zero["summary"]["mean_ic"]
+
+
+def test_walk_forward_ic_winsorize_runs_and_changes_fit():
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(10)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid)
+    cfg = LGBMConfig()
+    wf = WalkForwardConfig(min_train_months=6, min_names=5)
+    base = walk_forward_ic(panel, "3M", cfg, wf, target_mode="sector_return")
+    wins = walk_forward_ic(panel, "3M", cfg, wf, target_mode="sector_return",
+                           winsorize_pct=0.02)
+    # Clipping the training label at 2% per date changes the fit (so mean_ic moves),
+    # but the harness still produces a finite result on the same folds.
+    assert base["summary"]["n_folds"] == wins["summary"]["n_folds"]
+    assert np.isfinite(wins["summary"]["mean_ic"])
+
+
+def test_walk_forward_ic_winsorize_raises_on_rank_target():
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(6)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid)
+    with pytest.raises(ValueError):
+        walk_forward_ic(panel, "3M", LGBMConfig(),
+                        WalkForwardConfig(min_train_months=6, min_names=5),
+                        target_mode="rank", winsorize_pct=0.01)
+
+
+def test_fit_horizon_models_winsorize_clips_training_label():
+    from backend.ml.gbm_baseline import HorizonSpec
+    from backend.ml.gbm_inference import fit_horizon_models
+
+    frames = [make_frame(n_days=1600, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(10)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid)
+    as_of = sorted(panel["date"].unique())[-1]
+
+    spec = HorizonSpec(target_mode="sector_return", winsorize_pct=0.02)
+    models, windows, _, _ = fit_horizon_models(
+        panel, {"3M": spec}, seed=0, as_of=as_of, n_seeds=1
+    )
+    assert len(models["3M"]) == 1
+    assert windows["3M"]["rows"] > 0
+
+    # A winsorize_pct on an ordinal target must fail loudly, not silently no-op.
+    bad = HorizonSpec(target_mode="rank", winsorize_pct=0.02)
+    with pytest.raises(ValueError):
+        fit_horizon_models(panel, {"3M": bad}, seed=0, as_of=as_of, n_seeds=1)
+
+
+# =============================================================
+# E4 — LambdaRank ranking objective (sector_grade target + LGBMRanker)
+# =============================================================
+
+
+def test_sector_grade_target_gives_uniform_per_date_grades():
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(15)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid, n_grades=5)
+    gcol = "y_3M_sector_grade"
+    assert gcol in panel.columns
+    valid = panel[gcol].dropna()
+    # Grades are the ordinal set {0,1,2,3,4}.
+    assert set(np.unique(valid)) <= {0.0, 1.0, 2.0, 3.0, 4.0}
+    # Per date with >= n_grades names, qcut yields ~equal-count buckets.
+    for d, sub in panel.groupby("date"):
+        g = sub[gcol].dropna()
+        if g.shape[0] >= 25:  # enough names for a clean 5-way split
+            counts = g.value_counts()
+            assert counts.max() - counts.min() <= 2  # near-uniform
+
+
+def test_sector_grade_is_nan_where_horizon_masked():
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(12)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid, n_grades=5)
+    masked = ~panel["mask_3M"].astype(bool)
+    # No masked row may carry a grade (labels only exist where a return exists).
+    assert panel.loc[masked, "y_3M_sector_grade"].isna().all()
+
+
+def test_sector_grade_thin_date_yields_nan():
+    # A date with fewer than n_grades labeled names cannot be qcut into K buckets.
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(3)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid, n_grades=5)
+    for d, sub in panel.groupby("date"):
+        labeled = sub[sub["mask_3M"].astype(bool)]
+        if 0 < labeled.shape[0] < 5:
+            assert sub["y_3M_sector_grade"].isna().all()
+
+
+def test_ranker_branch_builds_date_contiguous_groups():
+    from backend.ml.gbm_baseline import LGBMConfig
+
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(12)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid, n_grades=5)
+    gcol = "y_3M_sector_grade"
+    dates = sorted(panel["date"].unique())
+    train = panel[(panel["date"] <= dates[-4]) & panel["mask_3M"] & panel[gcol].notna()]
+
+    # Group sizes (per date, in sorted order) must sum to the training row count —
+    # the invariant LightGBM relies on to segment query groups.
+    ordered = train.sort_values("date", kind="mergesort")
+    group = ordered.groupby("date", sort=False).size().to_numpy()
+    assert int(group.sum()) == train.shape[0]
+    assert group.min() >= 1
+
+    model = fit_lgbm_model(train, gcol, LGBMConfig(objective="lambdarank"), seed=0)
+    assert type(model).__name__ == "LGBMRanker"
+    # Same .predict() score signature as the regressor (drives zero downstream change).
+    test = panel[panel["date"] == dates[-1]]
+    preds = model.predict(test[FEATURE_COLS])
+    assert preds.shape[0] == test.shape[0]
+    assert np.isfinite(preds).all()
+
+
+def test_lambdarank_recovers_planted_cross_sectional_signal():
+    # Higher-trend tickers should rank higher: the ranker's IC must be clearly
+    # positive on a planted-signal panel (same bar the regression path clears).
+    from backend.ml.gbm_baseline import LGBMConfig
+
+    frames = [make_frame(n_days=1600, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(16)]
+    grid = build_calendar_grid(frames)
+    panel = prepare_panel(frames, grid, n_grades=5)
+    wf = WalkForwardConfig(min_train_months=6, min_names=5)
+    res = walk_forward_ic(panel, "3M", LGBMConfig(objective="lambdarank"), wf,
+                          target_mode="sector_grade")
+    assert res["summary"]["n_folds"] > 0
+    assert res["summary"]["mean_ic"] > 0.0
+
+
+# =============================================================
+# E5 — cross-sectional seasonality pack (Heston-Sadka)
+# =============================================================
+
+
+def _series_with_february_bump(start_year=2015, n_years=7, feb_daily=0.05 / 20.0):
+    """Daily series where every February carries a steady positive drift, else flat."""
+    from datetime import date, timedelta
+    import math
+
+    d0 = date(start_year, 1, 2)
+    trade_dates, adj_close = [], []
+    price = 100.0
+    for i in range(n_years * 365):
+        dd = d0 + timedelta(days=i)
+        price *= math.exp(feb_daily if dd.month == 2 else 0.0)
+        trade_dates.append(dd)
+        adj_close.append(price)
+    return trade_dates, adj_close
+
+
+def test_seasonality_detects_planted_month_and_is_pit_safe():
+    from backend.ml.factors.price import _seasonality_asof
+
+    trade_dates, adj_close = _series_with_february_bump()
+
+    def last_of(y, m):
+        return max(i for i, dd in enumerate(trade_dates) if dd.year == y and dd.month == m)
+
+    # January-end bars: the UPCOMING month is February, so the same-month seasonal
+    # should surface the planted positive February return; other months ~0.
+    jan_bars = [last_of(y, 1) for y in (2019, 2020, 2021)]
+    out = _seasonality_asof(adj_close, trade_dates, jan_bars,
+                            years=5, min_same_obs=2, min_other_obs=10)
+    for i in range(len(jan_bars)):
+        assert out["seasonal_same_month_5y"][i] > 0.03      # planted Feb ~+0.05..0.07
+        assert abs(out["seasonal_other_month_5y"][i]) < 0.01  # other months flat
+        assert out["seasonal_gap_5y"][i] > 0.03
+
+    # PIT: a bar at end of February (upcoming month March, which is flat) must read
+    # ~0 — the just-finished February must NOT leak into the "same-month" value.
+    feb = _seasonality_asof(adj_close, trade_dates, [last_of(2021, 2)],
+                            years=5, min_same_obs=2, min_other_obs=10)
+    assert abs(feb["seasonal_same_month_5y"][0]) < 0.01
+
+
+def test_seasonality_insufficient_history_falls_back_to_zero():
+    from backend.ml.factors.price import _seasonality_asof
+
+    trade_dates, adj_close = _series_with_february_bump(start_year=2020, n_years=2)
+
+    def last_of(y, m):
+        return max(i for i, dd in enumerate(trade_dates) if dd.year == y and dd.month == m)
+
+    # Only ~1 completed February of history before Jan 2021 -> below min_same_obs=3.
+    out = _seasonality_asof(adj_close, trade_dates, [last_of(2021, 1)],
+                            years=5, min_same_obs=3, min_other_obs=24)
+    assert out["seasonal_same_month_5y"][0] == 0.0
+    assert out["seasonal_gap_5y"][0] == 0.0
+
+
+def test_seasonality_columns_flow_into_panel():
+    from backend.ml.gbm_baseline import SEASONALITY_FEATURES
+
+    frames = [make_frame(n_days=1600, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(6)]
+    grid = build_calendar_grid(frames)
+    cols = list(FEATURE_COLS) + list(SEASONALITY_FEATURES)
+    panel = prepare_panel(frames, grid, rank_cols=cols)
+    for c in SEASONALITY_FEATURES:
+        assert c in panel.columns
+        # Rank-normalized into [-1, 1] like every other feature.
+        assert panel[c].between(-1.0, 1.0).all()

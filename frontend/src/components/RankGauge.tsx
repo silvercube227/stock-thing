@@ -6,7 +6,7 @@ import { percentileRank } from "@/lib/format";
 function rankTone(rank: number): { bar: string; text: string } {
   if (rank >= 0.66) return { bar: "bg-up", text: "text-up" };
   if (rank <= 0.34) return { bar: "bg-down", text: "text-down" };
-  return { bar: "bg-accent", text: "text-accent" };
+  return { bar: "bg-muted", text: "text-muted" };
 }
 
 function stabilityLabel(std: number): string {

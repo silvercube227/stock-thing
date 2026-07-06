@@ -63,6 +63,7 @@ from backend.ml.factors import (  # noqa: F401
     FUNDAMENTAL_FEATURES,
     FUNDAMENTAL_MISSING_FEATURES,
     INDUSTRY_RELATIVE_FEATURES,
+    INSIDER_FEATURES,
     KNIFE_FEATURES,
     LOTTERY_FEATURES,
     MICROSTRUCTURE_FEATURES,
@@ -70,6 +71,7 @@ from backend.ml.factors import (  # noqa: F401
     QUALITY_FEATURES,
     RESIDUAL_MOM_FEATURES,
     REVISION_MOMENTUM_FEATURES,
+    SEASONALITY_FEATURES,
     SENTIMENT_FEATURES,
     SHORT_INTEREST_FEATURES,
     VALUATION_FEATURES,
@@ -106,6 +108,16 @@ class LGBMConfig:
     colsample_bytree: float = 0.8   # feature bagging
     reg_lambda: float = 1.0
     reg_alpha: float = 0.0          # L1 leaf penalty (LightGBM default 0)
+    # Training objective. "regression" (default) = pointwise L2, the historical path.
+    # "lambdarank" / "rank_xendcg" switch fit_lgbm_model to LGBMRanker (learning-to-
+    # rank): the fit optimizes a listwise/pairwise ranking loss aligned with the
+    # rank-IC scoring metric. Ranking objectives require an ordinal grade target
+    # (--target sector_grade) and a per-date query group.
+    objective: str = "regression"
+    # LambdaRank list-truncation: pairs beyond this rank are ignored in the gradient.
+    # Set >= the cross-section size (~500) for full-list ranking; lower values focus
+    # the loss on the top of the list (the picks the product actually ships).
+    lambdarank_truncation_level: int = 500
     # n_jobs=1 is REQUIRED, not a perf choice: this process also loads torch
     # (dataset.py -> model.py), whose bundled libomp.dylib is a second LLVM
     # OpenMP runtime. LightGBM spawning its own OpenMP thread team alongside it
@@ -157,6 +169,11 @@ class HorizonSpec:
     # Mirrors WalkForwardConfig.max_train_months but lives on the spec so inference
     # can apply a per-horizon window without touching the CLI flag machinery.
     max_train_months: int | None = None
+    # Per-date training-label winsorization: clip the training target to its per-date
+    # [pct, 1−pct] quantiles (0 = off). Tames fat-tailed return labels so tail months
+    # don't dominate the L2 split; scoring stays on unclipped realized returns. Only
+    # valid for return-like target modes (asserted at fit time).
+    winsorize_pct: float = 0.0
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -221,13 +238,30 @@ _BASELINE_PLUS_REVMOM = FEATURE_COLS + REVISION_MOMENTUM_FEATURES
 #             +2.12→+2.36, turnover flat. Clearly clears the +10% bar.
 #     3M/1Y left on expanding window: 3M +4.1% (below bar), 1Y −14.7% (kill —
 #     long-horizon regime memory matters more than regime recency at 1Y).
+#   - 6M / 1Y LambdaRank objective PROMOTED (2026-07-06, 8-seed walk-forward, SECB).
+#     Train an LGBMRanker on the ordinal `sector_grade` target (per-date qcut of
+#     sector_return into 5 grades) with a per-date query group — the fit optimizes a
+#     listwise ranking loss aligned with the rank-IC scoring metric instead of L2
+#     regress-then-rank (Poh 2020; LambdaRankIC 2026). trunc=100 (top-100 focus, also
+#     what the product ships) — full-list trunc=500 was ~3 hr/horizon for negligible
+#     extra signal. Before → after vs the same-seed regression baseline:
+#         6M: SECB IC +0.0560→+0.0563, ICIR 0.494→0.575 (+16.4%), t_block 2.36→2.75,
+#             p 0.0020→0.0005, turnover 0.116→0.105 (lower). Clears the +10% bar.
+#         1Y: SECB IC +0.0579→+0.0690 (+19.2%), ICIR 0.747→1.109 (+48.5%), t_block
+#             2.41→3.58, hit 0.82→0.89, turnover 0.042→0.038 (lower). Decisive.
+#     3M NOT promoted: ICIR +8.9% (below bar) AND mean IC −9% (net loss). The overlays
+#     (6M rolling-60, 1Y smooth_span=4) compose unchanged — they act on the ranker's
+#     percentile ranks (monotone-invariant). Inference needs ZERO changes: fit_lgbm_model
+#     branches on lgb_cfg.objective, LGBMRanker.predict has the same signature.
+_LAMBDARANK_CFG = LGBMConfig(objective="lambdarank", lambdarank_truncation_level=100)
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
     "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM,
                       smooth_span=3, knife_lambda=0.20),
-    "6M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE,
-                      max_train_months=60),
-    "1Y": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
+    "6M": HorizonSpec(target_mode="sector_grade", lgb_cfg=_LAMBDARANK_CFG,
+                      feature_cols=_BASELINE_PLUS_SURPRISE, max_train_months=60),
+    "1Y": HorizonSpec(target_mode="sector_grade", lgb_cfg=_LAMBDARANK_CFG,
+                      feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
 }
 
 
@@ -373,6 +407,7 @@ def apply_target_modes(
     n_buckets: int = 5,
     market_horizon_returns: dict | None = None,
     sector_min_group_size: int = 5,
+    n_grades: int = 5,
 ):
     """Add per-horizon training-target variants computed cross-sectionally per date.
 
@@ -433,6 +468,23 @@ def apply_target_modes(
             out[f"y_{h}_sector_return"] = np.where(use_sector, valid - sec_med, valid)
         else:
             out[f"y_{h}_sector_return"] = valid
+
+        # --- Sector-relative GRADE target (E4 LambdaRank) ---
+        # Per-date qcut of the sector-demeaned return into n_grades ordinal grades
+        # (0..K-1) — the relevance labels a pairwise/NDCG ranking objective consumes.
+        # Per-DATE (not within-sector) qcut so grades span the full ~500-name query
+        # group; 20-70-name sector groups would degrade qcut (v1 decision). NaN where
+        # the sector return is masked or the date has < n_grades names — those rows
+        # are dropped at fit time exactly like the other precomputed targets.
+        sec_ret = pd.Series(out[f"y_{h}_sector_return"], index=out.index)
+        sec_ret = sec_ret.where(out[m].astype(bool))  # NaN outside the horizon mask
+
+        def _grade_bucket(s):
+            if s.notna().sum() < n_grades:
+                return pd.Series(np.nan, index=s.index)
+            return pd.qcut(s, n_grades, labels=False, duplicates="drop").astype(float)
+
+        out[f"y_{h}_sector_grade"] = sec_ret.groupby(out["date"]).transform(_grade_bucket)
 
         # --- Vol-scaled sector-relative target (lever 1, 6M-focused) ---
         # Homoskedasticize label noise + shrink high-vol labels by dividing by
@@ -495,6 +547,7 @@ def prepare_panel(
     rank_cols: list[str] | None = None,
     industry_relative: bool = False,
     min_group_size: int = 5,
+    n_grades: int = 5,
 ):
     """Full pipeline: assemble → demean target → rank-normalize features → targets."""
     market_returns = build_universe_return_map(frames)
@@ -527,7 +580,8 @@ def prepare_panel(
         panel = add_knife_score_feature(panel)
     market_horizon_returns = build_market_horizon_returns(market_returns, grid)
     panel = apply_target_modes(
-        panel, n_buckets, market_horizon_returns=market_horizon_returns
+        panel, n_buckets, market_horizon_returns=market_horizon_returns,
+        n_grades=n_grades,
     )
     return panel
 
@@ -567,6 +621,8 @@ def fit_lgbm_model(
     import lightgbm as lgb
 
     cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    if cfg.objective in _RANKING_OBJECTIVES:
+        return _fit_lgbm_ranker(train_df, target_col, cfg, seed, shuffle, cols)
     # Pass DataFrames (not bare arrays) so feature names flow into LightGBM and
     # sklearn doesn't warn at predict time.
     X_tr = train_df[cols]
@@ -574,7 +630,7 @@ def fit_lgbm_model(
     if shuffle:  # destroy feature->label link, preserve marginal => no-signal null
         y_tr = y_tr[np.random.default_rng(seed).permutation(len(y_tr))]
     model = lgb.LGBMRegressor(
-        objective="regression",
+        objective=cfg.objective,
         n_estimators=cfg.n_estimators,
         learning_rate=cfg.learning_rate,
         num_leaves=cfg.num_leaves,
@@ -590,6 +646,56 @@ def fit_lgbm_model(
         verbose=-1,
     )
     model.fit(X_tr, y_tr)
+    return model
+
+
+# LightGBM learning-to-rank objectives (vs pointwise "regression"). Both consume an
+# ordinal grade label + a per-date query group; both expose the same `.predict()`
+# score signature as the regressor, so _fit_predict / walk_forward_ic / inference
+# need no branch beyond fit_lgbm_model.
+_RANKING_OBJECTIVES = frozenset({"lambdarank", "rank_xendcg"})
+
+
+def _fit_lgbm_ranker(train_df, target_col, cfg, seed, shuffle, cols):
+    """Fit an LGBMRanker on per-date query groups; returns a model with `.predict()`.
+
+    The panel is ticker-major (assemble_panel extends per ticker), so the rows must
+    be reordered to date-contiguous blocks and the query `group` sizes read off in
+    that same order — LightGBM assumes each group occupies a consecutive row span.
+    A stable (mergesort) sort keeps within-date order deterministic across seeds.
+    label_gain is LINEAR (0,1,..,K−1): Spearman / SECB reward monotone ordering
+    through the whole list, not the default 2^i−1 top-heavy gain.
+    """
+    import lightgbm as lgb
+
+    ordered = train_df.sort_values("date", kind="mergesort")
+    X_tr = ordered[cols]
+    y_tr = ordered[target_col].to_numpy(dtype=float)
+    if shuffle:  # no-signal null: permute grades, keep the group structure intact
+        y_tr = y_tr[np.random.default_rng(seed).permutation(len(y_tr))]
+    y_tr = np.rint(y_tr).astype(int)
+    group = ordered.groupby("date", sort=False).size().to_numpy()
+    n_labels = int(y_tr.max()) + 1 if y_tr.size else 2
+    label_gain = list(range(max(n_labels, 2)))
+    model = lgb.LGBMRanker(
+        objective=cfg.objective,
+        n_estimators=cfg.n_estimators,
+        learning_rate=cfg.learning_rate,
+        num_leaves=cfg.num_leaves,
+        max_depth=cfg.max_depth,
+        min_child_samples=cfg.min_child_samples,
+        subsample=cfg.subsample,
+        subsample_freq=1,
+        colsample_bytree=cfg.colsample_bytree,
+        reg_lambda=cfg.reg_lambda,
+        reg_alpha=cfg.reg_alpha,
+        n_jobs=cfg.n_jobs,
+        random_state=seed,
+        verbose=-1,
+        label_gain=label_gain,
+        lambdarank_truncation_level=cfg.lambdarank_truncation_level,
+    )
+    model.fit(X_tr, y_tr, group=group)
     return model
 
 
@@ -677,6 +783,47 @@ def _fit_predict(
 def _target_col(horizon: str, target_mode: str) -> str:
     """Training-target column: raw return needs no precomputed column."""
     return f"r_{horizon}" if target_mode == "return" else f"y_{horizon}_{target_mode}"
+
+
+# Target modes whose label is a raw return-like quantity (fat-tailed) and can be
+# winsorized. rank / quantile targets are already bounded/ordinal, so clipping them
+# is meaningless — the guard raises rather than silently no-op'ing.
+_WINSORIZABLE_TARGET_MODES = frozenset(
+    {"return", "sector_return", "sector_return_vol", "beta_resid", "beta_sector_resid"}
+)
+
+
+def assert_winsorizable_target(target_mode: str) -> None:
+    """Guard: winsorization only makes sense for raw return-like training targets."""
+    if target_mode not in _WINSORIZABLE_TARGET_MODES:
+        raise ValueError(
+            f"winsorization is only valid for return-like targets "
+            f"{sorted(_WINSORIZABLE_TARGET_MODES)}, not {target_mode!r}"
+        )
+
+
+def winsorize_by_date(y, dates, pct: float):
+    """Clip each date's cross-section of a return-like target to its per-date
+    [pct, 1−pct] quantiles.
+
+    PIT-safe: the clip bounds are computed from same-date rows only, so no future
+    information leaks across the winsorization (same class as the median-demean).
+    NaNs pass through untouched (excluded from both the quantile and the clip).
+    `pct=0` (or falsy) is an exact no-op. Applied to the TRAINING label only; the
+    scoring target `r_{h}` is never clipped.
+    """
+    import pandas as pd
+
+    y = np.asarray(y, dtype=float)
+    if not pct or pct <= 0:
+        return y
+    if pct >= 0.5:
+        raise ValueError(f"winsorize pct must be in [0, 0.5), got {pct}")
+    s = pd.Series(y)
+    d = pd.Series(np.asarray(dates), index=s.index)
+    lo = s.groupby(d).transform(lambda x: x.quantile(pct))
+    hi = s.groupby(d).transform(lambda x: x.quantile(1.0 - pct))
+    return s.clip(lower=lo, upper=hi).to_numpy()
 
 
 def within_sector_ic(
@@ -1165,6 +1312,7 @@ def walk_forward_ic(
     ridge_alpha: float = 10.0,
     smooth_span: int = 0,
     knife_lambda: float = 0.0,
+    winsorize_pct: float = 0.0,
     return_records: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
@@ -1186,6 +1334,21 @@ def walk_forward_ic(
     wf_cfg = wf_cfg or WalkForwardConfig()
     r_col, m_col = f"r_{horizon}", f"mask_{horizon}"
     t_col = _target_col(horizon, target_mode)
+    # Winsorize the TRAINING label only (per-date quantile clip); scoring stays on
+    # the unclipped realized return `r_col`. Precompute a clipped column once over
+    # the whole panel — the per-date clip uses same-date rows only, so it is
+    # identical to clipping each fold's training slice (fold-invariant, PIT-safe).
+    fit_col = t_col
+    if winsorize_pct and winsorize_pct > 0:
+        assert_winsorizable_target(target_mode)
+        fit_col = f"{t_col}__wins"
+        panel = panel.assign(**{
+            fit_col: winsorize_by_date(
+                panel[t_col].to_numpy(dtype=float),
+                panel["date"].to_numpy(),
+                winsorize_pct,
+            )
+        })
     embargo_steps = max(1, math.ceil(HORIZON_TRADING_DAYS[horizon] / 21))
 
     grid_dates = sorted(panel["date"].unique())
@@ -1203,14 +1366,14 @@ def walk_forward_ic(
             continue
 
         preds = _fit_predict(
-            train, test, t_col, lgb_cfg, seed + fi, shuffle,
+            train, test, fit_col, lgb_cfg, seed + fi, shuffle,
             feature_cols=feature_cols, n_seeds=n_seeds,
         )
         if linear_blend > 0:
             # `test` is a single month-end cross-section here, so rank-blending is
             # well-defined. The null path shuffles both models identically.
             lin = fit_linear_model(
-                train, t_col, feature_cols=feature_cols, alpha=ridge_alpha,
+                train, fit_col, feature_cols=feature_cols, alpha=ridge_alpha,
                 seed=seed + fi, shuffle=shuffle,
             )
             cols = feature_cols if feature_cols is not None else FEATURE_COLS
@@ -1478,6 +1641,13 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(SHORT_INTEREST_FEATURES)
     if args.with_knife_feature:
         cols += list(KNIFE_FEATURES)
+    if args.with_seasonality:
+        cols += list(SEASONALITY_FEATURES)
+    if args.with_insider:
+        cols += list(INSIDER_FEATURES)
+    # Ad-hoc single features (e.g. isolating one member of a pack for an ablation).
+    if getattr(args, "extra_features", None):
+        cols += [c.strip() for c in args.extra_features.split(",") if c.strip()]
     # De-dupe while preserving order.
     seen: set[str] = set()
     out: list[str] = []
@@ -1489,7 +1659,23 @@ def _compose_feature_cols(args) -> list[str]:
 
 
 async def run(args) -> None:
-    lgb_cfg = LGBMConfig()
+    lgb_cfg = LGBMConfig(
+        objective=args.objective,
+        lambdarank_truncation_level=args.lambdarank_truncation,
+    )
+    if args.subsample is not None:
+        lgb_cfg = replace(lgb_cfg, subsample=args.subsample)
+    if args.objective in _RANKING_OBJECTIVES:
+        if args.target != "sector_grade":
+            raise SystemExit(
+                f"--objective {args.objective} requires --target sector_grade "
+                f"(ordinal grade labels), got --target {args.target}"
+            )
+        if args.with_linear_blend > 0:
+            raise SystemExit(
+                "--with-linear-blend is unsupported with a ranking objective "
+                "(untested ranker+ridge combination; no production horizon blends)"
+            )
     wf_cfg = WalkForwardConfig(
         min_train_months=args.min_train_months,
         max_train_months=args.max_train_months,
@@ -1517,6 +1703,7 @@ async def run(args) -> None:
             n_buckets=args.n_buckets,
             rank_cols=feature_cols,
             industry_relative=args.industry_relative,
+            n_grades=args.rank_grades,
         )
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
@@ -1576,14 +1763,17 @@ async def run(args) -> None:
                                ridge_alpha=args.ridge_alpha,
                                smooth_span=args.smooth_span,
                                knife_lambda=args.knife_lambda,
+                               winsorize_pct=args.winsorize_target,
                                return_records=knife_grid is not None or blend_grid is not None)
         block_size = args.block_size or max(
             1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
         )
         smooth_tag = f", smooth_span={args.smooth_span}" if args.smooth_span > 0 else ""
         knife_tag = f", knife_lambda={args.knife_lambda}" if args.knife_lambda > 0 else ""
+        wins_tag = f", winsorize={args.winsorize_target}" if args.winsorize_target > 0 else ""
+        obj_tag = f", objective={args.objective}" if args.objective != "regression" else ""
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
-              f"(expanding walk-forward, target={args.target}{smooth_tag}{knife_tag}) ---")
+              f"(expanding walk-forward, target={args.target}{obj_tag}{smooth_tag}{knife_tag}{wins_tag}) ---")
         if knife_grid is not None and real.get("records"):
             print(f"\n[knife sweep] vol×downtrend output overlay (no refit, "
                   f"smooth_span={args.smooth_span}); SECB={args.sector_neutral_ic}:")
@@ -1708,7 +1898,8 @@ async def run(args) -> None:
                                       linear_blend=args.with_linear_blend,
                                       ridge_alpha=args.ridge_alpha,
                                       smooth_span=args.smooth_span,
-                                      knife_lambda=args.knife_lambda)
+                                      knife_lambda=args.knife_lambda,
+                                      winsorize_pct=args.winsorize_target)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 if args.sector_neutral_ic and "sector_summary" in res:
@@ -1742,13 +1933,16 @@ def main() -> None:
     p.add_argument("--min-names", type=int, default=30, help="skip thinner test cross-sections")
     p.add_argument("--target", default="return",
                    choices=["return", "rank", "quantile", "sector_return",
-                            "sector_return_vol", "beta_resid", "beta_sector_resid"],
+                            "sector_return_vol", "beta_resid", "beta_sector_resid",
+                            "sector_grade"],
                    help="training target transform (scoring is always vs realized "
                         "universe-demeaned return; sector_return / beta_resid / "
                         "beta_sector_resid are alpha-residual modes; "
                         "sector_return_vol divides sector_return by raw vol_120d "
                         "floored at the per-date 20th pct — homoskedasticizes label "
-                        "noise and shrinks high-vol labels, goal A + B lever)")
+                        "noise and shrinks high-vol labels, goal A + B lever; "
+                        "sector_grade = per-date qcut of sector_return into ordinal "
+                        "grades for a --objective lambdarank fit)")
     p.add_argument(
         "--n-buckets", type=int, default=5,
         help="equal-count buckets for --target quantile",
@@ -1783,6 +1977,30 @@ def main() -> None:
                         "cross-section toward names that are NOT both high-vol and "
                         "downtrending; composes ahead of --smooth-span. Suppresses "
                         "'falling knife' picks at the top and lowers turnover.")
+    p.add_argument("--objective", default="regression",
+                   choices=["regression", "lambdarank", "rank_xendcg"],
+                   help="LightGBM training objective. 'regression' = pointwise L2 "
+                        "(default). 'lambdarank'/'rank_xendcg' switch to LGBMRanker "
+                        "(learning-to-rank, aligned with rank-IC scoring); require "
+                        "--target sector_grade (ordinal grades + per-date query group)")
+    p.add_argument("--rank-grades", type=int, default=5, metavar="K",
+                   help="number of ordinal grades for --target sector_grade (per-date "
+                        "qcut buckets); default 5 matches the quantile-bucket convention")
+    p.add_argument("--lambdarank-truncation", type=int, default=500, metavar="N",
+                   help="LambdaRank list-truncation level (pairs beyond rank N are "
+                        "ignored in the gradient); default 500 >= cross-section size "
+                        "for full-list ranking. Lower focuses the loss on the top.")
+    p.add_argument("--subsample", type=float, default=None, metavar="F",
+                   help="row-bagging fraction override (default: LGBMConfig 0.8). "
+                        "Used to smoke the bagging x pairwise-gradient interaction "
+                        "under ranking objectives (0.8 vs 1.0).")
+    p.add_argument("--winsorize-target", type=float, default=0.0, metavar="PCT",
+                   help="per-date winsorization of the TRAINING label (0 = off). "
+                        "Clips each date's cross-section of the return-like target to "
+                        "its [PCT, 1−PCT] quantiles before fitting; scoring stays on "
+                        "unclipped realized return. Only valid for return-like targets "
+                        "(return/sector_return/beta_resid*). E.g. 0.01 clips the top/"
+                        "bottom 1%% per date.")
     p.add_argument("--knife-sweep", default=None, metavar="L1,L2,...",
                    help="comma-separated knife-lambda grid for a no-refit sweep table "
                         "(e.g. '0,0.05,0.1,0.2'); reports mean/within-sector IC, "
@@ -1862,6 +2080,21 @@ def main() -> None:
                    help="vet the opted-in pack features (--with-*) for decorrelation vs "
                         "the book + standalone within-sector IC + a consolidation "
                         "(efficiency-ratio tertile) breakdown, then exit — no model fits")
+    p.add_argument("--with-insider", action="store_true",
+                   help="add insider-transaction pack (Cohen-Malloy-Pomorski: "
+                        "insider_net_buy_6m / insider_buyers_90d / insider_net_ratio_12m). "
+                        "PIT-safe on filing_date; requires insider_transactions "
+                        "(migration 010) + backfill_insiders.py.")
+    p.add_argument("--with-seasonality", action="store_true",
+                   help="add cross-sectional seasonality pack (Heston-Sadka same-"
+                        "calendar-month return persistence: seasonal_same/other/gap_5y). "
+                        "Expect signal at 3M; 1Y is a wash (forward window spans all "
+                        "12 months). PIT-safe (completed months strictly before the bar).")
+    p.add_argument("--extra-features", default=None, metavar="c1,c2,...",
+                   help="append these ad-hoc feature columns to the active list "
+                        "(isolate one member of a pack for a targeted ablation, e.g. "
+                        "--extra-features sales_to_price). Columns must be produced by "
+                        "build_ticker_rows.")
     p.add_argument("--industry-relative", action="store_true",
                    help="rank-normalize price/fundamental/valuation/quality "
                         "features within (date, industry) instead of universe-wide")
