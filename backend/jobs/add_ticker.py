@@ -188,9 +188,41 @@ async def _finish(
     )
 
 
+async def _ingest_ticker(pool: asyncpg.Pool, ticker_id: int, symbol: str, metadata: dict) -> None:
+    """Idempotent ingest of one ticker's prices + fundamentals + sentiment."""
+    await ingest_full_history(pool, tickers=[(ticker_id, symbol)], start_date=date(2010, 1, 1))
+    if metadata["cik"]:
+        await ingest_fundamentals(pool, tickers=[(ticker_id, symbol, metadata["cik"])])
+    await ingest_sentiment(pool, tickers=[(ticker_id, symbol)])
+
+
+async def _record_terminal(
+    run_id: int, status: str, *,
+    error: str | None = None, rows: int | None = None, metadata: dict | None = None,
+) -> None:
+    """Write the run's terminal status on a FRESH short-lived pool.
+
+    The failure we're recording is often a dropped Supabase connection, which also
+    poisons the ingest pool — writing the status on that same pool would raise too,
+    stranding the run at `running`. The UI misreads a stuck `running` as a scoring
+    hang ("remove and re-add"), so guaranteeing a terminal write is what makes the
+    error honest (and re-adds effective). Best-effort: the status endpoint's
+    stale-run guard is the last-resort backstop if even this write can't land.
+    """
+    try:
+        async with pool_context(command_timeout=60, max_size=2) as p:
+            await _finish(p, run_id, status, error=error, rows=rows, metadata=metadata)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def run_add(symbol: str, run_id: int | None) -> int:
     symbol = symbol.upper().strip()
-    async with pool_context(command_timeout=300) as pool:
+    meta: dict = {"symbol": symbol}
+    # Small pool: the API's uvicorn and the score subprocess each hold their own
+    # connections, so a fat worker pool adds free-tier connection pressure — the very
+    # thing that drops the ingest mid-pull.
+    async with pool_context(command_timeout=300, max_size=2) as pool:
         if run_id is None:
             run_id = int(
                 await pool.fetchval(
@@ -198,36 +230,44 @@ async def run_add(symbol: str, run_id: int | None) -> int:
                     f"add_ticker:{symbol}",
                 )
             )
-        meta: dict = {"symbol": symbol}
         try:
             metadata = await _resolve_metadata(pool, symbol)
             ticker_id = await _upsert_ticker(pool, symbol, metadata)
             meta["ticker_id"] = ticker_id
             meta["sector"] = metadata["sector"]
 
-            await ingest_full_history(pool, tickers=[(ticker_id, symbol)], start_date=date(2010, 1, 1))
-            if metadata["cik"]:
-                await ingest_fundamentals(pool, tickers=[(ticker_id, symbol, metadata["cik"])])
-            await ingest_sentiment(pool, tickers=[(ticker_id, symbol)])
+            # Bounded retries: a transient pooler drop self-heals — asyncpg replaces
+            # the dead connection and every ingest step is an idempotent upsert.
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    await _ingest_ticker(pool, ticker_id, symbol, metadata)
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    await asyncio.sleep(2 * (attempt + 1))
+            if last_exc is not None:
+                raise last_exc
 
             rc, output, outcome = await _score_subprocess(symbol)
             if rc != 0 or outcome is None:
                 meta["outcome"] = "failed"
-                await _finish(pool, run_id, "failed",
-                              error=f"scoring exit {rc}\n{output[-1500:]}", metadata=meta)
+                await _record_terminal(run_id, "failed",
+                                       error=f"scoring exit {rc}\n{output[-1500:]}", metadata=meta)
                 return 1
             if outcome["status"] == "insufficient_history":
                 meta["outcome"] = "insufficient_history"
-                await _finish(pool, run_id, "success", rows=0, metadata=meta)
+                await _record_terminal(run_id, "success", rows=0, metadata=meta)
                 return 0
             meta["outcome"] = "scored"
             meta["ranks"] = outcome.get("ranks")
-            await _finish(pool, run_id, "success",
-                          rows=len(outcome.get("ranks", {})), metadata=meta)
+            await _record_terminal(run_id, "success",
+                                   rows=len(outcome.get("ranks", {})), metadata=meta)
             return 0
         except Exception:
             meta["outcome"] = "failed"
-            await _finish(pool, run_id, "failed", error=traceback.format_exc(), metadata=meta)
+            await _record_terminal(run_id, "failed", error=traceback.format_exc(), metadata=meta)
             return 1
 
 

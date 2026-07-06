@@ -134,9 +134,16 @@ async def add_ticker(
         symbol,
     )
     if existing is not None and existing["active"]:
-        return AddTickerResponse(symbol=symbol, status="exists", ticker_id=int(existing["ticker_id"]))
-
-    if existing is not None:
+        ticker_id = int(existing["ticker_id"])
+        already_scored = await pool.fetchval(
+            "select exists(select 1 from predictions where ticker_id = $1)", ticker_id
+        )
+        if already_scored:
+            return AddTickerResponse(symbol=symbol, status="exists", ticker_id=ticker_id)
+        # Active but never scored — a prior add stranded before scoring finished.
+        # Fall through to re-spawn the worker so re-adding actually retries, instead
+        # of a no-op "exists" that leaves the ticker permanently unscored.
+    elif existing is not None:
         # Reactivate a removed-from-index name as user-added.
         ticker_id = int(existing["ticker_id"])
         await pool.execute(
