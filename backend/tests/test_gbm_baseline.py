@@ -2155,3 +2155,94 @@ def test_regime_report_omits_vol_split_without_the_raw_column():
     rep = regime_report(folds)
     assert rep["by_vol_regime"] == {}
     assert rep["by_year"][2020]["n"] == 7
+
+
+# --- frozen-holdout test-date window -----------------------------------------
+# The research protocol needs selection folds whose labels are FULLY realized
+# before the holdout opens, and a one-shot holdout run over the tail. Neither
+# walk_forward_folds nor walk_forward_ic had any date-window parameter.
+
+def test_walk_forward_ic_max_test_date_truncates_folds_without_touching_training():
+    panel = _planted_panel(n_dates=48, n_names=40, beta=1.0, seed=3)
+    wf = WalkForwardConfig(min_train_months=12, min_names=20)
+    cfg = LGBMConfig(n_estimators=40)
+    cutoff = date(2019, 12, 31)
+
+    full = walk_forward_ic(panel, "1M", cfg, wf, seed=1)
+    cut = walk_forward_ic(panel, "1M", cfg, wf, seed=1, max_test_date=cutoff)
+
+    assert 0 < len(cut["folds"]) < len(full["folds"])
+    assert all(f["date"] <= cutoff for f in cut["folds"])
+    # Truncating the tail leaves the surviving folds bit-identical: same fold
+    # index => same seed, and the expanding training window is untouched.
+    kept = [f for f in full["folds"] if f["date"] <= cutoff]
+    assert [f["date"] for f in cut["folds"]] == [f["date"] for f in kept]
+    assert [f["n_train"] for f in cut["folds"]] == [f["n_train"] for f in kept]
+    assert [f["ic"] for f in cut["folds"]] == [f["ic"] for f in kept]
+
+
+def test_walk_forward_ic_min_test_date_selects_the_holdout_tail():
+    panel = _planted_panel(n_dates=48, n_names=40, beta=1.0, seed=3)
+    wf = WalkForwardConfig(min_train_months=12, min_names=20)
+    cfg = LGBMConfig(n_estimators=40)
+
+    full = walk_forward_ic(panel, "1M", cfg, wf, seed=1)
+    selection = walk_forward_ic(panel, "1M", cfg, wf, seed=1,
+                                max_test_date=date(2019, 12, 31))
+    holdout = walk_forward_ic(panel, "1M", cfg, wf, seed=1,
+                              min_test_date=date(2020, 1, 1))
+
+    assert holdout["folds"]
+    assert all(f["date"] >= date(2020, 1, 1) for f in holdout["folds"])
+    # The two windows partition the fold list — no fold is scored twice, none lost.
+    assert len(selection["folds"]) + len(holdout["folds"]) == len(full["folds"])
+
+
+def test_walk_forward_ic_without_a_window_is_unchanged():
+    panel = _planted_panel(n_dates=36, n_names=40, beta=1.0, seed=5)
+    wf = WalkForwardConfig(min_train_months=12, min_names=20)
+    cfg = LGBMConfig(n_estimators=40)
+    base = walk_forward_ic(panel, "1M", cfg, wf, seed=1)
+    same = walk_forward_ic(panel, "1M", cfg, wf, seed=1,
+                           max_test_date=None, min_test_date=None)
+    assert [f["ic"] for f in base["folds"]] == [f["ic"] for f in same["folds"]]
+
+
+# --- PIT vol-regime tertiles --------------------------------------------------
+
+def _rising_vol_folds(n: int) -> list[dict]:
+    return [
+        {"date": date(2015 + k // 12, k % 12 + 1, 28), "ic": 0.01,
+         "sector_ic": 0.01, "vol_raw_med": 0.01 * (k + 1)}
+        for k in range(n)
+    ]
+
+
+def test_regime_report_pit_tertiles_use_only_prior_folds():
+    from backend.ml.gbm_baseline import regime_report
+
+    # Volatility rises monotonically over the whole sample. The in-sample cut
+    # splits it into equal thirds; the PIT cut cannot, because every scored fold
+    # is above everything that preceded it.
+    rep = regime_report(_rising_vol_folds(48), burn_in=24)
+
+    assert rep["by_vol_regime"]["low_vol"]["n"] == 16
+    assert rep["by_vol_regime"]["mid_vol"]["n"] == 16
+    assert rep["by_vol_regime"]["high_vol"]["n"] == 16
+
+    assert rep["pit_n_scored"] == 24
+    assert rep["by_vol_regime_pit"]["high_vol"]["n"] == 24
+    assert "low_vol" not in rep["by_vol_regime_pit"]
+
+
+def test_regime_report_pit_drops_the_burn_in_window():
+    from backend.ml.gbm_baseline import regime_report
+
+    rep = regime_report(_rising_vol_folds(30), burn_in=24)
+    assert rep["pit_burn_in"] == 24
+    assert rep["pit_n_scored"] == 6
+
+    # Not enough history to bucket anything at all.
+    short = regime_report(_rising_vol_folds(20), burn_in=24)
+    assert short["by_vol_regime_pit"] == {}
+    assert short["by_vol_regime"]  # the in-sample cut still works

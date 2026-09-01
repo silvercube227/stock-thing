@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
+from datetime import date
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -1220,6 +1221,8 @@ def regularization_sweep(
     seed: int = 1337,
     sector_group_col: str = "sector",
     compute_sector_ic: bool = True,
+    max_test_date=None,
+    min_test_date=None,
     log=lambda *_: None,
 ) -> list[dict]:
     """Compare LightGBM regularization configs at one horizon — each a FULL refit.
@@ -1237,6 +1240,7 @@ def regularization_sweep(
             panel, horizon, cfg, wf_cfg, seed=seed, shuffle=False,
             target_mode=target_mode, feature_cols=feature_cols, n_seeds=n_seeds,
             compute_sector_ic=compute_sector_ic, sector_group_col=sector_group_col,
+            max_test_date=max_test_date, min_test_date=min_test_date,
         )
         sec = res.get("sector_summary", {})
         boot = block_bootstrap_summary(
@@ -1359,6 +1363,8 @@ def walk_forward_ic(
     smooth_span: int = 0,
     knife_lambda: float = 0.0,
     winsorize_pct: float = 0.0,
+    max_test_date=None,
+    min_test_date=None,
     return_records: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
@@ -1373,6 +1379,13 @@ def walk_forward_ic(
     overlay composes first, then smoothing. The result always carries `rank_turnover`
     (mean |Δ rank| between consecutive dates) for the raw signal, and the transformed
     turnover (`turnover_smoothed`) when either post-step is on.
+
+    `max_test_date` / `min_test_date` restrict which fold TEST dates are scored;
+    the training window per fold is unchanged. This is how the frozen holdout is
+    enforced: selection runs pass `max_test_date = holdout_start - horizon` so
+    every selection label is fully realized before the holdout opens, and the
+    one-shot holdout run passes `min_test_date = holdout_start`. There is no
+    default -- truncation is always explicit.
     """
     import pandas as pd
 
@@ -1399,6 +1412,14 @@ def walk_forward_ic(
 
     grid_dates = sorted(panel["date"].unique())
     folds = walk_forward_folds(grid_dates, wf_cfg.min_train_months, embargo_steps)
+    if max_test_date is not None or min_test_date is not None:
+        folds = [
+            (td, cut) for td, cut in folds
+            if (max_test_date is None or td <= max_test_date)
+            and (min_test_date is None or td >= min_test_date)
+        ]
+        log(f"test-date window: {len(folds)} folds kept "
+            f"[{min_test_date or '-'} .. {max_test_date or '-'}]")
 
     fold_rows: list[dict] = []
     records: list[dict] = []  # per-fold (ticker_ids, raw pred, realized r, sector) for smoothing/turnover
@@ -1589,12 +1610,19 @@ def size_neutral_summary(
     }
 
 
-def regime_report(folds: list[dict]) -> dict:
+def regime_report(folds: list[dict], burn_in: int = 24) -> dict:
     """Per-fold IC broken out by calendar year and by volatility regime.
 
     The headline is a pooled mean over 2013-2026, which hides regime dependence —
     especially for a size-tilted signal, where a mega-cap-led stretch and a
     broadening stretch are different worlds. Pure function over existing fold rows.
+
+    Two vol-regime tables are returned. `by_vol_regime` cuts tertiles over the WHOLE
+    fold set — in-sample breakpoints, fine for describing the panel, useless as
+    evidence for a tradeable rule. `by_vol_regime_pit` cuts each fold against
+    quantiles of the folds strictly BEFORE it (expanding window, `burn_in` folds of
+    history required), so every bucket assignment was knowable at the time. A regime
+    claim that only survives the in-sample cut is not a claim.
     """
     from collections import defaultdict
 
@@ -1620,6 +1648,7 @@ def regime_report(folds: list[dict]) -> dict:
     # of RAW realized vol on the fold date.
     vol_rows = [f for f in rows if f.get("vol_raw_med") == f.get("vol_raw_med")
                 and f.get("vol_raw_med") is not None]
+    vol_rows.sort(key=lambda f: f["date"])
     regimes: dict[str, dict] = {}
     if len(vol_rows) >= 6:
         vols = np.asarray([f["vol_raw_med"] for f in vol_rows], dtype=float)
@@ -1631,7 +1660,27 @@ def regime_report(folds: list[dict]) -> dict:
         }
         regimes = {name: agg(items) for name, items in buckets.items() if items}
 
-    return {"by_year": years, "by_vol_regime": regimes}
+    # Same cut, but each fold is bucketed against the quantiles of the folds that
+    # PRECEDE it. Folds inside the burn-in have no usable history and are dropped
+    # rather than bucketed on a handful of observations.
+    pit_buckets: dict[str, list[dict]] = {"low_vol": [], "mid_vol": [], "high_vol": []}
+    for i, f in enumerate(vol_rows):
+        if i < burn_in:
+            continue
+        hist = np.asarray([g["vol_raw_med"] for g in vol_rows[:i]], dtype=float)
+        p_lo, p_hi = np.quantile(hist, [1 / 3, 2 / 3])
+        v = f["vol_raw_med"]
+        name = "low_vol" if v <= p_lo else ("mid_vol" if v <= p_hi else "high_vol")
+        pit_buckets[name].append(f)
+    regimes_pit = {name: agg(items) for name, items in pit_buckets.items() if items}
+
+    return {
+        "by_year": years,
+        "by_vol_regime": regimes,
+        "by_vol_regime_pit": regimes_pit,
+        "pit_burn_in": burn_in,
+        "pit_n_scored": sum(len(v) for v in pit_buckets.values()),
+    }
 
 
 def block_bootstrap_summary(
@@ -1955,6 +2004,8 @@ async def run(args) -> None:
                                smooth_span=args.smooth_span,
                                knife_lambda=args.knife_lambda,
                                winsorize_pct=args.winsorize_target,
+                               max_test_date=args.max_test_date,
+                               min_test_date=args.min_test_date,
                                return_records=(knife_grid is not None
                                                or blend_grid is not None
                                                or args.size_neutral_ic))
@@ -1993,6 +2044,8 @@ async def run(args) -> None:
                                   feature_cols=feature_cols, n_seeds=args.n_seeds,
                                   compute_sector_ic=args.sector_neutral_ic,
                                   sector_group_col=args.neutralize_by,
+                                  max_test_date=args.max_test_date,
+                                  min_test_date=args.min_test_date,
                                   return_records=True)
             print(f"  {'w':>5} {'mean_ic':>8} {'sec_ic':>8} {'sec_t':>7} "
                   f"{'sec_p':>8} {'turnover':>9}")
@@ -2035,6 +2088,8 @@ async def run(args) -> None:
                 reps=args.block_bootstrap_reps, seed=args.seed,
                 sector_group_col=args.neutralize_by,
                 compute_sector_ic=args.sector_neutral_ic,
+                max_test_date=args.max_test_date,
+                min_test_date=args.min_test_date,
                 log=print if args.verbose else (lambda *_: None),
             ):
                 print(f"  {row['name']:>13} {row['mean_ic']:>+8.4f} "
@@ -2096,8 +2151,16 @@ async def run(args) -> None:
                 print(f"  {year:<6} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
                       f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
             if rep["by_vol_regime"]:
-                print("  by realized-vol regime (tertiles of the cross-sectional median):")
+                print("  by realized-vol regime (IN-SAMPLE tertiles of the cross-sectional "
+                      "median — descriptive only):")
                 for name, agg in rep["by_vol_regime"].items():
+                    print(f"  {name:<9} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
+                          f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
+            if rep["by_vol_regime_pit"]:
+                print(f"  by realized-vol regime (PIT expanding tertiles, burn-in "
+                      f"{rep['pit_burn_in']}, {rep['pit_n_scored']} folds scored — "
+                      f"this is the one that counts):")
+                for name, agg in rep["by_vol_regime_pit"].items():
                     print(f"  {name:<9} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
                           f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
 
@@ -2127,7 +2190,9 @@ async def run(args) -> None:
                                       ridge_alpha=args.ridge_alpha,
                                       smooth_span=args.smooth_span,
                                       knife_lambda=args.knife_lambda,
-                                      winsorize_pct=args.winsorize_target)
+                                      winsorize_pct=args.winsorize_target,
+                                      max_test_date=args.max_test_date,
+                                      min_test_date=args.min_test_date)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 if args.sector_neutral_ic and "sector_summary" in res:
@@ -2149,6 +2214,14 @@ async def run(args) -> None:
             _verdict("verdict(univ)", real["summary"]["mean_ic"], null_means)
 
 
+def _iso_date(raw: str) -> date:
+    """argparse type for YYYY-MM-DD; panel grid dates are datetime.date."""
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {raw!r}") from exc
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Cross-sectional LightGBM walk-forward baseline")
     p.add_argument(
@@ -2159,6 +2232,15 @@ def main() -> None:
     p.add_argument("--max-train-months", type=int, default=None,
                    help="rolling window length in months (default: expanding)")
     p.add_argument("--min-names", type=int, default=30, help="skip thinner test cross-sections")
+    p.add_argument("--max-test-date", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+                   help="score only folds whose TEST date is on or before this. Frozen-holdout "
+                        "discipline: research/selection runs must stop far enough back that every "
+                        "label is realized before the holdout opens (holdout 2024-01 => 3M "
+                        "2023-09-30, 6M 2023-06-30, 1Y 2022-12-31). Training is unaffected.")
+    p.add_argument("--min-test-date", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+                   help="score only folds whose TEST date is on or after this. Used ONCE per "
+                        "finalized config for the frozen holdout run (--min-test-date 2024-01-01); "
+                        "that run is a sign/sanity check, not a significance test.")
     p.add_argument("--target", default="return",
                    choices=["return", "rank", "quantile", "sector_return",
                             "sector_return_vol", "beta_resid", "beta_sector_resid",

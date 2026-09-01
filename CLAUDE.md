@@ -50,9 +50,22 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
   | 6M | +0.054 | +0.007 | −0.057 |
   | 1Y | +0.028 | +0.007 | −0.064 |
 
-  (sector IC shown.) The pattern holds across two objectives (L2 and LambdaRank) and all three horizons: whatever the book picks up works in calm markets and **inverts under stress** (3M sector IC 2020 −0.12, 2022 −0.030, 2025 −0.067). This was invisible in the pooled mean and is the audit's open item #11.
+  (sector IC shown.) The pattern holds across two objectives (L2 and LambdaRank) and all three horizons: whatever the book picks up works in calm markets and **inverts under stress** (3M sector IC 2020 −0.12, 2022 −0.030, 2025 −0.067). This was invisible in the pooled mean and is the audit's open item #11. ⚠️ **These tertiles are IN-SAMPLE** (breakpoints cut over the whole fold set), so the table describes the panel; it is not evidence for a tradeable rule. `regime_report` now also returns `by_vol_regime_pit` — the same cut against an expanding window of strictly prior folds (24-fold burn-in) — and that is the one a regime claim has to survive.
 - **Status: no horizon currently clears the promotion bar.** `PRODUCTION_HORIZON_SPECS` is UNCHANGED (the overlays still behave as designed — 3M turnover 0.154→0.077, 1Y 0.090→0.041), but the specs are no longer backed by a significant result. Do not describe this model as having demonstrated edge until something clears SECB again.
 - Signal is cross-sectional (relative ranking), not absolute direction — absolute direction has no detectable edge
+
+### Research protocol (locked 2026-08-31)
+
+Adopted after the audit remediation showed that two construction errors had carried the entire measured signal. The point is to make it impossible to promote on a sub-floor result again.
+
+- **Frozen holdout, purge-aware.** The holdout is calendar **2024-01 onward** and is touched ONCE per finalized config. Selection/research folds must have labels fully realized before it opens: `--max-test-date` = **3M 2023-09-30, 6M 2023-06-30, 1Y 2022-12-31**. The holdout run passes `--min-test-date 2024-01-01`. Both are new flags on `walk_forward_ic` (they filter the fold list; the per-fold training window is untouched) and are threaded through every call site in `run()` — main fit, target-blend fit, reg-sweep, shuffle-null — so A/Bs and nulls stay matched. There is no default: truncation is always explicit.
+- **The holdout is a sign/sanity check, not a significance test.** With data through 2026-08 it yields roughly 28 / 25 / 19 folds at 3M / 6M / 1Y (a label must also be realized *inside* the holdout), i.e. 2–3 effective 1Y blocks. Always report it next to its own min-detect IC.
+- **The honest benchmark is IC ≈ 0.01–0.02**, not the old "Qlib SOTA 0.045" comparison, which was cross-market (retail-dominated China) and cross-horizon. Our detection floors are 0.030–0.035, i.e. **the floor sits above the realistic effect**: the panel currently cannot distinguish "no signal" from "normal honest signal", and anything that DOES clear the bar is disproportionately likely to be contamination.
+- **Sanity ceiling: any large-cap monthly IC > ~0.035 is presumptively a bug or a leak.** Audit before celebrating — the 2026-08 audit is the existence proof.
+- **No sub-floor significance hunts.** An experiment must either target |ΔIC| ≥ ~0.02, raise N_eff (universe breadth qualifies; single features almost never do), or be judged against a criterion written down numerically BEFORE the run.
+- **Compute discipline.** Iterate single-seed L2; 8-seed / LambdaRank only to confirm, with matched seeds for any A/B.
+- **Production stays frozen** while research runs. Only a lever that passes its own pre-written criterion ships.
+- **Honesty note on the vol-regime hypothesis:** it was motivated by an *in-sample* observation on these same folds. It rests on a literature prior (Barroso–Santa-Clara 2015 own-vol scaling; Daniel–Moskowitz 2016 momentum crashes), not on in-panel significance — with ~5 stress episodes in the sample it cannot be validated in-panel, and generic factor-vol-timing is refuted (Cederburg et al. 2020). Any rule built on it must be near-parameter-free and never swept.
 
 **Shelved: PatchTST transformer** (`backend/ml/model.py`, `train.py`, `dataset.py`)
 - 4-layer encoder, FeatureGate variable-selection, multi-horizon heads, ~1M params
