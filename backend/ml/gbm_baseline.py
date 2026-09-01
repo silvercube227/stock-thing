@@ -175,6 +175,9 @@ class HorizonSpec:
     # don't dominate the L2 split; scoring stays on unclipped realized returns. Only
     # valid for return-like target modes (asserted at fit time).
     winsorize_pct: float = 0.0
+    # Shrink ranks toward 0.5 on point-in-time high-vol dates. Only meaningful when
+    # smooth_span > 0 — see vol_gate_ranks for why it is inert on its own.
+    vol_gate: bool = False
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -1050,6 +1053,64 @@ def knife_overlay_ranks(
     return _rank01((1.0 - lam) * model_p - lam * _rank01(knife))
 
 
+def vol_gate_flags(
+    vol_med: list[float | None], pct: float = 0.80, burn_in: int = 24
+) -> list[bool]:
+    """Per-date "is this a stress cross-section?", knowable at the time.
+
+    A date is gated when its cross-sectional median RAW realized vol exceeds the
+    `pct` quantile of the medians on all STRICTLY EARLIER dates. Expanding window,
+    so no future information; dates inside `burn_in` are never gated because a
+    quantile over a handful of points is noise. Missing medians are never gated and
+    do not enter the history.
+
+    Near-parameter-free on purpose. Generic factor-vol-timing does not replicate
+    (Cederburg et al. 2020); only own-vol scaling does (Barroso-Santa-Clara 2015),
+    and with ~5 stress episodes in the panel there is nothing here to tune against.
+    """
+    flags: list[bool] = []
+    history: list[float] = []
+    for i, v in enumerate(vol_med):
+        ok = v is not None and v == v
+        if ok and i >= burn_in and len(history) >= burn_in:
+            flags.append(bool(v > float(np.quantile(np.asarray(history), pct))))
+        else:
+            flags.append(False)
+        if ok:
+            history.append(float(v))
+    return flags
+
+
+def vol_gate_ranks(
+    model_ranks: np.ndarray, gated: bool, shrink: float = 0.5
+) -> np.ndarray:
+    """Shrink a cross-section's percentile ranks toward 0.5 when the date is gated.
+
+    ⚠️ This is a MONOTONE transform of the cross-section, so it leaves that date's
+    Spearman rank-IC exactly unchanged — there is no shrink factor that moves IC
+    toward zero (shrink=0 makes it undefined, not 0). It bites only where ranks are
+    compared ACROSS dates, i.e. composed with `ewma_rank_by_ticker`: halving the
+    spread of today's ranks halves their weight in the EWMA, so a gated date leans
+    on the pre-stress rank instead. A horizon with `smooth_span == 0` is therefore
+    provably unaffected, and 6M is excluded on that ground rather than by result.
+    """
+    ranks = np.asarray(model_ranks, dtype=float)
+    if not gated or shrink >= 1.0:
+        return ranks
+    return 0.5 + (ranks - 0.5) * float(shrink)
+
+
+def apply_vol_gate(
+    rank_series: list[np.ndarray], vol_med: list[float | None],
+    pct: float = 0.80, burn_in: int = 24, shrink: float = 0.5,
+) -> tuple[list[np.ndarray], list[bool]]:
+    """Walk-forward adapter: gate each fold's ranks, returning ranks + the flags."""
+    flags = vol_gate_flags(vol_med, pct=pct, burn_in=burn_in)
+    gated = [vol_gate_ranks(rk, g, shrink)
+             for rk, g in zip(rank_series, flags, strict=True)]
+    return gated, flags
+
+
 def apply_knife_overlay(records: list[dict], lam: float) -> list[np.ndarray]:
     """Per-fold rank arrays after the falling-knife output overlay (see
     `knife_overlay_ranks`). `lam=0` returns each fold's model ranks unchanged.
@@ -1365,6 +1426,7 @@ def walk_forward_ic(
     winsorize_pct: float = 0.0,
     max_test_date=None,
     min_test_date=None,
+    vol_gate: bool = False,
     return_records: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
@@ -1489,8 +1551,19 @@ def walk_forward_ic(
     # re-rank, so scoring on the transformed rank == scoring on its rank. lam/span = 0
     # are no-ops, so the default path keeps the raw per-fold IC scored in the loop.
     turnover_smoothed = None
-    if (knife_lambda > 0 or smooth_span > 0) and records:
+    n_gated = 0
+    if (knife_lambda > 0 or smooth_span > 0 or vol_gate) and records:
         ranks = apply_knife_overlay(records, knife_lambda)  # lam=0 → model ranks
+        if vol_gate:
+            # Must precede smoothing: the gate has no effect on a single date's
+            # rank-IC (monotone), it only changes how much that date contributes
+            # to the cross-date EWMA.
+            ranks, gate_flags = apply_vol_gate(
+                ranks, [f.get("vol_raw_med") for f in fold_rows]
+            )
+            n_gated = int(sum(gate_flags))
+            for fold, g in zip(fold_rows, gate_flags, strict=True):
+                fold["vol_gated"] = bool(g)
         if smooth_span > 0:
             ranks = ewma_rank_by_ticker(records, smooth_span, rank_series=ranks)
         for fold, rec, rk in zip(fold_rows, records, ranks, strict=True):
@@ -1503,6 +1576,7 @@ def walk_forward_ic(
     result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
     result["turnover_raw"] = rank_turnover(records)
     result["turnover_smoothed"] = turnover_smoothed
+    result["n_vol_gated"] = n_gated
     if return_records:
         # Raw per-fold (ticker_ids, pred, r, sector) so a caller can sweep smoothing
         # spans / turnover WITHOUT refitting (the fits dominate cost).
@@ -2006,6 +2080,7 @@ async def run(args) -> None:
                                winsorize_pct=args.winsorize_target,
                                max_test_date=args.max_test_date,
                                min_test_date=args.min_test_date,
+                               vol_gate=args.vol_gate,
                                return_records=(knife_grid is not None
                                                or blend_grid is not None
                                                or args.size_neutral_ic))
@@ -2143,6 +2218,12 @@ async def run(args) -> None:
 
         # REGIME: a pooled mean hides regime dependence, which a size-tilted signal
         # is especially prone to.
+        if args.vol_gate:
+            n_f = max(1, len(real["folds"]))
+            print(f"[vol-gate] fired on {real['n_vol_gated']}/{len(real['folds'])} fold(s) "
+                  f"({real['n_vol_gated'] / n_f:.0%})"
+                  + ("" if args.smooth_span else
+                     "  -- NOTE: smooth_span=0, so this is inert by construction"))
         if args.regime_report:
             rep = regime_report(real["folds"])
             print("\n[REGIME] per-calendar-year:")
@@ -2192,7 +2273,8 @@ async def run(args) -> None:
                                       knife_lambda=args.knife_lambda,
                                       winsorize_pct=args.winsorize_target,
                                       max_test_date=args.max_test_date,
-                                      min_test_date=args.min_test_date)
+                                      min_test_date=args.min_test_date,
+                                      vol_gate=args.vol_gate)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 if args.sector_neutral_ic and "sector_summary" in res:
@@ -2409,6 +2491,11 @@ def main() -> None:
                         "Spearman, post-hoc on the same folds — no refits). The size "
                         "premium is a documented RISK premium; what survives this is "
                         "the part not explained by a size tilt.")
+    p.add_argument("--vol-gate", action="store_true",
+                   help="shrink ranks toward 0.5 on PIT high-vol dates (expanding 80th "
+                        "pctile of the cross-sectional median raw vol, 24-fold burn-in). "
+                        "Composes BEFORE smoothing; provably inert without it, so 6M "
+                        "(smooth_span=0) is unaffected by construction.")
     p.add_argument("--regime-report", action="store_true",
                    help="break per-fold IC out by calendar year and by realized-vol "
                         "tertile. A pooled mean hides regime dependence.")

@@ -54,6 +54,8 @@ from backend.ml.gbm_baseline import (
     fit_lgbm_model,
     knife_overlay_ranks,
     knife_tier,
+    vol_gate_flags,
+    vol_gate_ranks,
     prepare_panel,
     winsorize_by_date,
 )
@@ -202,12 +204,23 @@ def score_current_cross_section(
         raise ValueError(f"no active ticker rows available for as_of={as_of}")
 
     if isinstance(specs, dict):
-        iter_pairs = [(h, _spec_feature_cols(s), getattr(s, "knife_lambda", 0.0))
+        iter_pairs = [(h, _spec_feature_cols(s), getattr(s, "knife_lambda", 0.0),
+                       getattr(s, "vol_gate", False))
                       for h, s in specs.items()]
     else:
-        iter_pairs = [(h, list(FEATURE_COLS), 0.0) for h in specs]
+        iter_pairs = [(h, list(FEATURE_COLS), 0.0, False) for h in specs]
 
     import pandas as pd
+
+    # Is `as_of` a point-in-time stress cross-section? The gate compares this date's
+    # cross-sectional median raw vol against the expanding 80th percentile of every
+    # EARLIER grid date, which the panel already carries (prepare_panel stashes
+    # `vol_120d_raw` before rank-normalization) — no extra state, no new table.
+    vol_gated = False
+    if "vol_120d_raw" in panel.columns:
+        med = (panel[panel["date"] <= as_of]
+               .groupby("date")["vol_120d_raw"].median().sort_index())
+        vol_gated = bool(vol_gate_flags(list(med.to_numpy(dtype=float)))[-1]) if len(med) else False
 
     # Risk features for the falling-knife overlay (one cross-section), read from the
     # rank-normalized panel; reused across horizons since they're horizon-agnostic.
@@ -227,7 +240,7 @@ def score_current_cross_section(
 
     rows: list[dict] = []
     n = len(current)
-    for h, cols, knife_lambda in iter_pairs:
+    for h, cols, knife_lambda, spec_vol_gate in iter_pairs:
         # Predictions are mapped to within-cross-section percentile rank in [0, 1]
         # before storage. The previous "clip to [0,1]" path worked for `rank`-mode
         # training where preds were already roughly in that range, but a
@@ -254,6 +267,11 @@ def score_current_cross_section(
             # out of the top before the rank is stored / smoothed. No-op when
             # knife_lambda=0 or the risk features are absent.
             ranks = knife_overlay_ranks(ranks, knife_risk, knife_lambda)
+            # Stress gate: shrink toward 0.5 so this date carries less weight in the
+            # cross-date EWMA below. Inert unless the horizon smooths (see
+            # vol_gate_ranks) — must therefore run BEFORE apply_rank_smoothing.
+            if spec_vol_gate:
+                ranks = vol_gate_ranks(ranks, vol_gated)
         else:
             ranks = np.full_like(preds, 0.5, dtype=float)
         for ticker_id, rank in zip(current["ticker_id"].to_numpy(), ranks, strict=True):
@@ -426,6 +444,7 @@ def _specs_from_serialized(serialized: dict) -> dict[str, HorizonSpec]:
             knife_lambda=d.get("knife_lambda", 0.0),
             max_train_months=d.get("max_train_months", None),
             winsorize_pct=d.get("winsorize_pct", 0.0),
+            vol_gate=d.get("vol_gate", False),
         )
     return out
 
@@ -475,6 +494,7 @@ def _serialize_spec(spec: HorizonSpec) -> dict:
         "knife_lambda": getattr(spec, "knife_lambda", 0.0),
         "max_train_months": getattr(spec, "max_train_months", None),
         "winsorize_pct": getattr(spec, "winsorize_pct", 0.0),
+        "vol_gate": getattr(spec, "vol_gate", False),
     }
 
 

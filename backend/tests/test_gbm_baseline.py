@@ -2246,3 +2246,86 @@ def test_regime_report_pit_drops_the_burn_in_window():
     short = regime_report(_rising_vol_folds(20), burn_in=24)
     assert short["by_vol_regime_pit"] == {}
     assert short["by_vol_regime"]  # the in-sample cut still works
+
+
+# --- Stage 2: point-in-time volatility gate ----------------------------------
+# The gate shrinks a stress cross-section's ranks toward 0.5. That is a MONOTONE
+# transform, so it cannot move that date's rank-IC — it only reduces how much the
+# date weighs in the cross-date EWMA. These tests pin both halves of that claim,
+# because the acceptance criterion is meaningless if the mechanism is misread.
+
+def test_vol_gate_flags_use_only_prior_dates_and_respect_burn_in():
+    from backend.ml.gbm_baseline import vol_gate_flags
+
+    calm = [0.10] * 30
+    flags = vol_gate_flags(calm + [0.90], pct=0.80, burn_in=24)
+    assert flags[-1] is True                     # the spike clears the 80th pctile
+    assert not any(flags[:-1])                   # a flat history gates nothing
+    # Nothing inside the burn-in is ever gated, however extreme.
+    assert not any(vol_gate_flags([0.1] * 5 + [9.9] * 10, burn_in=24))
+
+
+def test_vol_gate_flags_ignore_missing_medians():
+    from backend.ml.gbm_baseline import vol_gate_flags
+
+    series = [0.10] * 30 + [None, float("nan"), 0.90]
+    flags = vol_gate_flags(series, pct=0.80, burn_in=24)
+    assert flags[30] is False and flags[31] is False
+    assert flags[32] is True
+
+
+def test_vol_gate_ranks_shrink_toward_a_half_but_preserve_order():
+    from backend.ml.gbm_baseline import vol_gate_ranks
+
+    ranks = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    out = vol_gate_ranks(ranks, gated=True, shrink=0.5)
+    assert np.allclose(out, [0.25, 0.375, 0.5, 0.625, 0.75])
+    # Monotone: the within-date ordering — and therefore the rank-IC — is untouched.
+    assert np.array_equal(np.argsort(out), np.argsort(ranks))
+    assert np.array_equal(vol_gate_ranks(ranks, gated=False), ranks)
+
+
+def test_vol_gate_cannot_change_ic_without_smoothing():
+    """6M runs smooth_span=0, so the gate is excluded there BY CONSTRUCTION rather
+    than by a null result. This is the test that keeps that claim honest."""
+    panel = _planted_panel(n_dates=60, n_names=40, beta=1.0, seed=11)
+    wf = WalkForwardConfig(min_train_months=12, min_names=20)
+    cfg = LGBMConfig(n_estimators=40)
+
+    base = walk_forward_ic(panel, "1M", cfg, wf, seed=1, compute_sector_ic=False)
+    gated = walk_forward_ic(panel, "1M", cfg, wf, seed=1, compute_sector_ic=False,
+                            vol_gate=True)
+    assert [f["ic"] for f in gated["folds"]] == [f["ic"] for f in base["folds"]]
+
+
+def test_vol_gate_changes_ranks_once_smoothing_composes():
+    from backend.ml.gbm_baseline import _rank01, apply_vol_gate, ewma_rank_by_ticker
+
+    rng = np.random.default_rng(0)
+    ids = np.arange(30)
+    records = [{"ticker_ids": ids, "pred": rng.normal(size=30)} for _ in range(40)]
+    vol = [0.1] * 35 + [0.9] * 5           # a stress stretch at the end
+
+    plain = ewma_rank_by_ticker(records, span=4)
+    ranks = [_rank01(r["pred"]) for r in records]
+    gated_ranks, flags = apply_vol_gate(ranks, vol)
+    composed = ewma_rank_by_ticker(records, span=4, rank_series=gated_ranks)
+
+    assert any(flags), "expected the tail to be gated"
+    assert not np.allclose(composed[-1], plain[-1]), (
+        "gate must bite once ranks are compared across dates"
+    )
+
+
+def test_horizon_spec_vol_gate_round_trips_through_serialization():
+    from backend.ml.gbm_baseline import HorizonSpec
+    from backend.ml.gbm_inference import _serialize_spec, _specs_from_serialized
+
+    spec = HorizonSpec(target_mode="sector_return", smooth_span=3, vol_gate=True)
+    back = _specs_from_serialized({"3M": _serialize_spec(spec)})["3M"]
+    assert back.vol_gate is True
+    assert back.smooth_span == 3
+    # A pre-Stage-2 artifact has no key at all and must default to off.
+    legacy = _serialize_spec(spec)
+    legacy.pop("vol_gate")
+    assert _specs_from_serialized({"3M": legacy})["3M"].vol_gate is False
