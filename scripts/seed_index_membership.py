@@ -12,6 +12,21 @@ Sources, in order of authority:
   2. `tickers.removed_at` — the removal date captured when the historical seed ran.
   3. The "Selected changes" wikitable, when present. Wikipedia removed it from the
      page (2026), so this is treated as optional: absent, we fall back to 1 + 2.
+  4. fja05680/sp500 `sp500_ticker_start_end.csv` (MIT), used ONLY to recover
+     membership stretches that ENDED before our own interval for that name began.
+     Sources 1+2 know a name's CURRENT entry date, so a name demoted from the index
+     and later re-promoted (AMD out 2013 / back 2017, DD, DOW, EQT, PCG, TMUS, ...)
+     was silently absent from every cross-section in between. That is lost breadth,
+     and it is a non-random loss: demoted-then-repromoted names are exactly the
+     recovery cohort.
+
+     Deliberately NOT authoritative. Audited 2026-08-31, the file carries real
+     corruption at its recent edge -- symbols that do not exist (FDXF, HONA),
+     members it lists as exited while its own snapshot file still carries them
+     (MMC), and renames modelled as an exit plus a new entry (FISV->FI, FB->META,
+     ABC->COR). Consuming only CLOSED intervals that end before our own start date,
+     for symbols already in `tickers`, sidesteps all three: the corruption lives in
+     the open/current intervals, and a rename produces no gap so it never qualifies.
 
 Interval rules (valid_to is EXCLUSIVE; null = still a member):
   * current member with a known "Date added"
@@ -22,6 +37,8 @@ Interval rules (valid_to is EXCLUSIVE; null = still a member):
                                 (no addition date survives for these)
   * a change-table row that adds a name back after a removal opens a second
     interval, which is why the PK is (ticker_id, valid_from)
+  * an fja interval ending at or before our own start
+                             -> [max(fja_start, 2010-01-01), fja_end)  source 'fja05680_prior'
 
 Full refresh: deletes and rebuilds every row, so it is safe to re-run.
 
@@ -31,18 +48,22 @@ present): names removed before the historical seed's window were never inserted 
 names carry an assumed rather than observed start.
 
 Usage:
-    python -m scripts.seed_index_membership [--dry-run]
+    python -m scripts.seed_index_membership [--dry-run] [--no-fja]
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import io
 from collections import defaultdict
 from datetime import date, datetime
 
 import bs4
+import httpx
 
+from backend.config import get_settings
 from backend.ingestion.db import pool_context
 from backend.ingestion.prices import HISTORY_START
 from scripts.seed_sp500 import normalize_symbol
@@ -52,6 +73,10 @@ from scripts.seed_sp500_historical import fetch_wiki_html, parse_change_rows
 WINDOW_START: date = HISTORY_START
 
 _DATE_FORMATS = ("%Y-%m-%d", "%B %d, %Y", "%b %d, %Y", "%Y")
+
+FJA_URL = (
+    "https://raw.githubusercontent.com/fja05680/sp500/master/sp500_ticker_start_end.csv"
+)
 
 
 def _parse_added_date(raw: str | None) -> date | None:
@@ -112,6 +137,85 @@ def parse_constituents_with_dates(html: str) -> dict[str, date | None]:
         )
         out[symbol] = _parse_added_date(raw)
     return out
+
+
+async def fetch_fja_csv() -> str:
+    settings = get_settings()
+    headers = {"User-Agent": f"stock-thing-seed/1.0 ({settings.sec_edgar_user_agent})"}
+    async with httpx.AsyncClient(timeout=30.0, headers=headers, follow_redirects=True) as client:
+        resp = await client.get(FJA_URL)
+        resp.raise_for_status()
+    return resp.text
+
+
+def parse_fja_intervals(
+    csv_text: str, window_start: date = WINDOW_START
+) -> dict[str, list[tuple[date, date | None]]]:
+    """{symbol -> [(start, end|None)]} from fja05680's ticker_start_end CSV.
+
+    Pure: takes the CSV text, no network. Symbols are normalised to our yfinance
+    convention (BF.B -> BF-B). Intervals that closed before the panel window are
+    dropped; a blank end date means "still a member" and is kept as None.
+    """
+    out: dict[str, list[tuple[date, date | None]]] = defaultdict(list)
+    for row in csv.DictReader(io.StringIO(csv_text)):
+        symbol = normalize_symbol((row.get("ticker") or "").strip())
+        if not symbol:
+            continue
+        try:
+            start = date.fromisoformat((row.get("start_date") or "").strip())
+        except ValueError:
+            continue
+        raw_end = (row.get("end_date") or "").strip()
+        end: date | None = None
+        if raw_end:
+            try:
+                end = date.fromisoformat(raw_end)
+            except ValueError:
+                continue
+            if end <= window_start:
+                continue
+        out[symbol].append((start, end))
+    return {sym: sorted(ivs) for sym, ivs in out.items()}
+
+
+def add_prior_intervals(
+    intervals: dict[str, list[dict]],
+    fja: dict[str, list[tuple[date, date | None]]],
+    window_start: date = WINDOW_START,
+) -> tuple[dict[str, list[dict]], list[str]]:
+    """Splice in earlier membership stretches that our own sources cannot see.
+
+    Sources 1+2 give a name its CURRENT entry date, so a stretch that ended before
+    that date is simply missing: AMD was an index member until 2013 and again from
+    2017, and we had only the 2017 interval, so AMD was absent from every 2010-2013
+    cross-section despite being a member with full price history.
+
+    Only CLOSED fja intervals ending at or before our own earliest start qualify.
+    That single condition is what makes an untrusted source safe to use here: the
+    file's corruption is all in its open/current rows, and a rename (FISV -> FI)
+    leaves no gap, so it never produces a splice. Purely additive -- an existing
+    interval is never modified or dropped -- and conservative: a name we cannot
+    corroborate simply stays out of those cross-sections, as it is today.
+    """
+    out = {sym: list(ivs) for sym, ivs in intervals.items()}
+    added: list[str] = []
+    for symbol, ours in out.items():
+        prior = fja.get(symbol)
+        if not prior:
+            continue
+        earliest = min(iv["valid_from"] for iv in ours)
+        for start, end in prior:
+            if end is None or end > earliest:
+                continue
+            clipped = max(start, window_start)
+            if clipped >= end:
+                continue  # entirely before the panel window
+            ours.append({"valid_from": clipped, "valid_to": end,
+                         "source": "fja05680_prior"})
+            added.append(f"{symbol} [{clipped} .. {end})")
+        ours.sort(key=lambda iv: iv["valid_from"])
+    return out, added
 
 
 def build_intervals(
@@ -235,6 +339,27 @@ async def amain(args: argparse.Namespace) -> int:
             added_dates, removed_at, set(by_symbol), change_rows,
             still_active=still_active, observed_on=date.today(),
         )
+
+        # Recover membership stretches that ended before our own start date. Treated
+        # as best-effort: a fetch failure leaves the intervals exactly as sources
+        # 1-3 built them rather than aborting the rebuild.
+        if args.no_fja:
+            print("fja05680 splice disabled (--no-fja)")
+        else:
+            try:
+                fja = parse_fja_intervals(await fetch_fja_csv())
+            except Exception as exc:  # noqa: BLE001 — optional source
+                print(f"fja05680 unavailable ({exc}); keeping intervals as built")
+            else:
+                unmatched = sorted(set(fja) - set(by_symbol))
+                intervals, spliced = add_prior_intervals(intervals, fja)
+                print(f"fja05680: {len(fja)} symbol(s); spliced {len(spliced)} prior "
+                      f"interval(s) onto names we already hold")
+                for line in spliced:
+                    print(f"    + {line}")
+                print(f"  {len(unmatched)} fja symbol(s) absent from `tickers` "
+                      f"(mostly pre-2016 exits with no retrievable price history)")
+
         total = sum(len(v) for v in intervals.values())
         multi = sum(1 for v in intervals.values() if len(v) > 1)
         sources: dict[str, int] = defaultdict(int)
@@ -278,6 +403,8 @@ async def amain(args: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dry-run", action="store_true", help="report without writing")
+    p.add_argument("--no-fja", action="store_true",
+                   help="skip the fja05680 prior-interval splice (source 4)")
     return asyncio.run(amain(p.parse_args()))
 
 
