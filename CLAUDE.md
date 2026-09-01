@@ -79,6 +79,37 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
 
   Also: the gate **fired on 29–33% of folds, not the ≤20% the rule assumed "by construction"** — an expanding 80th percentile over an upward-drifting vol series fires far more often than 20%, the same drift that skews the PIT tertiles. So the display-side variant (2b) fails its own firing-rate criterion too, and per protocol the percentile is not tuned to fix it. The one real side effect is ~13% lower rank turnover (3M 0.0798→0.0696, 1Y 0.0491→0.0439), a mechanical consequence of leaning on the prior rank — but smoothing already owns turnover, and turnover is a stability proxy, not a portfolio quantity. **Mechanism kept and tested (`vol_gate_flags` / `vol_gate_ranks` / `--vol-gate`, `HorizonSpec.vol_gate`); `PRODUCTION_HORIZON_SPECS` unchanged.**
 
+- **Stage 3 — residual momentum: REJECTED at diagnostics, no fits run.** All five `RESIDUAL_MOM_FEATURES` fail the decorrelation gate AND the standalone gate at every horizon (selection folds only):
+
+  | feature | \|corr\| vs book | top correlate | 3M sec_p | 6M sec_p | 1Y sec_p |
+  |---|---|---|---|---|---|
+  | resid_mom_12_1 | 0.292 | **mom_12_1 = 0.94** | 0.448 | 0.572 | 0.927 |
+  | resid_mom_6m | 0.354 | **mom_6m = 0.95** | 0.953 | 0.559 | 0.909 |
+  | mom_accel_3_6 | 0.219 | mom_6m = 0.68 | 0.800 | 0.499 | 0.933 |
+  | mom_consistency_6m | 0.274 | mom_6m = 0.68 | 0.885 | 0.467 | 0.911 |
+  | industry_neutral_mom_12_1 | 0.232 | mom_12_1 = 0.78 | 0.780 | 0.677 | 0.689 |
+
+  **Why residualizing momentum is nearly a cross-sectional no-op:** `resid_mom = mom − beta·market_return`, and within a single date the market term is COMMON to every name. Only beta dispersion separates names, and that is second-order — hence corr 0.94–0.95 with the raw momentum already in the book. Blitz–Huij–Martens residual momentum halves *time-series* volatility, which is a different claim from adding *cross-sectional* rank information. Nothing here to promote at any horizon; not worth a fit.
+
+- **Incidental finding from the same tables — the two promoted packs are not equally supported on the fixed panel.** The 3M revision-momentum pack largely holds up: `coverage_chg_90d` sec_ic +0.0239 with **sec_p 0.009** and only 0.057 correlation with the book (the cleanest feature in the whole diagnostic), `eps_est_rev_90d` +0.0251 / p 0.011, `eps_est_rev_30d` +0.0140 / p 0.040. But `pt_num_estimates` is negative (−0.0117) and 0.42-correlated with `log_market_cap` — a size proxy that looks like a drag — and the 6M/1Y `revenue_surprise` clears nothing (sec_p 0.60 at 6M, 0.32 at 1Y) despite being promoted at both. Analyst-revision *breadth* is the most promising place left to look; `revenue_surprise` and `pt_num_estimates` are the first things to re-ablate.
+
+- **Frozen-holdout run (2024-01+, ONE shot, production specs unchanged, 8-seed).** Nothing was promoted during the program, so the surviving config is the existing `PRODUCTION_HORIZON_SPECS`. Sign/sanity check only:
+
+  | Horizon | folds | eff_blocks | SEC IC | hit | SECB t_block | min_detect | reading |
+  |---------|-------|------------|--------|-----|--------------|------------|---------|
+  | 3M | 29 | 9.7 | **+0.0139** | 0.59 | +0.32 | 0.0746 | positive sign, far below floor |
+  | 6M | 26 | 4.3 | **+0.0285** | 0.73 | +1.04 | 0.0418 | positive sign, below floor |
+  | 1Y | 19 | 1.6 | **−0.0537** | 0.11 | −1.62 | 0.0231 | negative, but n≈1.6 blocks |
+
+  3M and 6M are the first positive out-of-sample signs since the audit; neither is significant. **Two traps this run illustrates, both worth remembering:**
+
+  1. **Naive t is dangerously seductive here.** 6M shows naive t = **+2.54** (hit 0.73, universe naive t +3.96) and block-corrected t = +1.04, p = 0.20. Overlapping labels inflate the naive statistic by ~2.5x. Never quote the naive t.
+  2. **Below ~5 effective blocks the bootstrap p-value and min_detect are themselves unreliable.** The 6M *universe* bootstrap reports p = 0.0020 with a CI excluding zero while its own t_block is only +1.62; at 1Y, eff_blocks = 1.6 produces se = 0.0118 and p = 0.0005 on 19 folds where only 2 were positive. With that few resample units the centered null is too coarse to mean anything. Read the sign and the hit rate; ignore the p.
+
+  **Design lesson: freezing 2024+ leaves 1Y with essentially no evidential power** (19 monthly folds x 12-month labels ≈ 1.6 independent periods). The 1Y holdout is one macro episode in which the ranking ran backwards — consistent with the vol-regime inversion (2025 was a stress year), but it is not independent evidence for it, and it is not a significance result either.
+
+- **Program outcome: nothing cleared the bar; `PRODUCTION_HORIZON_SPECS` is unchanged.** What the program did buy: ~2x the pre-2016 cross-section, PIT-replicated regime dependence, an enforced holdout, a diagnostics path that no longer reads it, and three levers killed cheaply (vol gate, residual momentum, and — implicitly — the "shrinkage moves IC" premise). The most promising remaining thread is analyst-revision breadth (`coverage_chg_90d`), not price-derived features.
+
 ### Research protocol (locked 2026-08-31)
 
 Adopted after the audit remediation showed that two construction errors had carried the entire measured signal. The point is to make it impossible to promote on a sub-floor result again.
