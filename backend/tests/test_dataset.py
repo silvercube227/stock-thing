@@ -82,15 +82,39 @@ def test_labels_down_when_price_falls():
 def test_return_target_is_log_ratio():
     import math
     adj = [2.0] * 300
-    adj[21] = 2.0 * math.e          # 1M horizon (21 bars) -> log(e) = 1.0
+    # Entry is the bar AFTER end_idx (implementation lag), so the 1M exit bar is
+    # 1 + 21 = 22, not 21.
+    adj[22] = 2.0 * math.e          # 1M horizon (21 bars) -> log(e) = 1.0
     labels, returns, mask = compute_targets(adj, end_idx=0)
     assert mask["1M"] and abs(returns["1M"] - 1.0) < 1e-9 and labels["1M"] == 1
     assert returns["3M"] == 0.0 and labels["3M"] == 0   # flat -> non-positive
 
 
+def test_label_ignores_the_signal_bar_close():
+    """The entry price is the NEXT bar, so bar `end_idx` cannot enter the return.
+
+    Pins the one-bar implementation lag: without it, signal and entry share a close.
+    """
+    adj = [1.0] * 300
+    baseline = compute_targets(adj, end_idx=0)[1]
+    adj[0] = 100.0                  # wild price on the signal bar only
+    shifted = compute_targets(adj, end_idx=0)[1]
+    assert shifted == baseline
+
+
+def test_label_masked_when_entry_bar_missing():
+    """No bar after `end_idx` means the position could never be opened."""
+    adj = [float(i + 1) for i in range(300)]
+    labels, returns, mask = compute_targets(adj, end_idx=299)
+    for h in HORIZONS:
+        assert mask[h] is False
+        assert returns[h] == 0.0
+
+
 def test_labels_mask_beyond_available_bars():
     adj = [float(i + 1) for i in range(300)]
-    # end_idx=100: 1Y (252) lands at 352 >= 300 -> masked; shorter horizons fine.
+    # end_idx=100: entry at 101, 1Y (252) exits at 353 >= 300 -> masked;
+    # shorter horizons fine.
     labels, returns, mask = compute_targets(adj, end_idx=100)
     assert mask["1M"] and mask["3M"] and mask["6M"]
     assert mask["1Y"] is False

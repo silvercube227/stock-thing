@@ -10,7 +10,7 @@ from __future__ import annotations
 # Tabular factor columns the model trains on (order is informational only).
 PRICE_FEATURES = [
     "mom_1m", "mom_3m", "mom_6m", "mom_12_1",   # momentum (12_1 skips the last month)
-    "log_market_cap",                           # log(adj_close × shares_outstanding)
+    "log_market_cap",                           # log(raw close × as-reported PIT shares)
     "vol_20d", "vol_60d", "vol_120d",           # realized vol
     "dist_high_252", "dist_low_252",            # distance to 52w extremes
     "ma_gap_50", "ma_gap_200",                  # gap vs moving averages
@@ -126,8 +126,14 @@ INSIDER_FEATURES = [
 SEASONALITY_FEATURES = [
     "seasonal_same_month_5y", "seasonal_other_month_5y", "seasonal_gap_5y",
 ]
+# FinBERT rolling news sentiment. NOT in FEATURE_COLS: yfinance only serves ~30 days
+# of headlines and there is no backfill, so sentiment_daily covers a few months while
+# the panel spans 2010+. The columns were ~98% zero in training yet non-zero at
+# inference — a train/serve skew where the model never had the chance to learn the
+# feature it was being served. Still computed on every row, so `--with-sentiment`
+# turns them back on the moment a real headline archive exists.
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
-FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
+FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES
 # EXPERIMENTAL_FEATURES: per-ticker features produced by build_ticker_rows (eligible for
 # `--feature-diagnostics` and `--with-*` packs). knife_score is excluded because it is a
 # PANEL-LEVEL feature computed by add_knife_score_feature AFTER cross-sectional normalization
@@ -137,7 +143,7 @@ EXPERIMENTAL_FEATURES = (
     + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + EPS_SURPRISE_FEATURES
     + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES + LOTTERY_FEATURES
     + MICROSTRUCTURE_FEATURES + EPS_DISPERSION_FEATURES + SHORT_INTEREST_FEATURES
-    + SEASONALITY_FEATURES + INSIDER_FEATURES
+    + SEASONALITY_FEATURES + INSIDER_FEATURES + SENTIMENT_FEATURES
     # KNIFE_FEATURES intentionally excluded — panel-level, not in build_ticker_rows
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /

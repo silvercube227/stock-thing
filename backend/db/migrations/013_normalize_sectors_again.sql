@@ -1,0 +1,20 @@
+-- Migration 013: re-normalize the 'Technology' sector label (follow-up to 006).
+--
+-- Six mega-cap names (AAPL, MSFT, NVDA, AVGO, ADBE, ORCL) were sitting under the
+-- raw yfinance label 'Technology' instead of GICS 'Information Technology', so they
+-- formed their own 6-name peer group. That is worse than cosmetic:
+--
+--   * within_sector_ic() requires min_group_size = 10, so a 6-name group is SKIPPED
+--     entirely -> the largest tech names never entered the headline SECB metric.
+--   * apply_target_modes() uses sector_min_group_size = 5, so they DID train against
+--     a 6-name peer median rather than the ~93-name Information Technology sector,
+--     which is not the selection bar the model is supposed to be learning.
+--
+-- Migration 006 fixed this class of bug once; these rows re-leaked afterwards. The
+-- guard in backend/jobs/add_ticker.py only stores a sector that already exists in
+-- the table, so once no row carries 'Technology' the label cannot be reintroduced
+-- by the add-ticker path.
+--
+-- Note: sector = 'Index' on the four ETFs (SPY/QQQ/DIA/VTI) is deliberate and left
+-- alone — ETFs are not part of the equity cross-section.
+update tickers set sector = 'Information Technology' where sector = 'Technology';

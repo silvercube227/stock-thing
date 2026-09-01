@@ -176,9 +176,31 @@ on conflict (ticker_id, trade_date) do update set
 """
 
 
-async def _fetch_active_tickers(pool: asyncpg.Pool) -> list[tuple[int, str]]:
+async def _fetch_tradeable_tickers(pool: asyncpg.Pool) -> list[tuple[int, str]]:
+    """Tickers worth pulling bars for: index members plus anything still trading.
+
+    Filtering on `active` alone froze the removed-from-index cohort at seed time,
+    so those names stopped accruing bars and their forward labels went permanently
+    masked — survivorship creeping back in through the ingest path. Many removals
+    are index demotions, not delistings; those names keep trading and belong in the
+    panel.
+
+    Self-healing by design: a name that truly delists stops producing bars and ages
+    out of the recency window on its own, so we don't keep hammering yfinance for
+    dead symbols and no maintenance flag is required.
+    """
     rows = await pool.fetch(
-        "select ticker_id, symbol from tickers where active = true order by ticker_id"
+        """
+        select t.ticker_id, t.symbol
+          from tickers t
+         where t.active = true
+            or exists (
+                select 1 from price_history ph
+                 where ph.ticker_id = t.ticker_id
+                   and ph.trade_date >= current_date - 21
+            )
+         order by t.ticker_id
+        """
     )
     return [(r["ticker_id"], r["symbol"]) for r in rows]
 
@@ -327,7 +349,7 @@ async def ingest_full_history(
     Use this for the initial bootstrap and as the recovery path after drift.
     """
     if tickers is None:
-        tickers = await _fetch_active_tickers(pool)
+        tickers = await _fetch_tradeable_tickers(pool)
     tickers = list(tickers)
 
     started = datetime.now(timezone.utc)
@@ -366,7 +388,7 @@ async def ingest_recent(
     ticker is re-pulled from HISTORY_START to absorb the split/dividend.
     """
     if tickers is None:
-        tickers = await _fetch_active_tickers(pool)
+        tickers = await _fetch_tradeable_tickers(pool)
     tickers = list(tickers)
 
     started = datetime.now(timezone.utc)

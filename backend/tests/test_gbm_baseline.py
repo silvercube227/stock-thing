@@ -519,17 +519,33 @@ def test_block_bootstrap_summary_reports_power_floor():
 
 
 def test_build_market_horizon_returns_aggregates_over_trading_days():
-    # 25 fake trading days with constant +1% daily log return; H=21 trading days
-    # => market_r_h = 21 * 0.01 = 0.21 at any grid date with 21 days forward.
+    # 30 fake trading days with constant +1% daily log return; H=21 trading days
+    # => market_r_h = 21 * 0.01 = 0.21 at any grid date with a full window ahead.
+    # The window starts at idx(g)+2 because entry is the bar AFTER g (implementation
+    # lag) and daily[i] is the return INTO bar i — so g needs 21 + 2 slots after it.
     from backend.ingestion.calendar import HORIZON_TRADING_DAYS as HTD
-    dates = [date(2020, 1, 1) + timedelta(days=i) for i in range(25)]
+    dates = [date(2020, 1, 1) + timedelta(days=i) for i in range(30)]
     market_returns = {d: 0.01 for d in dates}
     grid = [dates[0], dates[3], dates[-2]]
     out = build_market_horizon_returns(market_returns, grid, horizons=("1M",))
-    # 21 trading days forward from dates[0] and dates[3] both fit; dates[-2] does not.
     assert abs(out["1M"][dates[0]] - HTD["1M"] * 0.01) < 1e-9
     assert abs(out["1M"][dates[3]] - HTD["1M"] * 0.01) < 1e-9
     assert dates[-2] not in out["1M"]  # window runs past end
+
+
+def test_build_market_horizon_returns_starts_after_the_grid_date():
+    """The market leg must span the same bars the ticker's lagged label does.
+
+    Entry is the bar after the grid date, so the return ON the grid date and the
+    return on the very next bar are both OUTSIDE the window.
+    """
+    dates = [date(2020, 1, 1) + timedelta(days=i) for i in range(30)]
+    market_returns = {d: 0.0 for d in dates}
+    market_returns[dates[5]] = 1.0   # return into the grid date itself
+    market_returns[dates[6]] = 2.0   # return into the entry bar
+    market_returns[dates[7]] = 0.5   # first return actually earned while holding
+    out = build_market_horizon_returns(market_returns, [dates[5]], horizons=("1M",))
+    assert out["1M"][dates[5]] == pytest.approx(0.5)
 
 
 def test_industry_neutral_momentum_subtracts_within_date_industry_median():
@@ -1899,3 +1915,243 @@ def test_seasonality_columns_flow_into_panel():
         assert c in panel.columns
         # Rank-normalized into [-1, 1] like every other feature.
         assert panel[c].between(-1.0, 1.0).all()
+
+
+# =============================================================
+# Sentiment demoted to an opt-in pack
+# =============================================================
+
+
+def test_sentiment_not_in_default_feature_cols():
+    """yfinance gives ~30 days of headlines and there is no backfill, so these
+    columns were ~98% zero in training yet non-zero at inference. They stay off the
+    default book until a real archive exists."""
+    from backend.ml.factors.constants import FEATURE_COLS, SENTIMENT_FEATURES
+
+    for col in SENTIMENT_FEATURES:
+        assert col not in FEATURE_COLS
+
+
+def _pack_args(**overrides):
+    """Namespace with every --with-* pack off, so a test can flip exactly one."""
+    import argparse
+
+    flags = {
+        "with_valuation", "with_quality", "with_residual_mom",
+        "with_earnings_reaction", "with_analyst_revisions", "with_estimate_surprise",
+        "with_eps_surprise", "with_revision_momentum", "with_forward_valuation",
+        "with_lottery", "with_microstructure", "with_eps_dispersion",
+        "with_short_interest", "with_knife_feature", "with_seasonality",
+        "with_insider", "with_sentiment",
+    }
+    ns = {f: False for f in flags} | {"extra_features": None}
+    return argparse.Namespace(**(ns | overrides))
+
+
+def test_with_sentiment_flag_readds_the_pack():
+    from backend.ml.factors.constants import SENTIMENT_FEATURES
+    from backend.ml.gbm_baseline import _compose_feature_cols
+
+    off = _compose_feature_cols(_pack_args())
+    on = _compose_feature_cols(_pack_args(with_sentiment=True))
+    for col in SENTIMENT_FEATURES:
+        assert col not in off
+        assert col in on
+
+
+def test_production_specs_exclude_sentiment():
+    """The promoted per-horizon lists derive from FEATURE_COLS, so they must not
+    carry the unvalidated sentiment columns into production inference."""
+    from backend.ml.factors.constants import SENTIMENT_FEATURES
+    from backend.ml.gbm_baseline import PRODUCTION_HORIZON_SPECS
+
+    for horizon, spec in PRODUCTION_HORIZON_SPECS.items():
+        cols = spec.feature_cols or []
+        for col in SENTIMENT_FEATURES:
+            assert col not in cols, f"{horizon} still serves {col}"
+
+
+# =============================================================
+# Point-in-time index-membership filter
+# =============================================================
+
+
+def _membership_panel():
+    return pd.DataFrame({
+        "date": [date(2017, 1, 31)] * 3 + [date(2023, 1, 31)] * 3,
+        "ticker_id": [1, 2, 3] * 2,
+        "in_index": [True, False, None, True, True, None],
+        "mom_1m": [0.1] * 6,
+    })
+
+
+def test_membership_filter_drops_rows_outside_membership():
+    """Ticker 2 joined the index later, so its 2017 row must not be in the
+    cross-section — otherwise the panel selects on future index promotion."""
+    from backend.ml.gbm_baseline import apply_membership_filter
+
+    out = apply_membership_filter(_membership_panel())
+    kept = set(zip(out["date"], out["ticker_id"]))
+    assert (date(2017, 1, 31), 2) not in kept
+    assert (date(2017, 1, 31), 1) in kept
+    assert (date(2023, 1, 31), 2) in kept
+
+
+def test_membership_filter_drops_unknown_membership_by_default():
+    from backend.ml.gbm_baseline import apply_membership_filter
+
+    out = apply_membership_filter(_membership_panel())
+    assert 3 not in set(out["ticker_id"])
+
+
+def test_membership_filter_keeps_exempt_ids():
+    """User-added off-index tickers never have membership; they are scored but
+    excluded from training separately, so the filter must not drop them."""
+    from backend.ml.gbm_baseline import apply_membership_filter
+
+    out = apply_membership_filter(_membership_panel(), exempt_ids={3})
+    assert set(out.loc[out["ticker_id"] == 3, "date"]) == {
+        date(2017, 1, 31), date(2023, 1, 31)
+    }
+
+
+def test_membership_filter_passes_through_panels_without_the_column():
+    """Hand-built test panels have no in_index column and must not be filtered."""
+    from backend.ml.gbm_baseline import apply_membership_filter
+
+    df = pd.DataFrame({"date": [date(2020, 1, 31)], "ticker_id": [1], "mom_1m": [0.1]})
+    assert len(apply_membership_filter(df)) == 1
+
+
+def test_membership_filter_raises_when_no_membership_loaded():
+    """A frame cache predating the migration would otherwise silently empty the
+    entire panel — fail loudly instead."""
+    from backend.ml.gbm_baseline import apply_membership_filter
+
+    df = pd.DataFrame({
+        "date": [date(2020, 1, 31)] * 2,
+        "ticker_id": [1, 2],
+        "in_index": [None, None],
+    })
+    with pytest.raises(RuntimeError, match="refresh-cache"):
+        apply_membership_filter(df)
+
+
+def test_in_index_on_respects_exclusive_valid_to():
+    from backend.ml.factors.assembly import _in_index_on
+
+    intervals = [{"valid_from": date(2015, 1, 1), "valid_to": date(2020, 6, 1)}]
+    assert _in_index_on(intervals, date(2015, 1, 1)) is True   # inclusive start
+    assert _in_index_on(intervals, date(2020, 5, 31)) is True
+    assert _in_index_on(intervals, date(2020, 6, 1)) is False  # exclusive end
+    assert _in_index_on(intervals, date(2014, 12, 31)) is False
+
+
+def test_in_index_on_handles_open_and_multiple_intervals():
+    from backend.ml.factors.assembly import _in_index_on
+
+    intervals = [
+        {"valid_from": date(2010, 1, 1), "valid_to": date(2015, 8, 1)},
+        {"valid_from": date(2021, 4, 1), "valid_to": None},
+    ]
+    assert _in_index_on(intervals, date(2012, 1, 1)) is True
+    assert _in_index_on(intervals, date(2018, 1, 1)) is False   # the gap
+    assert _in_index_on(intervals, date(2026, 1, 1)) is True    # open interval
+
+
+def test_in_index_on_returns_none_when_not_loaded():
+    from backend.ml.factors.assembly import _in_index_on
+
+    assert _in_index_on(None, date(2020, 1, 1)) is None
+    assert _in_index_on([], date(2020, 1, 1)) is False
+
+
+# =============================================================
+# Size-neutral IC + regime report
+# =============================================================
+
+
+def test_partial_spearman_kills_a_pure_size_confound():
+    """If both the prediction and the realized return are just size, the naive IC
+    is high but nothing survives holding size constant."""
+    from backend.ml.gbm_baseline import _partial_spearman
+
+    rng = np.random.default_rng(0)
+    size = rng.normal(size=300)
+    pred = size + 0.01 * rng.normal(size=300)
+    r = size + 0.01 * rng.normal(size=300)
+    naive = pd.Series(pred).corr(pd.Series(r), method="spearman")
+    assert naive > 0.9
+    assert abs(_partial_spearman(pred, r, size)) < 0.25
+
+
+def test_partial_spearman_keeps_signal_orthogonal_to_size():
+    from backend.ml.gbm_baseline import _partial_spearman
+
+    rng = np.random.default_rng(1)
+    size = rng.normal(size=400)
+    signal = rng.normal(size=400)
+    r = signal + 0.1 * rng.normal(size=400)
+    naive = pd.Series(signal).corr(pd.Series(r), method="spearman")
+    partial = _partial_spearman(signal, r, size)
+    assert partial == pytest.approx(naive, abs=0.1)
+
+
+def test_size_neutral_summary_runs_over_records():
+    from backend.ml.gbm_baseline import size_neutral_summary
+
+    rng = np.random.default_rng(2)
+    records = []
+    for i in range(8):
+        n = 60
+        size = rng.normal(size=n)
+        # A partly size-driven signal — not size exactly, which would make the
+        # partial correlation genuinely undefined (denominator -> 0).
+        records.append({
+            "date": date(2020, 1 + i % 12, 28),
+            "pred": 0.6 * size + 0.8 * rng.normal(size=n),
+            "r": 0.6 * size + 0.8 * rng.normal(size=n),
+            "size": size,
+            "sector": np.array(["A"] * 30 + ["B"] * 30),
+        })
+    out = size_neutral_summary(records, block_size=3, reps=50)
+    assert out["universe"]["n_folds"] == 8
+    assert abs(out["universe"]["mean_ic"]) < 0.3   # size confound removed
+    assert out["sector"]["n_folds"] == 8
+
+
+def test_size_neutral_summary_skips_records_without_size():
+    from backend.ml.gbm_baseline import size_neutral_summary
+
+    records = [{"date": date(2020, 1, 31), "pred": np.zeros(5),
+                "r": np.zeros(5), "size": None, "sector": None}]
+    out = size_neutral_summary(records, block_size=3, reps=10)
+    assert out["universe"]["n_folds"] == 0
+
+
+def test_regime_report_groups_by_year_and_vol_tertile():
+    from backend.ml.gbm_baseline import regime_report
+
+    folds = [
+        {"date": date(2020, m, 28), "ic": 0.05, "sector_ic": 0.03, "vol_raw_med": 0.01 * m}
+        for m in range(1, 13)
+    ] + [
+        {"date": date(2021, m, 28), "ic": -0.02, "sector_ic": -0.01, "vol_raw_med": 0.5}
+        for m in range(1, 7)
+    ]
+    rep = regime_report(folds)
+    assert rep["by_year"][2020]["n"] == 12
+    assert rep["by_year"][2020]["hit_rate"] == 1.0
+    assert rep["by_year"][2021]["hit_rate"] == 0.0
+    assert set(rep["by_vol_regime"]) == {"low_vol", "mid_vol", "high_vol"}
+    # The 2021 folds all carry the highest vol, so that bucket is the negative one.
+    assert rep["by_vol_regime"]["high_vol"]["mean_ic"] < 0
+
+
+def test_regime_report_omits_vol_split_without_the_raw_column():
+    from backend.ml.gbm_baseline import regime_report
+
+    folds = [{"date": date(2020, m, 28), "ic": 0.01} for m in range(1, 8)]
+    rep = regime_report(folds)
+    assert rep["by_vol_regime"] == {}
+    assert rep["by_year"][2020]["n"] == 7

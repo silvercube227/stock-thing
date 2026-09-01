@@ -1,7 +1,10 @@
-"""Backfill SEC EDGAR fundamentals for active equity tickers.
+"""Backfill SEC EDGAR fundamentals for every equity with a CIK.
+
+Includes removed-from-index names: leaving that cohort without fundamentals made
+`fund_available` a proxy for future index removal (a survivorship leak).
 
 Usage:
-    python -m scripts.backfill_fundamentals                  # all active equities
+    python -m scripts.backfill_fundamentals                  # all equities with a CIK
     python -m scripts.backfill_fundamentals --symbols AAPL MSFT
 
 Requires SEC_EDGAR_USER_AGENT in .env (SEC rejects unidentified requests).
@@ -33,8 +36,8 @@ async def amain(symbols: list[str] | None) -> int:
                 """
                 select ticker_id, symbol, cik
                   from tickers
-                 where active = true
-                   and asset_type = 'equity'
+                 where asset_type = 'equity'
+                   and cik is not null
                    and symbol = any($1::text[])
                  order by ticker_id
                 """,
@@ -43,7 +46,7 @@ async def amain(symbols: list[str] | None) -> int:
             tickers = [(r["ticker_id"], r["symbol"], r["cik"]) for r in rows]
             if not tickers:
                 print(
-                    f"No matching active equities for: {', '.join(symbols_upper)}",
+                    f"No matching equities with a CIK for: {', '.join(symbols_upper)}",
                     file=sys.stderr,
                 )
                 return 1

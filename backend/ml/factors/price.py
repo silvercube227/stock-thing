@@ -14,18 +14,26 @@ def _price_features(
     adj_close: list[float | None], volume: list[float], trade_dates: list, pos: int,
     shares_outstanding: int | None = None,
     market_returns: dict | None = None,
+    market_cap: float | None = None,
 ) -> dict[str, float]:
     """Factor features computed from the ticker's own series up to bar `pos`.
 
     Requires pos >= SEQUENCE_LENGTH (252) so the 12-1 momentum and 52-week window
     have full lookback — the same minimum the aligned assembler enforces.
+
+    `market_cap` is the point-in-time cap assembled by the caller (raw close x
+    as-reported shares). When it is None the legacy adj_close x current-shares
+    formula is used, which is NOT point-in-time — see `_market_cap_at`.
     """
     P = adj_close[pos]
-    log_mcap = (
-        math.log(P * shares_outstanding)
-        if P and shares_outstanding and P > 0 and shares_outstanding > 0
-        else 0.0
-    )
+    if market_cap is not None:
+        log_mcap = math.log(market_cap) if market_cap > 0 else 0.0
+    else:
+        log_mcap = (
+            math.log(P * shares_outstanding)
+            if P and shares_outstanding and P > 0 and shares_outstanding > 0
+            else 0.0
+        )
     feats = {
         "mom_1m": _log_ratio(P, adj_close[pos - 21]),
         "mom_3m": _log_ratio(P, adj_close[pos - 63]),

@@ -548,8 +548,18 @@ def prepare_panel(
     industry_relative: bool = False,
     min_group_size: int = 5,
     n_grades: int = 5,
+    membership_filter: bool = False,
+    membership_exempt_ids: set | None = None,
+    log=lambda *_: None,
 ):
-    """Full pipeline: assemble → demean target → rank-normalize features → targets."""
+    """Full pipeline: assemble → demean target → rank-normalize features → targets.
+
+    `membership_filter` drops (date, ticker) rows where the ticker was not an index
+    member on that date. It runs BEFORE normalization on purpose: the per-date
+    feature ranks must be computed over the universe that actually existed, not one
+    padded with names the index had not yet promoted. `membership_exempt_ids` keeps
+    rows that never have membership by design (user-added off-index tickers).
+    """
     market_returns = build_universe_return_map(frames)
     panel = assemble_panel(
         frames,
@@ -559,6 +569,10 @@ def prepare_panel(
     )
     if panel.empty:
         return panel
+    if membership_filter:
+        panel = apply_membership_filter(panel, membership_exempt_ids, log=log)
+        if panel.empty:
+            return panel
     medians = cross_sectional_medians(frames)
     panel = demean_cross_sectional(panel, medians)
     panel = add_industry_neutral_momentum(panel, min_group_size=min_group_size)
@@ -589,6 +603,38 @@ def prepare_panel(
 # =============================================================
 # Walk-forward
 # =============================================================
+
+
+def apply_membership_filter(panel, exempt_ids: set | None = None, log=lambda *_: None):
+    """Keep only rows where the ticker was an index member on the row's date.
+
+    Without this the cross-sections are padded with names the index promoted LATER,
+    which selects on future success — the mirror image of survivorship bias. Rows
+    for `exempt_ids` (user-added off-index tickers) are kept: they are scored, never
+    trained on, and are excluded from training separately.
+
+    Raises if membership was never loaded, rather than silently emptying the panel.
+    Panels built by hand in tests have no `in_index` column and pass through.
+    """
+    if "in_index" not in panel.columns:
+        return panel
+
+    in_index = panel["in_index"]
+    if in_index.isna().all():
+        raise RuntimeError(
+            "membership filter requested but no index_membership data is loaded — "
+            "apply migration 012, run scripts.seed_index_membership, and rebuild the "
+            "frame cache with --refresh-cache"
+        )
+
+    # `in_index` is object dtype (True/False/None), so compare explicitly rather
+    # than fillna+astype, which pandas is deprecating for object columns.
+    keep = in_index.eq(True)
+    if exempt_ids:
+        keep = keep | panel["ticker_id"].isin(exempt_ids)
+    dropped = int((~keep).sum())
+    log(f"membership filter: kept {int(keep.sum()):,} rows, dropped {dropped:,}")
+    return panel[keep].reset_index(drop=True)
 
 
 def walk_forward_folds(grid_dates: list, min_train_months: int, embargo_steps: int):
@@ -1384,6 +1430,11 @@ def walk_forward_ic(
             continue
         fold = {"date": test_date, "ic": float(ic), "n_test": int(test.shape[0]),
                 "n_train": int(train.shape[0])}
+        # Raw (pre-normalization) vol median: a regime proxy for --regime-report.
+        # The normalized vol_120d column cannot serve — a per-date median of
+        # within-date ranks is ~constant by construction.
+        if "vol_120d_raw" in test.columns:
+            fold["vol_raw_med"] = float(np.nanmedian(test["vol_120d_raw"].to_numpy(dtype=float)))
         if compute_sector_ic:
             fold["sector_ic"] = within_sector_ic(
                 preds, test, r_col, group_col=sector_group_col
@@ -1401,6 +1452,9 @@ def walk_forward_ic(
             "pred": np.asarray(preds, dtype=float),
             "r": test[r_col].to_numpy(dtype=float),
             "sector": test[sector_group_col].to_numpy() if sector_group_col in test.columns else None,
+            # Rank-normalized size, for the partial-correlation size-neutral IC.
+            "size": (test["log_market_cap"].to_numpy(dtype=float)
+                     if "log_market_cap" in test.columns else None),
             "risk": risk,
         })
         log(
@@ -1454,6 +1508,130 @@ def summarize(ics: list[float]) -> dict:
     t_stat = icir * math.sqrt(n) if std > 0 else float("nan")  # significance across folds
     return {"n_folds": n, "mean_ic": mean, "std_ic": std,
             "icir": icir, "t_stat": t_stat, "hit_rate": float((a > 0).mean())}
+
+
+def _partial_spearman(pred: np.ndarray, r: np.ndarray, size: np.ndarray) -> float:
+    """Spearman correlation between pred and r, holding size constant.
+
+    Closed form: rho(p,r|s) = (rho_pr - rho_ps*rho_rs) / sqrt((1-rho_ps^2)(1-rho_rs^2)).
+    Answers "does the signal rank names correctly among same-size peers?" — the
+    size premium is a documented risk premium, so IC that survives this is the
+    part not explained by a size tilt.
+    """
+    import pandas as pd
+
+    ok = np.isfinite(pred) & np.isfinite(r) & np.isfinite(size)
+    if ok.sum() < 10:
+        return float("nan")
+    p, y, s = pred[ok], r[ok], size[ok]
+    if len(set(s.tolist())) < 2 or len(set(p.tolist())) < 2 or len(set(y.tolist())) < 2:
+        return float("nan")
+
+    def rho(a, b):
+        return pd.Series(a).corr(pd.Series(b), method="spearman")
+
+    r_pr, r_ps, r_rs = rho(p, y), rho(p, s), rho(y, s)
+    if any(v != v for v in (r_pr, r_ps, r_rs)):
+        return float("nan")
+    denom = math.sqrt(max(0.0, (1 - r_ps ** 2) * (1 - r_rs ** 2)))
+    if denom <= 1e-12:
+        return float("nan")
+    return float((r_pr - r_ps * r_rs) / denom)
+
+
+def size_neutral_summary(
+    records: list[dict],
+    block_size: int,
+    reps: int = 2000,
+    min_group_size: int = 10,
+) -> dict:
+    """Universe and within-sector IC after partialling out size, per fold.
+
+    Post-hoc on the walk-forward's own predictions — no refits. The audit found
+    that dropping `log_market_cap` removed significance at every horizon, i.e. the
+    result was load-bearing on a size tilt; this quantifies what is left once size
+    is held constant.
+    """
+    import pandas as pd
+
+    uni: list[float] = []
+    sec: list[float] = []
+    for rec in records:
+        size = rec.get("size")
+        if size is None:
+            continue
+        pred = np.asarray(rec["pred"], dtype=float)
+        r = np.asarray(rec["r"], dtype=float)
+        size = np.asarray(size, dtype=float)
+        val = _partial_spearman(pred, r, size)
+        if val == val:
+            uni.append(val)
+
+        sectors = rec.get("sector")
+        if sectors is None:
+            continue
+        per_sector: list[float] = []
+        for group in pd.unique(pd.Series(sectors).dropna()):
+            m = np.asarray(pd.Series(sectors).to_numpy() == group)
+            if m.sum() < min_group_size:
+                continue
+            val_s = _partial_spearman(pred[m], r[m], size[m])
+            if val_s == val_s:
+                per_sector.append(val_s)
+        if per_sector:
+            sec.append(float(np.mean(per_sector)))
+
+    return {
+        "universe": {**summarize(uni),
+                     **block_bootstrap_summary(uni, block_size, reps=reps)},
+        "sector": {**summarize(sec),
+                   **block_bootstrap_summary(sec, block_size, reps=reps)},
+    }
+
+
+def regime_report(folds: list[dict]) -> dict:
+    """Per-fold IC broken out by calendar year and by volatility regime.
+
+    The headline is a pooled mean over 2013-2026, which hides regime dependence —
+    especially for a size-tilted signal, where a mega-cap-led stretch and a
+    broadening stretch are different worlds. Pure function over existing fold rows.
+    """
+    from collections import defaultdict
+
+    rows = [f for f in folds if f.get("ic") == f.get("ic")]
+    by_year: dict[int, list[dict]] = defaultdict(list)
+    for f in rows:
+        by_year[f["date"].year].append(f)
+
+    def agg(items: list[dict]) -> dict:
+        ics = [f["ic"] for f in items]
+        secs = [f["sector_ic"] for f in items
+                if f.get("sector_ic") is not None and f["sector_ic"] == f["sector_ic"]]
+        return {
+            "n": len(items),
+            "mean_ic": float(np.mean(ics)) if ics else float("nan"),
+            "mean_sector_ic": float(np.mean(secs)) if secs else float("nan"),
+            "hit_rate": float(np.mean([1.0 if v > 0 else 0.0 for v in ics])) if ics else float("nan"),
+        }
+
+    years = {year: agg(items) for year, items in sorted(by_year.items())}
+
+    # Volatility regime: split folds into tertiles of the cross-sectional median
+    # of RAW realized vol on the fold date.
+    vol_rows = [f for f in rows if f.get("vol_raw_med") == f.get("vol_raw_med")
+                and f.get("vol_raw_med") is not None]
+    regimes: dict[str, dict] = {}
+    if len(vol_rows) >= 6:
+        vols = np.asarray([f["vol_raw_med"] for f in vol_rows], dtype=float)
+        lo, hi = np.quantile(vols, [1 / 3, 2 / 3])
+        buckets = {
+            "low_vol": [f for f in vol_rows if f["vol_raw_med"] <= lo],
+            "mid_vol": [f for f in vol_rows if lo < f["vol_raw_med"] <= hi],
+            "high_vol": [f for f in vol_rows if f["vol_raw_med"] > hi],
+        }
+        regimes = {name: agg(items) for name, items in buckets.items() if items}
+
+    return {"by_year": years, "by_vol_regime": regimes}
 
 
 def block_bootstrap_summary(
@@ -1645,6 +1823,8 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(SEASONALITY_FEATURES)
     if args.with_insider:
         cols += list(INSIDER_FEATURES)
+    if getattr(args, "with_sentiment", False):
+        cols += list(SENTIMENT_FEATURES)
     # Ad-hoc single features (e.g. isolating one member of a pack for an ablation).
     if getattr(args, "extra_features", None):
         cols += [c.strip() for c in args.extra_features.split(",") if c.strip()]
@@ -1704,6 +1884,8 @@ async def run(args) -> None:
             rank_cols=feature_cols,
             industry_relative=args.industry_relative,
             n_grades=args.rank_grades,
+            membership_filter=args.membership_filter,
+            log=print,
         )
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
@@ -1716,10 +1898,19 @@ async def run(args) -> None:
         if args.feature_diagnostics:
             # Default the candidates to the packs the user opted into (everything beyond
             # the production FEATURE_COLS). No model fits — just panel statistics.
-            candidates = [c for c in feature_cols if c not in FEATURE_COLS]
+            # --diagnose-features overrides that so an IN-BOOK feature can be vetted
+            # too (e.g. re-checking fund_available after the survivorship backfill).
+            if args.diagnose_features:
+                candidates = [c.strip() for c in args.diagnose_features.split(",") if c.strip()]
+                missing = [c for c in candidates if c not in panel.columns]
+                if missing:
+                    raise SystemExit(f"--diagnose-features: not in the panel: {missing}")
+            else:
+                candidates = [c for c in feature_cols if c not in FEATURE_COLS]
             if not candidates:
                 raise SystemExit("--feature-diagnostics needs candidate features; "
-                                 "add a pack, e.g. --with-microstructure")
+                                 "add a pack (e.g. --with-microstructure) or name them "
+                                 "with --diagnose-features")
             block_size = args.block_size or max(
                 1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
             )
@@ -1764,7 +1955,9 @@ async def run(args) -> None:
                                smooth_span=args.smooth_span,
                                knife_lambda=args.knife_lambda,
                                winsorize_pct=args.winsorize_target,
-                               return_records=knife_grid is not None or blend_grid is not None)
+                               return_records=(knife_grid is not None
+                                               or blend_grid is not None
+                                               or args.size_neutral_ic))
         block_size = args.block_size or max(
             1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
         )
@@ -1872,6 +2065,41 @@ async def run(args) -> None:
                 )
                 _print_bootstrap("SECB", sec_boot)
                 _print_power("SECB", sec_boot)
+
+        # SIZE-NEUTRAL: the size premium is a known risk premium, not alpha. This is
+        # what survives once size is held constant within each cross-section.
+        if args.size_neutral_ic:
+            if not real.get("records"):
+                print("[size-neutral] no fold records available")
+            else:
+                sn = size_neutral_summary(
+                    real["records"], block_size=block_size,
+                    reps=args.block_bootstrap_reps or 2000,
+                )
+                print("\n[SIZE-NEUTRAL] partial Spearman IC holding log_market_cap constant:")
+                _print_summary("SN-U", sn["universe"])
+                _print_bootstrap("SN-U", sn["universe"])
+                if sn["sector"]["n_folds"]:
+                    _print_summary("SN-S", sn["sector"])
+                    _print_bootstrap("SN-S", sn["sector"])
+                    _print_power("SN-S", sn["sector"])
+                print("  (SN-S is the honest read: within-sector selection net of the "
+                      "size tilt.)")
+
+        # REGIME: a pooled mean hides regime dependence, which a size-tilted signal
+        # is especially prone to.
+        if args.regime_report:
+            rep = regime_report(real["folds"])
+            print("\n[REGIME] per-calendar-year:")
+            print(f"  {'year':<6} {'n':>4} {'mean_ic':>9} {'sector_ic':>10} {'hit':>6}")
+            for year, agg in rep["by_year"].items():
+                print(f"  {year:<6} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
+                      f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
+            if rep["by_vol_regime"]:
+                print("  by realized-vol regime (tertiles of the cross-sectional median):")
+                for name, agg in rep["by_vol_regime"].items():
+                    print(f"  {name:<9} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
+                          f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
 
         # DIAGNOSTIC: universe IC includes sector rotation; high here + flat SECB
         # ⇒ the edge is sector timing, not stock selection (does NOT clear the bar).
@@ -2090,6 +2318,31 @@ def main() -> None:
                         "calendar-month return persistence: seasonal_same/other/gap_5y). "
                         "Expect signal at 3M; 1Y is a wash (forward window spans all "
                         "12 months). PIT-safe (completed months strictly before the bar).")
+    p.add_argument("--diagnose-features", default=None, metavar="c1,c2,...",
+                   help="run --feature-diagnostics on these exact columns instead of "
+                        "the opted-in packs. Needed to vet a feature that is already "
+                        "in the book, e.g. --diagnose-features fund_available,log_market_cap.")
+    p.add_argument("--size-neutral-ic", action="store_true",
+                   help="also report IC with log_market_cap partialled out (partial "
+                        "Spearman, post-hoc on the same folds — no refits). The size "
+                        "premium is a documented RISK premium; what survives this is "
+                        "the part not explained by a size tilt.")
+    p.add_argument("--regime-report", action="store_true",
+                   help="break per-fold IC out by calendar year and by realized-vol "
+                        "tertile. A pooled mean hides regime dependence.")
+    p.add_argument("--membership-filter", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="restrict each cross-section to point-in-time index members "
+                        "(index_membership, migration 012). ON by default: without it "
+                        "a name promoted into the index in 2023 still appears in the "
+                        "2017 cross-sections, which selects on future index promotion. "
+                        "Use --no-membership-filter to measure that bias.")
+    p.add_argument("--with-sentiment", action="store_true",
+                   help="add the FinBERT rolling news sentiment pack (sentiment_7d/"
+                        "sentiment_14d). OFF by default: yfinance serves only ~30 days "
+                        "of headlines, so the columns are ~98%% zero across the panel "
+                        "and cannot be validated. Turn on once a headline archive is "
+                        "backfilled.")
     p.add_argument("--extra-features", default=None, metavar="c1,c2,...",
                    help="append these ad-hoc feature columns to the active list "
                         "(isolate one member of a pack for a targeted ablation, e.g. "

@@ -62,6 +62,25 @@ CONCEPT_FALLBACKS: dict[str, list[str]] = {
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment"],
 }
 
+# Shares outstanding is handled separately from CONCEPT_FALLBACKS: it lives in the
+# `dei` namespace under the "shares" unit (not us-gaap/USD), and its `end` is the
+# cover-page measurement date — typically weeks AFTER period_end — so the ±5-day
+# period match used for the financial facts would reject every entry.
+# Multi-class issuers (META, TSN, RL, EL, UA/UAA, LEN, STZ, ...) tag the cover-page
+# count PER SHARE CLASS on a dimension axis, which leaves the non-dimensional
+# companyfacts array empty — so the first two concepts return nothing at all for
+# them. Weighted-average basic shares is reported non-dimensionally as the all-class
+# total (EPS is computed on it), which recovers those names. It is a period average
+# rather than a point-in-time count, so it is the LAST resort: slightly stale within
+# the period, but contemporaneous with the filing, which is the property that matters.
+# (namespace, concept), most-preferred first.
+SHARES_CONCEPTS: list[tuple[str, str]] = [
+    ("dei", "EntityCommonStockSharesOutstanding"),
+    ("us-gaap", "CommonStockSharesOutstanding"),
+    ("us-gaap", "WeightedAverageNumberOfSharesOutstandingBasic"),
+    ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
+]
+
 # Period-length tolerances (days) for matching the filing's natural span.
 ANNUAL_RANGE = (340, 380)
 QUARTERLY_RANGE = (80, 100)
@@ -128,6 +147,46 @@ def _is_natural_period(entry: dict, form: str) -> bool:
     return False
 
 
+def _shares_by_accn(facts_json: dict) -> dict[str, int]:
+    """{accession -> shares outstanding} from the filing cover page.
+
+    `tickers.shares_outstanding` is a single CURRENT scalar, so pairing it with a
+    2012 price misstates that year's market cap by the whole intervening
+    buyback/issuance history. The cover-page count is contemporaneous with the
+    filing and therefore point-in-time correct once joined on `filed_at`.
+
+    Unlike the financial facts, the cover-page entry's `end` is the date the share
+    count was measured (usually a few weeks after period_end, close to the filing
+    date), so we take the LATEST entry with `end <= filed` per accession rather
+    than period-matching. `dei` wins over `us-gaap` when both are present.
+
+    Caveat: for multi-class issuers the non-dimensional fact may report a single
+    class, so the level can understate total shares. Acceptable for a
+    cross-sectional size factor that is rank-normalized per date.
+    """
+    facts = facts_json.get("facts", {})
+    best: dict[str, tuple[int, str, int]] = {}  # accn -> (priority, end, val)
+    for priority, (namespace, concept) in enumerate(SHARES_CONCEPTS):
+        entries = (
+            facts.get(namespace, {}).get(concept, {}).get("units", {}).get("shares", [])
+        )
+        for entry in entries:
+            if entry.get("form") not in ("10-K", "10-Q"):
+                continue
+            accn, filed, end = entry.get("accn"), entry.get("filed"), entry.get("end")
+            val = entry.get("val")
+            if not accn or not filed or not end or val is None:
+                continue
+            if end > filed:  # measured after the filing was received — not knowable
+                continue
+            current = best.get(accn)
+            # Prefer the better namespace (lower priority); within one namespace,
+            # the latest measurement. Maximizing (-priority, end) gives both.
+            if current is None or (-priority, end) > (-current[0], current[1]):
+                best[accn] = (priority, end, int(val))
+    return {accn: val for accn, (_, _, val) in best.items()}
+
+
 def parse_companyfacts(facts_json: dict, ticker_id: int) -> list[dict]:
     """Convert EDGAR companyfacts JSON into a list of upsert-ready row dicts.
 
@@ -143,6 +202,9 @@ def parse_companyfacts(facts_json: dict, ticker_id: int) -> list[dict]:
       2. For each accn × field, choose the entry whose end matches the
          determined period_end (±5 days for fiscal calendar drift), preferring
          the leftmost concept-name in the fallback list.
+
+    Shares outstanding is collected in a separate pass (see `_shares_by_accn`)
+    because the cover-page fact does not follow the period-matching rule above.
 
     Pure function — exercised by unit tests without network or DB.
     """
@@ -186,6 +248,8 @@ def parse_companyfacts(facts_json: dict, ticker_id: int) -> list[dict]:
                 f["candidates"].setdefault(field_name, []).append(
                     (end, entry["val"], priority)
                 )
+
+    shares_by_accn = _shares_by_accn(facts_json)
 
     rows: list[dict] = []
     for accn, f in accn_data.items():
@@ -244,6 +308,7 @@ def parse_companyfacts(facts_json: dict, ticker_id: int) -> list[dict]:
                 "total_debt": total_debt,
                 "total_equity": equity,
                 "fcf": fcf,
+                "shares_outstanding": shares_by_accn.get(accn),
             }
         )
     return rows
@@ -276,24 +341,25 @@ _UPSERT_SQL = """
 insert into fundamentals (
     ticker_id, accession_number, filing_type, period_end, filed_at,
     revenue, net_income, gross_margin, operating_margin,
-    total_debt, total_equity, fcf, ingested_at
+    total_debt, total_equity, fcf, shares_outstanding, ingested_at
 ) values (
     $1, $2, $3, $4, $5,
     $6, $7, $8, $9,
-    $10, $11, $12, now()
+    $10, $11, $12, $13, now()
 )
 on conflict (ticker_id, accession_number) do update set
-    filing_type      = excluded.filing_type,
-    period_end       = excluded.period_end,
-    filed_at         = excluded.filed_at,
-    revenue          = excluded.revenue,
-    net_income       = excluded.net_income,
-    gross_margin     = excluded.gross_margin,
-    operating_margin = excluded.operating_margin,
-    total_debt       = excluded.total_debt,
-    total_equity     = excluded.total_equity,
-    fcf              = excluded.fcf,
-    ingested_at      = now()
+    filing_type        = excluded.filing_type,
+    period_end         = excluded.period_end,
+    filed_at           = excluded.filed_at,
+    revenue            = excluded.revenue,
+    net_income         = excluded.net_income,
+    gross_margin       = excluded.gross_margin,
+    operating_margin   = excluded.operating_margin,
+    total_debt         = excluded.total_debt,
+    total_equity       = excluded.total_equity,
+    fcf                = excluded.fcf,
+    shares_outstanding = excluded.shares_outstanding,
+    ingested_at        = now()
 """
 
 
@@ -314,6 +380,7 @@ async def _upsert_filings(conn: asyncpg.Connection, rows: list[dict]) -> int:
             r["total_debt"],
             r["total_equity"],
             r["fcf"],
+            r.get("shares_outstanding"),
         )
         for r in rows
     ]
@@ -323,12 +390,19 @@ async def _upsert_filings(conn: asyncpg.Connection, rows: list[dict]) -> int:
 
 
 async def _fetch_equities_with_cik(pool: asyncpg.Pool) -> list[tuple[int, str, str]]:
+    """Every equity with a CIK, INCLUDING removed-from-index names.
+
+    Deliberately not filtered on `active`: the removed cohort trains in the panel
+    too, and leaving it without fundamentals made `fund_available` a proxy for
+    future index removal (a survivorship leak). Names that still file keep getting
+    fresh filings; names that stopped filing simply return no new rows.
+    """
     rows = await pool.fetch(
         """
         select ticker_id, symbol, cik
           from tickers
-         where active = true
-           and asset_type = 'equity'
+         where asset_type = 'equity'
+           and cik is not null
          order by ticker_id
         """
     )

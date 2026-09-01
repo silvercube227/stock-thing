@@ -41,6 +41,26 @@ create unique index if not exists tickers_active_symbol_uniq
 create index if not exists tickers_cik_idx on tickers (cik) where cik is not null;
 
 -- =============================================================
+-- index_membership  (point-in-time S&P 500 membership)
+-- =============================================================
+-- One row per contiguous membership interval; re-added names get multiple rows.
+-- valid_to is EXCLUSIVE (member while valid_from <= d < valid_to); null = current.
+-- Without this the panel selects on future index promotion: a name added in 2023
+-- would otherwise appear in the 2017 cross-sections. See migration 012 for the
+-- `source` provenance values and the pre-2016 coverage gap.
+create table if not exists index_membership (
+    ticker_id   bigint not null references tickers(ticker_id) on delete restrict,
+    valid_from  date not null,              -- inclusive
+    valid_to    date,                       -- exclusive; null = still a member
+    source      text not null default 'wikipedia_changes',
+    ingested_at timestamptz not null default now(),
+    primary key (ticker_id, valid_from)
+);
+
+create index if not exists index_membership_valid_to_idx
+    on index_membership (valid_to);
+
+-- =============================================================
 -- price_history
 -- =============================================================
 create table if not exists price_history (
@@ -77,6 +97,8 @@ create table if not exists fundamentals (
     total_debt          numeric,
     total_equity        numeric,
     fcf                 numeric,
+    shares_outstanding  bigint,                  -- as-reported cover-page count (migration 011);
+                                                 -- with raw close gives historical market cap
     ingested_at         timestamptz not null default now(),
     primary key (ticker_id, accession_number)
 );

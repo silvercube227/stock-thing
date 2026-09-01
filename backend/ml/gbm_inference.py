@@ -75,6 +75,22 @@ def _spec_feature_cols(spec: HorizonSpec) -> list[str]:
     return spec.feature_cols if spec.feature_cols is not None else list(FEATURE_COLS)
 
 
+def _membership_available(frames) -> bool:
+    """True when index_membership was actually loaded for at least one frame.
+
+    The daily pipeline must not hard-fail if migration 012 or the membership seed
+    hasn't been run, so inference degrades to an unfiltered panel with a loud
+    warning — unlike the research CLI, which raises.
+    """
+    available = any(getattr(f, "membership", None) is not None for f in frames)
+    if not available:
+        print(
+            "WARNING: no index_membership data — scoring on an UNFILTERED panel. "
+            "Apply migration 012 and run `python -m scripts.seed_index_membership`."
+        )
+    return available
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -523,7 +539,15 @@ async def run(args) -> None:
         # promoted packs (e.g. revenue_surprise on 6M/1Y) are normalized exactly as
         # they were during the walk-forward validation that promoted them.
         rank_cols = sorted({c for s in specs.values() for c in _spec_feature_cols(s)})
-        panel = prepare_panel(frames, grid, n_buckets=args.n_buckets, rank_cols=rank_cols)
+        # Train on point-in-time index members only, matching the walk-forward that
+        # promoted these specs. User-added names are exempt so they stay in the panel
+        # and get scored at `as_of`; `exclude_ids` below still keeps them out of the fit.
+        panel = prepare_panel(
+            frames, grid, n_buckets=args.n_buckets, rank_cols=rank_cols,
+            membership_filter=_membership_available(frames),
+            membership_exempt_ids=user_added_ids,
+            log=print,
+        )
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
 
@@ -727,7 +751,13 @@ async def score_single_ticker(pool, symbol: str) -> dict:
     grid = build_calendar_grid(frames)
     grid = sorted(set(grid + [as_of]))
     rank_cols = sorted({c for s in specs.values() for c in _spec_feature_cols(s)})
-    panel = prepare_panel(frames, grid, n_buckets=5, rank_cols=rank_cols)
+    # The scored ticker is off-index by definition here, so exempt it from the
+    # membership filter — otherwise the name we were asked to score is dropped.
+    panel = prepare_panel(
+        frames, grid, n_buckets=5, rank_cols=rank_cols,
+        membership_filter=_membership_available(frames),
+        membership_exempt_ids={new_id},
+    )
 
     # Rank against the S&P cross-section ONLY (+ this ticker), so the percentile
     # means "vs the S&P" — not vs other off-index names a user happens to have added.

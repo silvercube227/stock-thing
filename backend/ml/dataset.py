@@ -79,6 +79,10 @@ class TickerFrame:
     short_interest: list[dict] | None = None
     # insider_transactions rows (filing_date PIT); None tolerates older pickled caches.
     insiders: list[dict] | None = None
+    # index_membership intervals [{valid_from, valid_to}] (valid_to exclusive, null =
+    # current). None means "not loaded" (pre-migration cache) and is distinct from []
+    # ("loaded; never a member") — the membership filter has to tell those apart.
+    membership: list[dict] | None = None
 
 
 @dataclass
@@ -118,18 +122,24 @@ def compute_targets(
 ) -> tuple[dict[str, int], dict[str, float], dict[str, bool]]:
     """Direction labels and log-return targets for each horizon at `end_idx`.
 
-    `adj_close` is ascending by trade_date. For horizon H the target is
-    `log(adj_close[end+H] / adj_close[end])` and the label is its sign. A horizon
-    is available iff the bar `end_idx + H` exists with positive prices; otherwise
-    it is masked (label 0, return 0.0).
+    `adj_close` is ascending by trade_date. Features are computed from the close of
+    bar `end_idx`, so the position cannot be entered until the NEXT bar: the return
+    runs `log(adj_close[end+1+H] / adj_close[end+1])`. Without that one-bar
+    implementation lag the label would start at the very close the signal is
+    computed from, which assumes observing a close and trading at it simultaneously.
+
+    A horizon is available iff both bar `end_idx + 1` (the entry) and bar
+    `end_idx + 1 + H` (the exit) exist with positive prices; otherwise it is masked
+    (label 0, return 0.0).
     """
-    base = adj_close[end_idx]
     labels: dict[str, int] = {}
     returns: dict[str, float] = {}
     mask: dict[str, bool] = {}
     n = len(adj_close)
+    entry_idx = end_idx + 1
+    base = adj_close[entry_idx] if entry_idx < n else None
     for h in HORIZONS:
-        j = end_idx + HORIZON_TRADING_DAYS[h]
+        j = entry_idx + HORIZON_TRADING_DAYS[h]
         future = adj_close[j] if j < n else None
         if future is not None and base is not None and base > 0 and future > 0:
             r = math.log(future / base)
@@ -272,6 +282,11 @@ def cross_sectional_medians(
     demeaning reference for cross-sectional labels. The H-day forward return uses a
     panel row shift, which equals an H-bar shift on each ticker's own series since
     all tickers share the NYSE calendar. Returns {horizon: {end_date: median}}.
+
+    The shifts mirror `compute_targets`' one-bar implementation lag: entry is the
+    bar AFTER the sample date, so the reference return runs from shift(-1) to
+    shift(-(H+1)). Keeping the two in step matters because `r_h - median` would
+    otherwise mix a next-bar base against a same-bar reference.
     """
     import pandas as pd
 
@@ -286,7 +301,8 @@ def cross_sectional_medians(
     medians: dict[str, dict[date, float]] = {}
     for h in HORIZONS:
         H = HORIZON_TRADING_DAYS[h]
-        logret = np.log(panel.shift(-H) / panel)     # H trading days forward
+        # Entry at the next bar, exit H bars later (one-bar implementation lag).
+        logret = np.log(panel.shift(-(H + 1)) / panel.shift(-1))
         med = logret.median(axis=1, skipna=True)     # cross-sectional median per date
         medians[h] = {d: float(v) for d, v in med.items() if pd.notna(v)}
     return medians
@@ -386,8 +402,13 @@ def to_arrays(samples: list[Sample]) -> dict[str, np.ndarray]:
 # =============================================================
 
 
+# `close` is the RAW as-traded price; `adj_close` is back-adjusted, so its LEVEL at
+# date t embeds every split/dividend after t. Ratios of adj_close are correct (the
+# factors cancel), which is what returns/momentum use — but a level times a share
+# count is a market cap, and there the adjustment is future information. Both are
+# selected: adj_close for returns, close for market cap.
 _PRICE_SQL = """
-select ticker_id, trade_date, adj_close, volume
+select ticker_id, trade_date, close, adj_close, volume
   from price_history
  where ticker_id = any($1::bigint[])
  order by ticker_id, trade_date
@@ -395,7 +416,7 @@ select ticker_id, trade_date, adj_close, volume
 
 _FUND_SQL = """
 select ticker_id, filed_at, period_end, filing_type, revenue, net_income, gross_margin,
-       operating_margin, total_debt, total_equity, fcf
+       operating_margin, total_debt, total_equity, fcf, shares_outstanding
   from fundamentals
  where ticker_id = any($1::bigint[])
  order by ticker_id, filed_at
@@ -440,6 +461,13 @@ select ticker_id, accession_number, transaction_idx, insider_cik,
   from insider_transactions
  where ticker_id = any($1::bigint[])
  order by ticker_id, filing_date
+"""
+
+_MEMBERSHIP_SQL = """
+select ticker_id, valid_from, valid_to
+  from index_membership
+ where ticker_id = any($1::bigint[])
+ order by ticker_id, valid_from
 """
 
 
@@ -499,6 +527,16 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
         ins_rows = await _fetch_chunked(pool, _INSIDER_SQL, ids)
     except Exception:  # noqa: BLE001 — table may not exist yet
         ins_rows = []
+    # index_membership is optional (migration 012). `membership_loaded` distinguishes
+    # "no intervals for this ticker" from "the table isn't there", which the
+    # membership filter must not confuse — the first excludes a name, the second
+    # would silently empty the whole panel.
+    membership_loaded = True
+    try:
+        membership_rows = await _fetch_chunked(pool, _MEMBERSHIP_SQL, ids)
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        membership_rows = []
+        membership_loaded = False
 
     by_ticker_prices = _group(price_rows)
     by_ticker_fund = _group(fund_rows)
@@ -507,6 +545,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     by_ticker_surprise = _group(surprise_rows)
     by_ticker_si = _group(si_rows)
     by_ticker_ins = _group(ins_rows)
+    by_ticker_membership = _group(membership_rows)
 
     frames: list[TickerFrame] = []
     for r in ticker_rows:
@@ -526,6 +565,8 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 surprises=by_ticker_surprise.get(tid, []),
                 short_interest=by_ticker_si.get(tid, []),
                 insiders=by_ticker_ins.get(tid, []),
+                membership=(by_ticker_membership.get(tid, [])
+                            if membership_loaded else None),
             )
         )
     return frames

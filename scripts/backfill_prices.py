@@ -23,7 +23,7 @@ from backend.ingestion.prices import ingest_full_history
 log = logging.getLogger(__name__)
 
 
-async def amain(start_date: date, symbols: list[str] | None) -> int:
+async def amain(start_date: date, symbols: list[str] | None, inactive_only: bool = False) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
@@ -38,16 +38,30 @@ async def amain(start_date: date, symbols: list[str] | None) -> int:
                 """
                 select ticker_id, symbol
                   from tickers
-                 where active = true
-                   and symbol = any($1::text[])
+                 where symbol = any($1::text[])
                  order by ticker_id
                 """,
                 symbols_upper,
             )
             tickers = [(r["ticker_id"], r["symbol"]) for r in rows]
             if not tickers:
-                print(f"No matching active tickers for: {', '.join(symbols_upper)}", file=sys.stderr)
+                print(f"No matching tickers for: {', '.join(symbols_upper)}", file=sys.stderr)
                 return 1
+        elif inactive_only:
+            rows = await pool.fetch(
+                """
+                select ticker_id, symbol
+                  from tickers
+                 where active = false
+                   and asset_type = 'equity'
+                 order by ticker_id
+                """
+            )
+            tickers = [(r["ticker_id"], r["symbol"]) for r in rows]
+            if not tickers:
+                print("No inactive equities found", file=sys.stderr)
+                return 1
+            log.info("inactive-only: %d removed-from-index ticker(s)", len(tickers))
 
         result = await ingest_full_history(pool, tickers=tickers, start_date=start_date)
 
@@ -77,13 +91,23 @@ def main() -> int:
         default=None,
         help="optional subset of symbols; default = all active tickers",
     )
+    p.add_argument(
+        "--inactive-only",
+        action="store_true",
+        help="pull only removed-from-index equities. They were seeded with a 2016 "
+             "floor and then frozen, so their panel history is both shallower and "
+             "staler than the active names'.",
+    )
     args = p.parse_args()
     start_date = (
         date.fromisoformat(args.start)
         if args.start
         else date.today() - timedelta(days=365 * args.years)
     )
-    return asyncio.run(amain(start_date=start_date, symbols=args.symbols))
+    return asyncio.run(
+        amain(start_date=start_date, symbols=args.symbols,
+              inactive_only=args.inactive_only)
+    )
 
 
 if __name__ == "__main__":
