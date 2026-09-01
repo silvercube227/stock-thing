@@ -54,6 +54,31 @@ Personal long-only stock and ETF trend prediction app. Not for active trading �
 - **Status: no horizon currently clears the promotion bar.** `PRODUCTION_HORIZON_SPECS` is UNCHANGED (the overlays still behave as designed — 3M turnover 0.154→0.077, 1Y 0.090→0.041), but the specs are no longer backed by a significant result. Do not describe this model as having demonstrated edge until something clears SECB again.
 - Signal is cross-sectional (relative ranking), not absolute direction — absolute direction has no detectable edge
 
+### Post-audit research program (2026-08-31)
+
+**Stage 1 — panel breadth.** The pre-2016 panel was only ~184 names wide against ~500 post-2016: 320 tickers had price history floored at exactly `2016-01-04`, a fossil of an old `backfill_prices --years 5` run. Backfilling that cohort to 2010 **roughly doubled the 2010–2015 cross-section** (184 → 356 names at 2010-06-30, 380 by 2012, 404 by 2014). Separately, 15 names carried a membership stretch we could not see at all — our sources only know a name's CURRENT index entry date, so AMD (member until 2013-09-23, back 2017-03-20), DD, DOW, EQT, PCG, TMUS, KDP, FSLR, JBL, LDOS, CEG, DELL, SNDK, TER and Q sat out every cross-section in between despite full price history. Recovered via fja05680 (see `scripts/seed_index_membership.py` source 4 for why that file is used but not trusted).
+
+  **The removal-side survivorship gap is NOT closable on free data — measured, not assumed.** 102 index members that exited before 2016 have no row in `tickers`; sampling 30 of them against yfinance, **25 return zero bars** (BNI, CEPH, MOLX, SLE, EK…). Only names that still trade come back. Pre-2016 folds remain 100% survivor-composed; Stage 1 raised N, it did not reduce that bias. Coverage by year (PIT members vs priceable): 2010 500/356, 2014 535/404, 2016 545/446, 2020 523/477, 2026 505/505.
+
+- **Post-Stage-1 baseline** (single-seed L2, `sector_return`, production per-horizon packs, no overlays, SELECTION folds only — labels fully realized before the 2024-01 holdout):
+
+  | Horizon | folds | SEC IC | t_block | p_block | min_detect | PIT low_vol | PIT high_vol |
+  |---------|-------|--------|---------|---------|------------|-------------|--------------|
+  | 3M (≤2023-09-30) | 114 | −0.0016 | −0.09 | 0.913 | 0.0279 | **+0.0245** | **−0.0296** |
+  | 6M (≤2023-06-30) | 108 | −0.0033 | −0.11 | 0.898 | 0.0497 | **+0.0223** | **−0.0587** |
+  | 1Y (≤2022-12-31) |  96 | −0.0069 | −0.17 | 0.834 | 0.0616 | **+0.0800** | **−0.0622** |
+
+  Pooled IC is indistinguishable from zero at every horizon, as it was before. **The frozen holdout costs power**: truncating the folds pushed 6M/1Y min-detect from ~0.035/0.030 up to 0.0497/0.0616 (1Y has only 8 effective blocks). 3M improved (0.032 → 0.0279) because the wider panel outweighs the lost folds. Worth being explicit about — honest measurement is not free.
+
+- **The vol-regime inversion REPLICATES under point-in-time tertiles** — the Stage 0.2 criterion (high-vol sector IC negative at all three horizons AND low-vol positive at all three) passes, so it is no longer resting on in-sample breakpoints. Caveat: PIT buckets are badly unbalanced (3M 11/27/52 low/mid/high) because realized vol drifted up after the ultra-calm 2014–2017 stretch that forms the early history, so "low_vol" is thin.
+
+- **Stage 2 — vol-regime gate: REJECTED at its pre-written criterion.** Two findings, both about the rule as specified:
+
+  1. **Shrinking ranks toward 0.5 cannot move rank-IC.** It is a monotone transform of the cross-section, so per-date Spearman is *exactly* unchanged; no shrink factor moves IC toward zero (full shrink makes it undefined, not 0). The gate bites only through `ewma_rank_by_ticker`, where halving today's spread halves its weight against the prior rank. **6M is therefore inert by construction** (`smooth_span=0`), which `test_vol_gate_cannot_change_ic_without_smoothing` pins.
+  2. Measured at the two horizons where it *can* act (matched seeds, selection folds): 3M PIT high-vol sector IC −0.0380 → **−0.0388 (worse)**; 1Y −0.0603 → −0.0594 (better by 0.0009 — 1.5% of its own 0.0616 detection floor). The criterion required improvement at both. Pooled IC moved in the 4th decimal at both.
+
+  Also: the gate **fired on 29–33% of folds, not the ≤20% the rule assumed "by construction"** — an expanding 80th percentile over an upward-drifting vol series fires far more often than 20%, the same drift that skews the PIT tertiles. So the display-side variant (2b) fails its own firing-rate criterion too, and per protocol the percentile is not tuned to fix it. The one real side effect is ~13% lower rank turnover (3M 0.0798→0.0696, 1Y 0.0491→0.0439), a mechanical consequence of leaning on the prior rank — but smoothing already owns turnover, and turnover is a stability proxy, not a portfolio quantity. **Mechanism kept and tested (`vol_gate_flags` / `vol_gate_ranks` / `--vol-gate`, `HorizonSpec.vol_gate`); `PRODUCTION_HORIZON_SPECS` unchanged.**
+
 ### Research protocol (locked 2026-08-31)
 
 Adopted after the audit remediation showed that two construction errors had carried the entire measured signal. The point is to make it impossible to promote on a sub-floor result again.

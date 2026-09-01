@@ -2037,6 +2037,19 @@ async def run(args) -> None:
             block_size = args.block_size or max(
                 1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
             )
+            # Vetting a candidate is a SELECTION decision, so it has to respect the
+            # frozen holdout exactly like the fold list does. This branch returns
+            # before walk_forward_ic ever runs, so the window is applied here.
+            diag_panel = panel
+            if args.max_test_date is not None or args.min_test_date is not None:
+                keep = np.ones(len(diag_panel), dtype=bool)
+                dates = diag_panel["date"].to_numpy()
+                if args.max_test_date is not None:
+                    keep &= np.asarray([d <= args.max_test_date for d in dates])
+                if args.min_test_date is not None:
+                    keep &= np.asarray([d >= args.min_test_date for d in dates])
+                diag_panel = diag_panel[keep]
+                print(f"diagnostics date window: {len(diag_panel):,} of {len(panel):,} rows")
             print(f"\n[feature diagnostics] {args.horizon}: decorrelation vs the book + "
                   f"standalone within-{args.neutralize_by} IC (block={block_size}); "
                   f"consolidation control = efficiency_ratio_120d:")
@@ -2044,7 +2057,7 @@ async def run(args) -> None:
                   f"{'sec_t':>7} {'sec_p':>8} {'ic_side':>8} {'ic_mid':>8} {'ic_trend':>8} "
                   f"  top correlates")
             for row in feature_diagnostics(
-                panel, args.horizon, candidates,
+                diag_panel, args.horizon, candidates,
                 sector_group_col=args.neutralize_by,
                 min_names=args.min_names,
                 block_size=block_size,
