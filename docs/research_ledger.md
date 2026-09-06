@@ -107,9 +107,64 @@ does change `build_universe_return_map` and `cross_sectional_medians`, which set
 demean baseline for every label. Effect is mixed and sub-floor, as expected for ~10.7k
 of 1.9M price rows.
 
-## Outstanding before Phase 1
+### 2026-09-06 — Phase 1: PIT sector target, terminal labels, cohort consistency
 
-- Re-baseline with `--refresh-cache` so the reuse guard and `removed_at` are in the panel.
-- 8-seed confirmation of the rank-averaged ensemble at 6M/1Y.
-- Production inference has not been re-run since 2026-07-31; the deployed model
-  (`48d1749f`, promoted 2026-08-01) still predates the 2026-08-21 audit fixes.
+**Change.** Three label/metric corrections landed together (see the Phase 1 commit):
+each panel row carries the GICS sector as of ITS OWN date from `sector_history`;
+a series that ENDED gets a hold-to-last-trade exit instead of being masked; a row whose
+sector group is missing or thinner than `sector_min_group_size` gets a NaN
+sector-relative target and is dropped at fit time rather than falling through to the
+universe-demeaned return.
+
+**Criterion (pre-written).** None — these are corrections, accepted on correctness.
+Recorded for direction only.
+
+**Result.** Matched A/B on the SAME refreshed frame cache (identical folds, identical
+panel rows, only the code differs; Phase-0 side run from a git worktree at `aafc2cf`):
+
+| Horizon | folds | SECB Phase 0 | SECB Phase 1 | Δ | min_detect | size-neutral P0 → P1 |
+|---------|-------|--------------|--------------|-----|------------|----------------------|
+| 3M | 114 | +0.0010 | +0.0037 | +0.0027 | 0.0231 | −0.0021 → −0.0000 |
+| 6M | 108 | +0.0030 | −0.0034 | −0.0064 | 0.0461 | −0.0012 → −0.0100 |
+| 1Y |  96 | −0.0107 | −0.0111 | −0.0004 | 0.0585 | −0.0082 → −0.0133 |
+
+Every delta is a fraction of its own detection floor — noise at this power. The 6M
+decline is **not** evidence of harm: the prior number was computed by demeaning
+against, and scoring inside, peer groups that partly did not exist at the time
+(Communication Services post-dates Sept 2018, Real Estate Sept 2016), so removing that
+artifact can move IC in either direction.
+
+Scale of what was corrected: 6.1% of member-months carried a different sector than
+today's label; 0.29% of member-months are newly dropped for a thin sector group;
+~15 price series terminate early and now receive a label instead of being masked.
+
+### 2026-09-06 — PHASE 1 REFERENCE BASELINE (supersedes the Phase 0 row)
+
+Refreshed cache, prices to 2026-09-04, LSEG caught up (278k estimate + 34k surprise
+rows), selection folds, single-seed L2 `sector_return`, production packs, expanding
+window, no overlays.
+
+| Horizon | folds | SECB IC | t_block | min_detect\|IC\| | size-neutral SECB |
+|---------|-------|---------|---------|----------------|-------------------|
+| 3M | 114 | +0.0037 | +0.23 | 0.0231 | −0.0000 |
+| 6M | 108 | −0.0034 | −0.11 | 0.0461 | −0.0100 |
+| 1Y |  96 | −0.0111 | −0.27 | 0.0585 | −0.0133 |
+
+Still nothing significant, still below every floor.
+
+## Outstanding
+
+- 8-seed confirmation of the rank-averaged ensemble at 6M/1Y (no criterion attached; it
+  is the correct estimator either way, and inert at the `n_seeds=1` used for every A/B
+  above).
+- **Deferred, needs its own measured run:** recomputing the universe demean over
+  membership-filtered frames only. It changes the label baseline at every horizon and
+  would have been unattributable inside the Phase 1 batch.
+- The top of the ranked list is still unmeasured (plan item 2.3). The 2026-09-04
+  production cross-section puts 8 Information Technology names in the 3M top 8 —
+  `direction_prob` is a UNIVERSE percentile while the model is trained on a
+  within-sector target, so sector concentration at the top is expected and invisible
+  to SECB.
+- 5 tickers return empty yfinance responses (AVB, SATS, EA, EQR, BK) and are stale;
+  all are from the known "active but absent from the live index list" cohort.
+- LSEG has no RIC for BF-B / BRK-A / BRK-B (pre-existing share-class gap).
