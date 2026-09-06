@@ -414,8 +414,11 @@ def test_earnings_reaction_detects_planted_jump_around_filing():
 
 
 def test_sector_return_target_subtracts_within_sector_median_above_threshold():
-    # 6 Tech names + 1 Energy; Tech has >= 5 so sector-demean applies, Energy
-    # has 1 so it falls back to the (already universe-demeaned) target.
+    # 6 Tech names + 1 Energy; Tech has >= 5 so sector-demean applies, Energy has 1
+    # so its sector-relative target is UNDEFINED (NaN) and the row is dropped at fit
+    # time. It used to fall through to the universe-demeaned return, which pooled a
+    # differently-defined label into the same fit while within_sector_ic excluded the
+    # row from the metric — trained on a cohort that was never scored.
     d = date(2020, 1, 31)
     df = pd.DataFrame({
         "date": [d] * 7,
@@ -438,9 +441,11 @@ def test_sector_return_target_subtracts_within_sector_median_above_threshold():
     assert np.allclose(
         sorted(tech["y_1M_sector_return"].to_numpy()), sorted(expected_tech)
     )
-    # Energy has 1 name -> below threshold -> passthrough (= universe-demeaned r_1M).
+    # Energy has 1 name -> below threshold -> NaN, so the fit drops it.
     energy = out[out["sector"] == "Energy"]
-    assert float(energy["y_1M_sector_return"].iloc[0]) == 0.30
+    assert np.isnan(float(energy["y_1M_sector_return"].iloc[0]))
+    # The grade target inherits the NaN (a ranking objective cannot grade it either).
+    assert np.isnan(float(energy["y_1M_sector_grade"].iloc[0]))
 
 
 def test_beta_resid_target_subtracts_beta_times_market_horizon_return():
@@ -1510,9 +1515,12 @@ def test_sector_return_vol_shrinks_high_vol_labels():
 
     out = apply_target_modes(df, sector_min_group_size=4)
 
-    # sector_return_vol must exist and be finite for all rows.
+    # sector_return_vol must exist and be finite wherever the sector target is
+    # defined; the 1-name Energy row is NaN by design (below sector_min_group_size).
     assert "y_1M_sector_return_vol" in out.columns
-    assert out["y_1M_sector_return_vol"].notna().all()
+    tech_mask = (out["sector"] == "Tech").to_numpy()
+    assert out.loc[tech_mask, "y_1M_sector_return_vol"].notna().all()
+    assert np.isnan(float(out.loc[~tech_mask, "y_1M_sector_return_vol"].iloc[0]))
 
     sr = out["y_1M_sector_return"].to_numpy()
     srv = out["y_1M_sector_return_vol"].to_numpy()

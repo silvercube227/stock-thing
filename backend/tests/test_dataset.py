@@ -7,9 +7,12 @@ calendar-free month arithmetic.
 
 from __future__ import annotations
 
+import math
+
 from datetime import date, timedelta
 
 import numpy as np
+import pytest
 
 from backend.ml.dataset import (
     Sample,
@@ -253,3 +256,85 @@ def test_reuse_guard_ignores_a_short_trading_halt():
 
     rows = _bars(date(2014, 1, 1), 900) + _bars(date(2016, 8, 1), 500)
     assert _drop_reused_symbol_bars(rows, date(2016, 1, 5)) == rows
+
+
+# =============================================================
+# Terminal (delisting) labels vs right-censoring
+# =============================================================
+
+
+def test_terminal_series_gets_a_label_from_its_last_trade():
+    """A name that stops trading inside the horizon used to be MASKED, which drops it
+    from both training and the scored cross-section — residual survivorship in the
+    label. With `terminal` the exit falls back to the last available close."""
+    from backend.ml.dataset import compute_targets
+
+    # 30 bars: entry at index 1, but 1M (21 bars) would need index 22 — present;
+    # 3M (63 bars) is past the end.
+    prices = [100.0 + i for i in range(30)]
+    _lab, ret, mask = compute_targets(prices, end_idx=0, terminal=True)
+    assert mask["3M"] is True
+    assert ret["3M"] == pytest.approx(math.log(prices[-1] / prices[1]))
+    # A real loss survives too — the negative tail is the half that matters most.
+    crash = [100.0] * 25 + [20.0]
+    _l2, ret2, mask2 = compute_targets(crash, end_idx=0, terminal=True)
+    assert mask2["1Y"] is True and ret2["1Y"] < 0
+
+
+def test_right_censored_series_is_still_masked():
+    """The panel simply ending is NOT a delisting: the future has not happened yet,
+    so those horizons must stay masked rather than inventing an exit."""
+    from backend.ml.dataset import compute_targets
+
+    prices = [100.0 + i for i in range(30)]
+    _lab, ret, mask = compute_targets(prices, end_idx=0, terminal=False)
+    assert mask["1M"] is True          # 21 bars ahead exists
+    assert mask["3M"] is False         # 63 bars ahead does not
+    assert ret["3M"] == 0.0
+
+
+def test_terminal_needs_a_bar_after_entry():
+    from backend.ml.dataset import compute_targets
+
+    # entry_idx = 1 is the last bar, so there is no exit bar even holding to the end.
+    _lab, _ret, mask = compute_targets([100.0, 101.0], end_idx=0, terminal=True)
+    assert all(v is False for v in mask.values())
+
+
+# =============================================================
+# Point-in-time sector lookup
+# =============================================================
+
+
+def test_sector_on_returns_the_label_as_of_the_row_date():
+    from backend.ml.factors.assembly import _sector_on
+
+    history = [
+        {"valid_from": date(2010, 1, 1), "valid_to": date(2018, 10, 1),
+         "sector": "Consumer Discretionary", "industry": "Media"},
+        {"valid_from": date(2018, 10, 1), "valid_to": None,
+         "sector": "Communication Services", "industry": "Entertainment"},
+    ]
+    fallback = ("Communication Services", "Entertainment")
+    # Before the 2018 GICS reshuffle DIS was Consumer Discretionary, and a 2012 row
+    # must be demeaned against THAT peer group.
+    assert _sector_on(history, date(2012, 6, 30), fallback)[0] == "Consumer Discretionary"
+    # valid_to is exclusive, so the boundary date itself belongs to the new interval.
+    assert _sector_on(history, date(2018, 9, 30), fallback)[0] == "Consumer Discretionary"
+    assert _sector_on(history, date(2018, 10, 1), fallback)[0] == "Communication Services"
+    assert _sector_on(history, date(2025, 1, 1), fallback)[0] == "Communication Services"
+
+
+def test_sector_on_falls_back_when_history_is_absent_or_uncovered():
+    from backend.ml.factors.assembly import _sector_on
+
+    fallback = ("Health Care", "Biotech")
+    # Table not loaded (pre-migration cache) -> static tickers label, i.e. the old
+    # behaviour exactly.
+    assert _sector_on(None, date(2015, 1, 1), fallback) == fallback
+    assert _sector_on([], date(2015, 1, 1), fallback) == fallback
+    # A date before the first interval also falls back rather than guessing.
+    history = [{"valid_from": date(2020, 1, 1), "valid_to": None,
+                "sector": "Financials", "industry": None}]
+    assert _sector_on(history, date(2015, 1, 1), fallback) == fallback
+    assert _sector_on(history, date(2021, 1, 1), fallback)[0] == "Financials"

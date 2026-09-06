@@ -82,7 +82,10 @@ class TickerFrame:
     # index_membership intervals [{valid_from, valid_to}] (valid_to exclusive, null =
     # current). None means "not loaded" (pre-migration cache) and is distinct from []
     # ("loaded; never a member") — the membership filter has to tell those apart.
-    membership: list[dict] | None = None
+    # sector_history intervals [{valid_from, valid_to, sector, industry}] (valid_to
+    # exclusive, null = current). None = table not loaded; build_ticker_rows then
+    # falls back to the static `sector`/`industry` above.
+    sector_history: list[dict] | None = None
     # tickers.removed_at — the date this name left the index (None = still a member).
     # Used to (a) detect symbol REUSE at load time and (b) tell a delisted series
     # apart from one that is merely right-censored by the panel's end date.
@@ -122,7 +125,7 @@ def months_before(d: date, months: int) -> date:
 
 
 def compute_targets(
-    adj_close: list[float], end_idx: int
+    adj_close: list[float], end_idx: int, terminal: bool = False
 ) -> tuple[dict[str, int], dict[str, float], dict[str, bool]]:
     """Direction labels and log-return targets for each horizon at `end_idx`.
 
@@ -135,6 +138,17 @@ def compute_targets(
     A horizon is available iff both bar `end_idx + 1` (the entry) and bar
     `end_idx + 1 + H` (the exit) exist with positive prices; otherwise it is masked
     (label 0, return 0.0).
+
+    `terminal=True` says the series ENDED — the company was acquired or delisted —
+    rather than being right-censored by the panel's end date. Masking those is a
+    residual survivorship bias in the LABEL: a name that stops trading inside the
+    next H bars silently leaves both the training set and the scored cross-section,
+    so the model never learns what precedes an exit and the metric never scores it.
+    In large caps the exits are mostly acquisitions (a positive tail) plus a few
+    failures (a sharp negative one), and dropping both truncates the label
+    distribution at each end. When `terminal`, the exit price falls back to the last
+    available close (hold-to-last-trade). Right-censored series keep masking, because
+    there the future genuinely has not happened yet.
     """
     labels: dict[str, int] = {}
     returns: dict[str, float] = {}
@@ -144,7 +158,12 @@ def compute_targets(
     base = adj_close[entry_idx] if entry_idx < n else None
     for h in HORIZONS:
         j = entry_idx + HORIZON_TRADING_DAYS[h]
-        future = adj_close[j] if j < n else None
+        if j < n:
+            future = adj_close[j]
+        elif terminal and n - 1 > entry_idx:
+            future = adj_close[n - 1]   # hold to last trade
+        else:
+            future = None
         if future is not None and base is not None and base > 0 and future > 0:
             r = math.log(future / base)
             labels[h] = 1 if r > 0 else 0
@@ -474,6 +493,13 @@ select ticker_id, valid_from, valid_to
  order by ticker_id, valid_from
 """
 
+_SECTOR_HISTORY_SQL = """
+select ticker_id, valid_from, valid_to, sector, industry
+  from sector_history
+ where ticker_id = any($1::bigint[])
+ order by ticker_id, valid_from
+"""
+
 
 # A delisted ticker's symbol can be REASSIGNED to an unrelated company years later
 # (SE -> Sea Limited, EMC, APC, INFO, STI, CA, SPLS, ...). yfinance then returns the
@@ -581,6 +607,12 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     except Exception:  # noqa: BLE001 — table may not exist yet
         membership_rows = []
         membership_loaded = False
+    # sector_history is optional (migration 015). Absent => every row keeps the static
+    # tickers.sector, i.e. exactly the pre-PIT behaviour.
+    try:
+        sector_history_rows = await _fetch_chunked(pool, _SECTOR_HISTORY_SQL, ids)
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        sector_history_rows = []
 
     by_ticker_prices = {
         tid: _drop_reused_symbol_bars(
@@ -595,6 +627,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     by_ticker_si = _group(si_rows)
     by_ticker_ins = _group(ins_rows)
     by_ticker_membership = _group(membership_rows)
+    by_ticker_sector_history = _group(sector_history_rows)
 
     frames: list[TickerFrame] = []
     for r in ticker_rows:
@@ -616,6 +649,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 insiders=by_ticker_ins.get(tid, []),
                 membership=(by_ticker_membership.get(tid, [])
                             if membership_loaded else None),
+                sector_history=by_ticker_sector_history.get(tid) or None,
                 removed_at=_as_date(r["removed_at"]) if r["removed_at"] else None,
             )
         )

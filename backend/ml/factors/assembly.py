@@ -51,6 +51,35 @@ def build_universe_return_map(frames: list[TickerFrame]) -> dict:
     return {d: float(np.mean(vals)) for d, vals in by_date.items() if vals}
 
 
+# A name whose last bar predates the panel's end by more than this has stopped
+# trading (acquired/delisted); anything inside it is just the normal ragged edge of
+# a live series. ~3 weeks of trading days.
+_TERMINAL_GAP_DAYS = 21
+
+
+def _sector_on(history: list[dict] | None, when, fallback: tuple):
+    """(sector, industry) as of `when`, falling back to the static tickers labels.
+
+    Intervals are [valid_from, valid_to) and non-overlapping (enforced by
+    seed_sector_history.py), so at most one matches. Without this every row carried
+    TODAY's GICS label — and since that label sets both the training target
+    (`sector_return` / `sector_grade`) and the headline metric (`within_sector_ic`),
+    pre-2018 rows were demeaned against, and scored inside, peer groups that did not
+    exist: Communication Services was created in Sept 2018 and Real Estate in Sept
+    2016. 6.1% of member-months carry a different sector than today's.
+    """
+    if not history:
+        return fallback
+    for iv in history:
+        vf = _as_date(iv["valid_from"])
+        if vf > when:
+            break                      # ordered by valid_from; no later one can match
+        vt = iv["valid_to"]
+        if vt is None or when < _as_date(vt):
+            return iv["sector"] or fallback[0], iv.get("industry") or fallback[1]
+    return fallback
+
+
 def _in_index_on(membership: list[dict] | None, when) -> bool | None:
     """Was this ticker an index member on `when`?
 
@@ -208,6 +237,15 @@ def build_ticker_rows(
     season_ctx = _seasonality_asof(adj_close, trade_dates, bar_positions)
     ins_ctx = _insider_context_asof(getattr(frame, "insiders", None) or [], bar_dates)
 
+    # Did this series END (acquired/delisted), or is it merely right-censored by the
+    # panel's end date? Only the first justifies a hold-to-last-trade exit price.
+    # `removed_at` guards against a live name with a transient ingestion gap.
+    terminal = bool(
+        getattr(frame, "removed_at", None) is not None
+        and grid
+        and (grid[-1] - trade_dates[-1]).days > _TERMINAL_GAP_DAYS
+    )
+
     rows: list[dict] = []
     for j, (g, pos, _bd) in enumerate(entries):
         market_cap = _market_cap_at(raw_close, adj_close, pos, pit_shares[j], shares)
@@ -289,12 +327,17 @@ def build_ticker_rows(
         if not feats["est_available"]:
             for _name in ESTIMATE_SOURCED_FEATURES:
                 feats[_name] = float("nan")
-        _labels, returns, mask = compute_targets(adj_close, pos)
+        _labels, returns, mask = compute_targets(adj_close, pos, terminal=terminal)
+        sector, industry = _sector_on(
+            getattr(frame, "sector_history", None), g, (frame.sector, frame.industry)
+        )
         row = {
             "date": g,
             "ticker_id": frame.ticker_id,
-            "sector": frame.sector,
-            "industry": frame.industry,
+            # Sector AS OF this row's date, not today's label — it drives both the
+            # sector-relative target and the within-sector metric.
+            "sector": sector,
+            "industry": industry,
             # Tagged per row, filtered in prepare_panel: a name added to the index
             # in 2023 must not sit in the 2017 cross-section. None = unknown.
             "in_index": _in_index_on(getattr(frame, "membership", None), g),

@@ -499,14 +499,24 @@ def apply_target_modes(
         # Since `valid` is already universe-demeaned, subtracting the within-
         # (date, sector) median of `valid` is mathematically identical to
         # subtracting the within-sector median of the raw returns — the cancel
-        # eats the universe median. Groups below the size threshold fall back
-        # to the universe-demeaned target.
-        if has_sector:
+        # eats the universe median.
+        #
+        # Rows whose sector is missing or too thin emit NaN and are DROPPED at fit
+        # time. They used to fall back to the universe-demeaned return, which pooled
+        # a differently-defined label into the same fit while `within_sector_ic`
+        # (min_group_size=10) excluded those very rows from the metric — the model
+        # was trained on a cohort it was never scored on. Making the target undefined
+        # aligns the two.
+        # A panel carrying NO sector labels at all has no sector dimension to be
+        # relative to, so it degrades to the universe-demeaned target rather than an
+        # all-NaN (untrainable) one. That is the `has_sector` guard's original job and
+        # it still applies to direct callers and to inference before migration 015.
+        if has_sector and out["sector"].notna().any():
             sec_grp = valid.groupby([out["date"], out["sector"]])
             sec_med = sec_grp.transform("median")
             sec_count = sec_grp.transform("count")
             use_sector = out["sector"].notna() & (sec_count >= sector_min_group_size)
-            out[f"y_{h}_sector_return"] = np.where(use_sector, valid - sec_med, valid)
+            out[f"y_{h}_sector_return"] = np.where(use_sector, valid - sec_med, np.nan)
         else:
             out[f"y_{h}_sector_return"] = valid
 
