@@ -83,6 +83,30 @@ Run in the same batch as 0.5, so the A/B above is their joint effect at `n_seeds
   RIG) — the de-survivorship data the panel needs — are untouched.
   **Not yet reflected in any measured number**: it needs a frame-cache refresh.
 
+### 2026-09-05 — PHASE 0 REFERENCE BASELINE (grade every later A/B against this)
+
+Refreshed frame cache (symbol-reuse guard active, prices current to 2026-08-31),
+selection folds only, single-seed L2 on `sector_return`, production per-horizon packs,
+expanding window, no overlays. This is the reference row for Phases 1-5.
+
+| Horizon | folds | SECB IC | t_block | p_block | min_detect\|IC\| | size-neutral SECB | raw turnover |
+|---------|-------|---------|---------|---------|----------------|-------------------|--------------|
+| 3M | 114 | +0.0067 | +0.40 | 0.61 | 0.0259 | +0.0031 | 0.160 |
+| 6M | 108 | +0.0018 | +0.06 | 0.94 | 0.0491 | −0.0019 | 0.133 |
+| 1Y |  96 | −0.0081 | −0.20 | 0.80 | 0.0596 | −0.0048 | 0.113 |
+
+Pre-Phase-0 the same command gave −0.0016 / −0.0001 / −0.0069. **Nothing here is
+significant and every value sits below its own detection floor**; the panel still
+cannot distinguish "no signal" from "normal honest signal". Phase 0 bought correctness,
+not edge.
+
+The symbol-reuse guard contributed the difference between this table and the
+same-config run on the stale cache (3M +0.0025, 6M +0.0028, 1Y −0.0073): it does not
+change the filtered panel (those rows were already outside every cross-section) but it
+does change `build_universe_return_map` and `cross_sectional_medians`, which set the
+demean baseline for every label. Effect is mixed and sub-floor, as expected for ~10.7k
+of 1.9M price rows.
+
 ## Outstanding before Phase 1
 
 - Re-baseline with `--refresh-cache` so the reuse guard and `removed_at` are in the panel.
