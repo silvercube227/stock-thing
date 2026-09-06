@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <key>Label</key>
+    <string>com.stockthing.add-ticker-drain</string>
+
+    <!-- Consumer for add-ticker requests the HOSTED read-API could not run itself.
+         render.yaml deploys an API with fastapi/asyncpg/yfinance only — no pandas,
+         lightgbm or torch, and no models/ artifact — so POST /tickers there records
+         the request as 'queued' rather than spawning a subprocess that would die on
+         ModuleNotFoundError with its stderr sent to DEVNULL (a silent hang, which is
+         exactly how this used to fail). This agent is what actually runs them.
+
+         Adding from the LOCAL API still spawns the worker inline and never touches
+         the queue, so this only ever has work to do for web-hosted adds. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/bennettye/Documents/GitHub/stock-thing/stockproject/bin/python</string>
+        <string>-m</string>
+        <string>backend.jobs.add_ticker</string>
+        <string>--drain</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/bennettye/Documents/GitHub/stock-thing</string>
+
+    <!-- Every 2 minutes: a person is waiting on the page, and an empty queue costs a
+         single indexed SELECT. `--drain` claims rows with `for update skip locked`,
+         so an overlapping firing (a slow job runs ~1 min) cannot double-process. -->
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <!-- Catch up on anything queued while the Mac was asleep or shut down. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/bennettye/Documents/GitHub/stock-thing/logs/add_ticker_drain.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/bennettye/Documents/GitHub/stock-thing/logs/add_ticker_drain.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>120</integer>
+
+</dict>
+</plist>

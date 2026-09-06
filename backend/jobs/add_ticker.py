@@ -271,13 +271,75 @@ async def run_add(symbol: str, run_id: int | None) -> int:
             return 1
 
 
+async def claim_queued(pool: asyncpg.Pool, limit: int) -> list[tuple[int, str]]:
+    """Atomically claim up to `limit` queued add-ticker jobs, oldest first.
+
+    `for update skip locked` inside the same statement that flips the status makes a
+    double-drain (two launchd firings overlapping, or a manual run beside the agent)
+    safe: a row can only ever be claimed once.
+    """
+    rows = await pool.fetch(
+        """
+        with claimed as (
+            select run_id from ingestion_runs
+             where status = 'queued' and job_name like 'add_ticker:%'
+             order by started_at
+             limit $1
+             for update skip locked
+        )
+        update ingestion_runs r
+           set status = 'running', started_at = now()
+          from claimed
+         where r.run_id = claimed.run_id
+        returning r.run_id, r.job_name
+        """,
+        limit,
+    )
+    return [(int(r["run_id"]), r["job_name"].split(":", 1)[1]) for r in rows]
+
+
+async def drain(limit: int) -> int:
+    """Run every queued add-ticker job. Entry point for the local drain agent.
+
+    The hosted read-API cannot execute the worker (no pandas/lightgbm/torch, no model
+    artifact), so it records the request as 'queued' instead of spawning a process that
+    would die silently. This is the consumer that makes those requests actually happen.
+    """
+    async with pool_context(command_timeout=300, max_size=2) as pool:
+        jobs = await claim_queued(pool, limit)
+    if not jobs:
+        return 0
+    print(f"draining {len(jobs)} queued add-ticker job(s): "
+          f"{', '.join(s for _, s in jobs)}")
+    worst = 0
+    for run_id, symbol in jobs:
+        # Sequential on purpose: each job ingests prices and then shells out to a
+        # LightGBM scoring subprocess, and this shares a laptop with the daily pipeline.
+        rc = await run_add(symbol, run_id)
+        print(f"  {symbol}: rc={rc}")
+        worst = max(worst, rc)
+    return worst
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Ingest + score a single user-added ticker")
-    p.add_argument("--symbol", required=True)
+    p.add_argument("--symbol", help="symbol to add (omit with --drain)")
     p.add_argument("--run-id", type=int, default=None,
                    help="existing ingestion_runs row to update (the API creates it); "
                         "a new row is created when omitted")
+    p.add_argument("--drain", action="store_true",
+                   help="run every add-ticker job the hosted API left 'queued', "
+                        "instead of adding one symbol. This is what the local drain "
+                        "agent runs; safe to run concurrently with itself.")
+    p.add_argument("--limit", type=int, default=5,
+                   help="max queued jobs to claim in one --drain pass (default 5)")
     args = p.parse_args()
+    if args.drain:
+        if args.symbol:
+            p.error("--drain takes no --symbol")
+        return asyncio.run(drain(args.limit))
+    if not args.symbol:
+        p.error("--symbol is required unless --drain is given")
     return asyncio.run(run_add(args.symbol, args.run_id))
 
 

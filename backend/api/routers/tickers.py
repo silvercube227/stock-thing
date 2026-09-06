@@ -11,10 +11,12 @@ read straight from the `predictions` table.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -43,6 +45,29 @@ HORIZON_ORDER = ("1M", "3M", "6M", "1Y")
 # A user-added job still polling after this long is treated as failed, so the
 # frontend never polls forever if the worker was hard-killed before its finally.
 _ADD_STALE_SECONDS = 15 * 60
+# A QUEUED job has not started yet — it is waiting for the local machine to drain it,
+# and that machine is a laptop that may be asleep. Give it a much longer leash than a
+# running job before calling it dead, but do not let it wait forever.
+_QUEUE_STALE_SECONDS = 12 * 60 * 60
+
+
+@lru_cache(maxsize=1)
+def _worker_runs_here() -> bool:
+    """Can THIS process actually execute the add-ticker worker?
+
+    `backend.jobs.add_ticker` pulls in pandas / lightgbm / torch (FinBERT sentiment)
+    and scores against a model artifact under models/, which is gitignored. All of
+    that exists on the local Mac and none of it on the hosted read-API (render.yaml
+    installs fastapi/asyncpg/yfinance only).
+
+    Spawning it there is worse than not trying: Popen SUCCEEDS, the child dies on
+    ModuleNotFoundError, stdout/stderr go to DEVNULL, and the run row sits at
+    'running' until the stale guard reports a timeout — a silent failure that looks
+    like a hang. When the deps are absent we record the request as 'queued' instead
+    and let the local machine pick it up.
+    """
+    return all(importlib.util.find_spec(m) is not None
+               for m in ("pandas", "lightgbm", "torch"))
 
 # lookback token -> trading-window in calendar days ("max" => no lower bound).
 _LOOKBACK_DAYS = {"1m": 31, "3m": 93, "6m": 186, "1y": 366, "2y": 731, "5y": 1827}
@@ -172,20 +197,26 @@ async def add_ticker(
             )
         )
 
+    # 'running' only if we are about to actually start it; otherwise 'queued' for the
+    # local drain. Recording 'running' on a host that cannot run the worker is what
+    # made this fail silently on the hosted API.
+    local = _worker_runs_here()
     run_id = int(
         await pool.fetchval(
-            "insert into ingestion_runs (job_name) values ($1) returning run_id",
+            "insert into ingestion_runs (job_name, status) values ($1, $2) returning run_id",
             f"add_ticker:{symbol}",
+            "running" if local else "queued",
         )
     )
-    # Detached so it outlives the request; it owns its own ingestion_runs status.
-    subprocess.Popen(
-        [sys.executable, "-m", "backend.jobs.add_ticker", "--symbol", symbol, "--run-id", str(run_id)],
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    if local:
+        # Detached so it outlives the request; it owns its own ingestion_runs status.
+        subprocess.Popen(
+            [sys.executable, "-m", "backend.jobs.add_ticker", "--symbol", symbol, "--run-id", str(run_id)],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     return AddTickerResponse(symbol=symbol, status="queued", run_id=run_id, ticker_id=ticker_id)
 
 
@@ -220,6 +251,17 @@ async def ticker_status(
     outcome = meta.get("outcome")
     status = row["status"]
 
+    if status == "queued":
+        age = (datetime.now(timezone.utc) - row["started_at"]).total_seconds()
+        if age > _QUEUE_STALE_SECONDS:
+            return TickerStatus(
+                symbol=symbol, status="failed",
+                message="Queued but never picked up — the scoring machine has not been online.",
+            )
+        return TickerStatus(
+            symbol=symbol, status="queued",
+            message="Queued — waiting for the scoring machine to come online.",
+        )
     if status == "running":
         age = (datetime.now(timezone.utc) - row["started_at"]).total_seconds()
         if age > _ADD_STALE_SECONDS:

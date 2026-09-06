@@ -290,7 +290,11 @@ create table if not exists ingestion_runs (
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
     status          text not null default 'running'
-                    check (status in ('running', 'success', 'partial', 'failed', 'skipped')),
+                    check (status in ('queued', 'running', 'success', 'partial',
+                                      'failed', 'skipped')),
+                                                 -- 'queued' = accepted by the hosted
+                                                 -- read-API, waiting for the local
+                                                 -- machine to drain it (migration 016)
     rows_inserted   integer,
     rows_updated    integer,
     error_message   text,

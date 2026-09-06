@@ -279,7 +279,9 @@ scripts/                  One-off backfill + seed utilities (run with python -m 
 
 deploy/
   launchd/
-    com.stockthing.daily-pipeline.plist  macOS LaunchAgent — install to ~/Library/LaunchAgents/
+    com.stockthing.daily-pipeline.plist    macOS LaunchAgent — install to ~/Library/LaunchAgents/
+    com.stockthing.add-ticker-drain.plist  LaunchAgent (2 min) — runs add-ticker jobs the
+                                           hosted read-API could only queue
 ```
 
 ### Daily pipeline stages
@@ -293,6 +295,18 @@ deploy/
 | gbm_inference | Fridays + first trading day of month | `ml/gbm_inference.py` — trains + writes `predictions` |
 
 Each stage logs start/finish/status to `ingestion_runs`. The orchestrator adds a top-level `daily_pipeline` row. Non-trading days exit 0 without touching the DB.
+
+Separately, a **drain agent** (`deploy/launchd/com.stockthing.add-ticker-drain.plist`, every 2 min, `RunAtLoad`) runs `python -m backend.jobs.add_ticker --drain`:
+
+| Stage | Frequency | Module |
+|---|---|---|
+| add_ticker drain | every 2 min (local Mac only) | `jobs/add_ticker.py` — `drain()`; claims `status='queued'` add-ticker runs |
+
+### Add-ticker: hosted API queues, the local Mac executes
+
+`POST /tickers` used to always `subprocess.Popen(python -m backend.jobs.add_ticker)`. That is correct on the Mac and **structurally impossible on the hosted read-API** (`render.yaml` installs fastapi/asyncpg/yfinance only — no pandas/lightgbm/torch — and `models/*.pkl` is gitignored, so there is no artifact to score with). Worse, it failed *silently*: `Popen` succeeds, the child dies instantly on `ModuleNotFoundError`, stdout/stderr go to `DEVNULL`, the `ingestion_runs` row sits at `running`, and the UI polls until the 15-minute stale guard says "Timed out". That is why adding a non-S&P ticker never worked from the web app.
+
+Now `_worker_runs_here()` probes for the ML deps: present → spawn inline as before; absent → record the run as **`queued`** (migration 016) and return. The local drain agent claims queued rows with `for update skip locked` (so overlapping firings cannot double-process) and runs the normal pipeline. `queued` is deliberately distinct from `running` — a queued job has not started, so the 15-minute worker-died guard must not apply to it; it gets a 12-hour window instead, because the scoring machine is a laptop that may be asleep. The frontend polls on `queued` as well as `running` and shows "waiting for the scoring machine".
 
 ### Key invariants
 

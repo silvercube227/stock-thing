@@ -194,6 +194,12 @@ export default function TickerPage({
                     <span className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-accent" />
                     Scoring this ticker… this can take a minute.
                   </div>
+                ) : predStatus === "queued" ? (
+                  <div className="flex flex-col items-center gap-2 py-8 text-center text-sm text-muted">
+                    <span className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-accent" />
+                    Queued for scoring — waiting for the scoring machine to come
+                    online. This page updates on its own.
+                  </div>
                 ) : predStatus === "insufficient_history" ? (
                   <p className="py-8 text-center text-sm text-muted">
                     Not enough price history (need ~1 year) to score this ticker.
