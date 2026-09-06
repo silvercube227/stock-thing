@@ -267,6 +267,10 @@ create table if not exists predictions (
                                                  -- below-trend/near-52w-low (transparency only,
                                                  -- does not affect direction_prob)
     cold_start          boolean not null default false,
+    smooth_state        numeric,                 -- raw EWMA state behind direction_prob
+                                                 -- (migration 014); advanced monthly so
+                                                 -- production smoothing matches the
+                                                 -- walk-forward that set smooth_span
     created_at          timestamptz not null default now(),
     primary key (ticker_id, model_version_id, as_of_date, horizon)
 );

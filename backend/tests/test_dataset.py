@@ -205,3 +205,51 @@ def test_to_arrays_shapes_and_dtypes():
     assert arr["r"].shape == (n, 4) and arr["r"].dtype == np.float32
     assert arr["mask"].shape == (n, 4) and arr["mask"].dtype == np.float32
     assert set(np.unique(arr["mask"])).issubset({0.0, 1.0})
+
+
+# =============================================================
+# Symbol reuse: a delisted ticker's symbol reassigned to another company
+# =============================================================
+
+
+def _bars(start, n, step_days=1):
+    from datetime import timedelta
+    return [{"trade_date": start + timedelta(days=i * step_days)} for i in range(n)]
+
+
+def test_reuse_guard_leaves_a_continuously_trading_ex_member_alone():
+    """De-survivorship depends on these rows: a name dropped from the index that
+    keeps trading (FOSL, GME, AA, RIG) must keep every bar."""
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    rows = _bars(date(2014, 1, 1), 3000)
+    assert _drop_reused_symbol_bars(rows, date(2016, 1, 5)) == rows
+    # A name still in the index has no removal date and is never touched.
+    assert _drop_reused_symbol_bars(rows, None) == rows
+
+
+def test_reuse_guard_drops_a_series_that_begins_after_removal():
+    """SE/EMC/CA/APC pattern: every bar we hold belongs to the new issuer."""
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    rows = _bars(date(2023, 12, 13), 600)
+    assert _drop_reused_symbol_bars(rows, date(2018, 11, 6)) == []
+
+
+def test_reuse_guard_truncates_at_a_multi_year_hole():
+    """CSRA/NFX pattern: the real company's bars stop at the acquisition and an
+    unrelated listing resumes under the symbol years later."""
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    original = _bars(date(2015, 1, 1), 800)
+    rows = original + _bars(date(2026, 7, 7), 40)
+    assert _drop_reused_symbol_bars(rows, date(2019, 2, 15)) == original
+
+
+def test_reuse_guard_ignores_a_short_trading_halt():
+    """A gap of a few months after removal is a halt or a thin tape, not a new
+    issuer — the threshold has to be wide enough not to eat those."""
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    rows = _bars(date(2014, 1, 1), 900) + _bars(date(2016, 8, 1), 500)
+    assert _drop_reused_symbol_bars(rows, date(2016, 1, 5)) == rows

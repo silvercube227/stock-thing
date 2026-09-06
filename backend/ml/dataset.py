@@ -32,7 +32,7 @@ import math
 import pickle
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 
@@ -83,6 +83,10 @@ class TickerFrame:
     # current). None means "not loaded" (pre-migration cache) and is distinct from []
     # ("loaded; never a member") — the membership filter has to tell those apart.
     membership: list[dict] | None = None
+    # tickers.removed_at — the date this name left the index (None = still a member).
+    # Used to (a) detect symbol REUSE at load time and (b) tell a delisted series
+    # apart from one that is merely right-censored by the panel's end date.
+    removed_at: date | None = None
 
 
 @dataclass
@@ -471,6 +475,41 @@ select ticker_id, valid_from, valid_to
 """
 
 
+# A delisted ticker's symbol can be REASSIGNED to an unrelated company years later
+# (SE -> Sea Limited, EMC, APC, INFO, STI, CA, SPLS, ...). yfinance then returns the
+# NEW company's bars under the old ticker_id. Those rows sit outside every index
+# cross-section (the membership interval closed at removal) but still feed
+# `build_universe_return_map` (the market-return series behind beta / residual
+# momentum / the beta_resid target) and `cross_sectional_medians` (the demean
+# baseline for every label) — so a handful of wrong-company series quietly moves the
+# benchmark for the whole panel.
+#
+# The tell is a GAP, not the removal date itself: names that keep trading after
+# leaving the index (FOSL, GME, AA, RIG ...) are exactly the de-survivorship data the
+# panel wants and trade continuously through their removal. Reuse always shows up as
+# a series that either starts long after removal or resumes after a multi-quarter
+# hole. Truncate at that discontinuity; leave continuous series untouched.
+_REUSE_MIN_GAP_DAYS = 180
+_REUSE_MIN_LAG_DAYS = 90
+
+
+def _drop_reused_symbol_bars(price_rows: list[dict], removed_at: date | None) -> list[dict]:
+    """Drop bars that belong to a different company trading under a reused symbol."""
+    if removed_at is None or not price_rows:
+        return price_rows
+    cutoff = removed_at + timedelta(days=_REUSE_MIN_LAG_DAYS)
+    prev: date | None = None
+    for i, row in enumerate(price_rows):
+        d = _as_date(row["trade_date"])
+        gap_days = (d - prev).days if prev is not None else None
+        # Either the series begins well after removal (i == 0), or it resumes after a
+        # hole no live listing would leave. Everything from here on is another issuer.
+        if d > cutoff and (gap_days is None or gap_days > _REUSE_MIN_GAP_DAYS):
+            return price_rows[:i]
+        prev = d
+    return price_rows
+
+
 async def _fetch_chunked(pool, sql: str, ids: list[int], chunk: int = 100) -> list:
     """Run an `ids = any($1)` query in ticker-id batches and concatenate results.
 
@@ -493,19 +532,24 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     """
     if symbols:
         ticker_rows = await pool.fetch(
-            "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, industry "
+            "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, "
+            "industry, removed_at "
             "from tickers "
             "where symbol = any($1::text[]) order by ticker_id",
             symbols,
         )
     else:
         ticker_rows = await pool.fetch(
-            "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, industry "
-            "from tickers order by ticker_id"
+            "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, "
+            "industry, removed_at from tickers order by ticker_id"
         )
     ids = [r["ticker_id"] for r in ticker_rows]
     if not ids:
         return []
+    _removed_at_by_id = {
+        r["ticker_id"]: (_as_date(r["removed_at"]) if r["removed_at"] else None)
+        for r in ticker_rows
+    }
 
     # Fetch in ticker-id batches: the full price pull (1.6M rows) is large enough
     # that the Supabase session pooler drops the single transfer mid-stream. Each
@@ -538,7 +582,12 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
         membership_rows = []
         membership_loaded = False
 
-    by_ticker_prices = _group(price_rows)
+    by_ticker_prices = {
+        tid: _drop_reused_symbol_bars(
+            rows, _removed_at_by_id.get(tid)
+        )
+        for tid, rows in _group(price_rows).items()
+    }
     by_ticker_fund = _group(fund_rows)
     by_ticker_sent = _group(sent_rows)
     by_ticker_est = _group(est_rows)
@@ -567,6 +616,7 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 insiders=by_ticker_ins.get(tid, []),
                 membership=(by_ticker_membership.get(tid, [])
                             if membership_loaded else None),
+                removed_at=_as_date(r["removed_at"]) if r["removed_at"] else None,
             )
         )
     return frames

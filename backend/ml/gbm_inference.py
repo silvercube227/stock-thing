@@ -29,7 +29,7 @@ import asyncio
 import hashlib
 import json
 import pickle
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
 
@@ -52,6 +52,7 @@ from backend.ml.gbm_baseline import (
     blend_gbdt_linear,
     fit_linear_model,
     fit_lgbm_model,
+    _rank01,
     knife_overlay_ranks,
     knife_tier,
     vol_gate_flags,
@@ -251,14 +252,21 @@ def score_current_cross_section(
         # cross-sections collapse to 0.5.
         model_or_list = models[h]
         if isinstance(model_or_list, list):
+            # Rank-average, matching gbm_baseline._fit_predict: LambdaRank scores are
+            # not on a common scale across seeds, so a raw mean lets the seed with the
+            # widest score range dominate the ensemble.
             preds = np.mean(
-                [np.asarray(m.predict(current[cols]), dtype=float) for m in model_or_list], axis=0
+                [_rank01(np.asarray(m.predict(current[cols]), dtype=float))
+                 for m in model_or_list], axis=0
             )
         else:
             preds = np.asarray(model_or_list.predict(current[cols]), dtype=float)
         if h in linear_models:
             ridge, weight = linear_models[h]
-            lin_pred = np.asarray(ridge.predict(current[cols].to_numpy(dtype=float)), dtype=float)
+            lin_pred = np.asarray(
+                ridge.predict(np.nan_to_num(current[cols].to_numpy(dtype=float), nan=0.0)),
+                dtype=float,
+            )
             preds = blend_gbdt_linear(preds, lin_pred, weight)
         if n > 1:
             ranks_raw = pd.Series(preds).rank(method="average").to_numpy()
@@ -329,19 +337,28 @@ def apply_cross_horizon_shrink(
 def apply_rank_smoothing(
     prediction_rows: list[dict],
     specs: dict,
-    prior_ranks: dict[tuple[int, str], list[float]],
+    prior_state: dict[tuple[int, str], float],
+    advance: bool = True,
 ) -> list[dict]:
-    """EWMA-smooth each name's percentile rank toward its most recent stored rank.
+    """EWMA-smooth each name's percentile rank, matching `ewma_rank_by_ticker` exactly.
 
-    For horizons whose `HorizonSpec.smooth_span > 0` (3M/1Y in production), blend the
-    current `relative_rank` with the name's last stored (already-smoothed) rank using
-    `alpha = 2/(span+1)`, then re-rank within the horizon to a clean percentile so the
-    stored value stays a uniform [0,1] rank. This is the online one-step form of the
-    walk-forward's `ewma_rank_by_ticker`: the previously stored rank is the carried
-    state. Names with no prior keep their raw rank; single-name horizons are skipped.
+    For horizons whose `HorizonSpec.smooth_span > 0` (3M/1Y in production):
 
-    `prior_ranks` maps (ticker_id, horizon) -> [most-recent-first stored ranks]; only
-    the newest (index 0) is used. Mutates and returns `prediction_rows`.
+        blended = alpha * rank_now + (1 - alpha) * state      (alpha = 2/(span+1))
+        state  <- blended                                      (when `advance`)
+        stored  = rank01(blended)
+
+    The carried state is the RAW blended value, exactly as in the walk-forward. The
+    previous implementation blended against `direction_prob`, the re-ranked percentile;
+    re-ranking re-inflates the prior's dispersion every step, so production smoothed
+    harder than the folds that promoted spans 3 and 4. A name with no state seeds from
+    its own rank, which is what `ewma_rank_by_ticker` does on first appearance.
+
+    `advance` is False on intra-month runs. The spans were fitted on a MONTHLY fold
+    grid while inference fires Fridays as well as month-starts, so advancing on every
+    run would apply ~4-5x the validated amount of smoothing. Intra-month runs still
+    blend against the month's anchor state (the ranking stays stable within the month),
+    they just do not move it. Mutates and returns `prediction_rows`.
     """
     if not isinstance(specs, dict):
         return prediction_rows
@@ -357,13 +374,16 @@ def apply_rank_smoothing(
             continue
         alpha = 2.0 / (span + 1.0)
         blended = np.array([
-            alpha * r["relative_rank"] + (1.0 - alpha) * prior_ranks[(r["ticker_id"], h)][0]
-            if prior_ranks.get((r["ticker_id"], h)) else r["relative_rank"]
+            alpha * r["relative_rank"] + (1.0 - alpha) * prior_state[(r["ticker_id"], h)]
+            if prior_state.get((r["ticker_id"], h)) is not None else r["relative_rank"]
             for r in rows
         ], dtype=float)
         ranks = (pd.Series(blended).rank(method="average").to_numpy() - 1.0) / (len(rows) - 1)
-        for r, rank in zip(rows, ranks, strict=True):
+        for r, rank, state in zip(rows, ranks, blended, strict=True):
             r["relative_rank"] = float(rank)
+            # Only an advancing run persists state; otherwise leave it null so the
+            # month's anchor keeps its place.
+            r["smooth_state"] = float(state) if advance else None
     return prediction_rows
 
 
@@ -412,6 +432,40 @@ async def fetch_prior_ranks(
     return out
 
 
+async def fetch_prior_smooth_state(
+    pool, ticker_ids, horizons, before: date
+) -> dict[tuple[int, str], float]:
+    """Newest stored EWMA state per (ticker_id, horizon), strictly before `before`.
+
+    Only advancing runs write `smooth_state`, so the newest non-null row is the most
+    recent monthly anchor — which is exactly the state the monthly walk-forward would
+    be carrying at this point.
+    """
+    rows = await pool.fetch(
+        """
+        select distinct on (ticker_id, horizon)
+               ticker_id, horizon, smooth_state
+          from predictions
+         where horizon = any($1::text[]) and ticker_id = any($2::bigint[])
+           and as_of_date < $3 and smooth_state is not null
+         order by ticker_id, horizon, as_of_date desc, created_at desc
+        """,
+        list(horizons),
+        [int(t) for t in ticker_ids],
+        before,
+    )
+    return {(int(r["ticker_id"]), r["horizon"]): float(r["smooth_state"]) for r in rows}
+
+
+async def latest_smooth_state_date(pool, horizons) -> date | None:
+    """Most recent as_of_date that advanced the smoothing state (None if never)."""
+    return await pool.fetchval(
+        "select max(as_of_date) from predictions "
+        " where horizon = any($1::text[]) and smooth_state is not null",
+        list(horizons),
+    )
+
+
 def save_bundle(path: Path, bundle: dict) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
@@ -456,14 +510,15 @@ async def upsert_predictions(
         """
         insert into predictions (
             ticker_id, model_version_id, as_of_date, horizon, direction_prob,
-            predicted_return, confidence, risk_flag, cold_start
-        ) values ($1,$2,$3,$4,$5,$6,$7,$8,false)
+            predicted_return, confidence, risk_flag, cold_start, smooth_state
+        ) values ($1,$2,$3,$4,$5,$6,$7,$8,false,$9)
         on conflict (ticker_id, model_version_id, as_of_date, horizon) do update set
             direction_prob   = excluded.direction_prob,
             predicted_return = excluded.predicted_return,
             confidence       = excluded.confidence,
             risk_flag        = excluded.risk_flag,
             cold_start       = excluded.cold_start,
+            smooth_state     = excluded.smooth_state,
             created_at       = now()
         """,
         [
@@ -476,6 +531,7 @@ async def upsert_predictions(
                 None,
                 r["confidence"],
                 r.get("risk_flag", "none"),
+                r.get("smooth_state"),
             )
             for r in prediction_rows
         ],
@@ -513,15 +569,10 @@ def build_specs_from_args(args) -> dict[str, HorizonSpec]:
     for h in args.horizons:
         spec = PRODUCTION_HORIZON_SPECS.get(h, HorizonSpec())
         if args.target is not None:
-            spec = HorizonSpec(
-                target_mode=args.target,
-                lgb_cfg=spec.lgb_cfg,
-                feature_cols=spec.feature_cols,
-                linear_blend=spec.linear_blend,
-                ridge_alpha=spec.ridge_alpha,
-                smooth_span=spec.smooth_span,
-                max_train_months=spec.max_train_months,
-            )
+            # `replace` so a --target override cannot silently drop a promoted field.
+            # The hand-listed constructor omitted knife_lambda / winsorize_pct /
+            # vol_gate, so any --target run shipped 3M without its knife overlay.
+            spec = replace(spec, target_mode=args.target)
         base[h] = spec
     return base
 
@@ -582,7 +633,19 @@ async def run(args) -> None:
         # priors once here and reuse them for the confidence/stability metric below.
         ticker_ids = sorted({r["ticker_id"] for r in prediction_rows})
         prior = await fetch_prior_ranks(pool, ticker_ids, horizons, as_of)
-        prediction_rows = apply_rank_smoothing(prediction_rows, specs, prior)
+        # Advance the EWMA state once per calendar month. The spans were validated on
+        # a monthly fold grid; inference also runs every Friday, so advancing on each
+        # run would compound ~4-5x the smoothing that was measured.
+        state = await fetch_prior_smooth_state(pool, ticker_ids, horizons, as_of)
+        last_state = await latest_smooth_state_date(pool, horizons)
+        advance = last_state is None or (last_state.year, last_state.month) < (
+            as_of.year, as_of.month
+        )
+        print(
+            f"smoothing: state anchor={last_state or 'none'} "
+            f"({'advancing' if advance else 'holding'} for {as_of:%Y-%m})"
+        )
+        prediction_rows = apply_rank_smoothing(prediction_rows, specs, state, advance=advance)
         if args.shrink_1y_toward_6m > 0 and {"6M", "1Y"} <= set(horizons):
             prediction_rows = apply_cross_horizon_shrink(
                 prediction_rows, source="6M", target="1Y",
@@ -801,7 +864,10 @@ async def score_single_ticker(pool, symbol: str) -> dict:
     # scored ids; one indexed query on a user-initiated add — cost is negligible.
     all_ids = sorted({r["ticker_id"] for r in prediction_rows})
     prior = await fetch_prior_ranks(pool, all_ids, horizons, as_of)
-    apply_rank_smoothing(prediction_rows, specs, prior)
+    # A user-initiated add must never advance the shared monthly anchor — it would
+    # apply an extra smoothing step to every name in the cross-section.
+    state = await fetch_prior_smooth_state(pool, all_ids, horizons, as_of)
+    apply_rank_smoothing(prediction_rows, specs, state, advance=False)
     for r in mine:
         series = prior.get((new_id, r["horizon"]), []) + [r["relative_rank"]]
         r["confidence"] = rank_stability(series)
@@ -839,8 +905,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--n-seeds", type=int, default=8,
                    help="seed-ensemble size: fit this many models per horizon and "
-                        "average their raw predictions before rank-transforming "
-                        "(default 8; reduces seed variance at low compute cost)")
+                        "rank-average their predictions (default 8; reduces seed "
+                        "variance at low compute cost)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--score-ticker", metavar="SYMBOL",
                    help="score ONE already-ingested ticker against the current S&P "

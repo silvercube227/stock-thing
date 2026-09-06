@@ -57,12 +57,15 @@ from backend.ml.factors import (  # noqa: F401
     EARNINGS_REACTION_FEATURES,
     EPS_DISPERSION_FEATURES,
     EPS_SURPRISE_FEATURES,
+    ESTIMATE_MISSING_FEATURES,
+    ESTIMATE_SOURCED_FEATURES,
     ESTIMATE_SURPRISE_FEATURES,
     EXPERIMENTAL_FEATURES,
     FEATURE_COLS,
     FORWARD_VALUATION_FEATURES,
     FUNDAMENTAL_FEATURES,
     FUNDAMENTAL_MISSING_FEATURES,
+    FUNDAMENTAL_SOURCED_FEATURES,
     INDUSTRY_RELATIVE_FEATURES,
     INSIDER_FEATURES,
     KNIFE_FEATURES,
@@ -343,22 +346,56 @@ def rank_normalize_features(
     *,
     industry_relative: bool = False,
     min_group_size: int = 5,
+    exempt_ids: set | None = None,
 ):
     """Map each feature to its within-date cross-sectional rank in [-1, 1].
 
     Point-in-time safe (only same-date rows) and robust to the heavy tails in raw
     factor values. Single-name (or empty) dates collapse to 0.
+
+    MISSING VALUES STAY MISSING: a NaN feature is not ranked, so LightGBM routes it
+    natively instead of the old sentinel 0.0 landing at a real cross-sectional
+    position (see FUNDAMENTAL_SOURCED_FEATURES in factors/constants.py). The rank
+    denominator is the count of OBSERVED values on that date.
+
+    `exempt_ids` (production only) are names that must not DEFINE the distribution —
+    user-added off-index tickers, which include leveraged and thematic ETFs whose
+    momentum/vol would distort every index name's rank. They are still scored: their
+    own value is placed against the member distribution. The walk-forward never
+    passes this, so evaluation is unchanged.
     """
     out = panel.copy()
     g = out.groupby("date")
+    exempt = (
+        out["ticker_id"].isin(exempt_ids)
+        if exempt_ids and "ticker_id" in out.columns
+        else None
+    )
 
     def _norm(rank_s, count_s):
         denom = (count_s - 1).clip(lower=1)
-        return np.where(count_s > 1, (rank_s - 1) / denom * 2 - 1, 0.0)
+        scaled = (rank_s - 1) / denom * 2 - 1
+        return np.where(
+            np.isnan(np.asarray(rank_s, dtype=float)),
+            np.nan,
+            np.where(count_s > 1, scaled, 0.0),
+        )
 
     for c in cols:
-        r = g[c].rank(method="average")
-        n = g[c].transform("count")
+        if exempt is None or not bool(exempt.any()):
+            r = g[c].rank(method="average")
+            n = g[c].transform("count")
+        else:
+            # Members define the scale: rank them among themselves.
+            gm = out.assign(_m=out[c].where(~exempt)).groupby("date")["_m"]
+            r_mem, n = gm.rank(method="average"), gm.transform("count")
+            # An exempt row's position among members = (its rank among ALL rows)
+            # − (its rank among exempt rows): both count values at or below it, so
+            # the difference is the member count below it. Exact up to average-tie
+            # adjustment; clipped into [1, n_members] to share the member scale.
+            ge = out.assign(_e=out[c].where(exempt)).groupby("date")["_e"]
+            pos = (g[c].rank(method="average") - ge.rank(method="average")).clip(lower=1.0)
+            r = r_mem.where(~exempt, np.minimum(pos, n.clip(lower=1)))
         out[c] = _norm(r, n)
         if not industry_relative or c not in INDUSTRY_RELATIVE_FEATURES:
             continue
@@ -592,6 +629,9 @@ def prepare_panel(
         cols=norm_cols,
         industry_relative=industry_relative,
         min_group_size=min_group_size,
+        # Off-index names ride along in the panel (membership_exempt_ids) so they can
+        # be scored, but they must not shift the index cross-section's ranks.
+        exempt_ids=membership_exempt_ids,
     )
     # Add knife_score if requested (knife_score in base_cols means --with-knife-feature).
     if "knife_score" in base_cols:
@@ -768,7 +808,10 @@ def fit_linear_model(
     from sklearn.linear_model import Ridge
 
     cols = feature_cols if feature_cols is not None else FEATURE_COLS
-    X = train_df[cols].to_numpy(dtype=float)
+    # Ridge has no native missing-value handling (LightGBM does). Features are
+    # within-date ranks in [-1, 1], so 0.0 is the neutral mid-rank — the least
+    # informative fill available and the one that keeps the design matrix finite.
+    X = np.nan_to_num(train_df[cols].to_numpy(dtype=float), nan=0.0)
     y = train_df[target_col].to_numpy(dtype=float)
     if shuffle:  # same no-signal null as the GBDT path
         y = y[np.random.default_rng(seed).permutation(len(y))]
@@ -821,10 +864,14 @@ def _fit_predict(
         return fit_lgbm_model(
             train_df, target_col, cfg, seed=seed, shuffle=shuffle, feature_cols=cols
         ).predict(test_df[cols])
+    # Average the seeds in RANK space, not raw-score space. LambdaRank scores have
+    # no fixed scale or offset across independently-seeded models, so a raw mean is
+    # a scale-weighted vote in which one wide-range seed dominates. `_rank01` is the
+    # same normalization `blend_gbdt_linear` / the target blend already use.
     preds_all = np.stack([
-        fit_lgbm_model(
+        _rank01(fit_lgbm_model(
             train_df, target_col, cfg, seed=seed + s * 997, shuffle=shuffle, feature_cols=cols
-        ).predict(test_df[cols])
+        ).predict(test_df[cols]))
         for s in range(n_seeds)
     ])
     return preds_all.mean(axis=0)
@@ -1488,8 +1535,13 @@ def walk_forward_ic(
     for fi, (test_date, cutoff) in enumerate(folds):
         train = panel[(panel["date"] <= cutoff) & panel[m_col] & panel[t_col].notna()]
         if wf_cfg.max_train_months is not None:
-            lower_idx = max(0, grid_dates.index(cutoff) - wf_cfg.max_train_months)
-            train = train[train["date"] >= grid_dates[lower_idx]]
+            # Count LABELED training dates, matching gbm_inference.fit_horizon_models
+            # exactly. Slicing by grid position instead would keep a different number
+            # of real training dates whenever a grid date carries no labeled rows, so
+            # the walk-forward would measure a different model than production ships.
+            train_dates = sorted(train["date"].unique())
+            if len(train_dates) > wf_cfg.max_train_months:
+                train = train[train["date"] >= train_dates[-wf_cfg.max_train_months]]
         test = panel[(panel["date"] == test_date) & panel[m_col]]
         if test.shape[0] < wf_cfg.min_names or train.empty:
             continue
@@ -1506,7 +1558,9 @@ def walk_forward_ic(
                 seed=seed + fi, shuffle=shuffle,
             )
             cols = feature_cols if feature_cols is not None else FEATURE_COLS
-            lin_pred = lin.predict(test[cols].to_numpy(dtype=float))
+            lin_pred = lin.predict(
+                np.nan_to_num(test[cols].to_numpy(dtype=float), nan=0.0)
+            )
             preds = blend_gbdt_linear(preds, lin_pred, linear_blend)
         ic = pd.Series(preds).corr(pd.Series(test[r_col].to_numpy(dtype=float)), method="spearman")
         if ic != ic:  # NaN (zero-variance cross-section)
@@ -1948,6 +2002,8 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(INSIDER_FEATURES)
     if getattr(args, "with_sentiment", False):
         cols += list(SENTIMENT_FEATURES)
+    if getattr(args, "with_estimate_missing", False):
+        cols += list(ESTIMATE_MISSING_FEATURES)
     # Ad-hoc single features (e.g. isolating one member of a pack for an ablation).
     if getattr(args, "extra_features", None):
         cols += [c.strip() for c in args.extra_features.split(",") if c.strip()]
@@ -1979,10 +2035,30 @@ async def run(args) -> None:
                 "--with-linear-blend is unsupported with a ranking objective "
                 "(untested ranker+ridge combination; no production horizon blends)"
             )
+    # Default the rolling-window length to the horizon's PRODUCTION spec so a
+    # re-validation measures the model that actually ships (6M is max_train_months=60).
+    # Explicit --max-train-months wins; pass 0 to force an expanding window.
+    spec_window = getattr(
+        PRODUCTION_HORIZON_SPECS.get(args.horizon, HorizonSpec()), "max_train_months", None
+    )
+    if args.max_train_months is None:
+        max_train_months = spec_window
+        window_src = f"production spec for {args.horizon}"
+    elif args.max_train_months == 0:
+        max_train_months = None
+        window_src = "forced expanding (--max-train-months 0)"
+    else:
+        max_train_months = args.max_train_months
+        window_src = "--max-train-months"
     wf_cfg = WalkForwardConfig(
         min_train_months=args.min_train_months,
-        max_train_months=args.max_train_months,
+        max_train_months=max_train_months,
         min_names=args.min_names,
+    )
+    print(
+        f"training window: "
+        f"{'expanding' if max_train_months is None else f'rolling {max_train_months} months'}"
+        f"  ({window_src})"
     )
     feature_cols = _compose_feature_cols(args)
     extras = [c for c in feature_cols if c not in FEATURE_COLS]
@@ -2278,6 +2354,11 @@ async def run(args) -> None:
                 res = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                       seed=args.seed + 1000 * (rep + 1), shuffle=True,
                                       target_mode=args.target, feature_cols=feature_cols,
+                                      # Must match the real run: a null built from a
+                                      # 1-seed estimator has a wider sampling
+                                      # distribution than an 8-seed real statistic,
+                                      # so the z-band would compare unlike things.
+                                      n_seeds=args.n_seeds,
                                       compute_sector_ic=args.sector_neutral_ic,
                                       sector_group_col=args.neutralize_by,
                                       linear_blend=args.with_linear_blend,
@@ -2325,7 +2406,10 @@ def main() -> None:
     )
     p.add_argument("--min-train-months", type=int, default=36)
     p.add_argument("--max-train-months", type=int, default=None,
-                   help="rolling window length in months (default: expanding)")
+                   help="rolling training-window length in monthly grid dates. Default "
+                        "(omitted) = the horizon's PRODUCTION_HORIZON_SPECS window, so a "
+                        "re-validation measures the deployed model (6M ships rolling-60). "
+                        "Pass 0 to force an expanding window.")
     p.add_argument("--min-names", type=int, default=30, help="skip thinner test cross-sections")
     p.add_argument("--max-test-date", type=_iso_date, default=None, metavar="YYYY-MM-DD",
                    help="score only folds whose TEST date is on or before this. Frozen-holdout "
@@ -2525,6 +2609,12 @@ def main() -> None:
                         "of headlines, so the columns are ~98%% zero across the panel "
                         "and cannot be validated. Turn on once a headline archive is "
                         "backfilled.")
+    p.add_argument("--with-estimate-missing", action="store_true",
+                   help="add the LSEG availability pack (est_available, "
+                        "est_staleness_days) — the analyst-feed analogue of "
+                        "fund_available. Opt-in: analyst_estimates starts in 2012-13, "
+                        "so these flag the rows where the promoted estimate packs are "
+                        "NaN rather than observed.")
     p.add_argument("--extra-features", default=None, metavar="c1,c2,...",
                    help="append these ad-hoc feature columns to the active list "
                         "(isolate one member of a pack for a targeted ablation, e.g. "

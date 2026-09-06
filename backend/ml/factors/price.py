@@ -26,13 +26,16 @@ def _price_features(
     formula is used, which is NOT point-in-time — see `_market_cap_at`.
     """
     P = adj_close[pos]
+    # NaN (not 0.0) when the cap cannot be built: log(cap) is ~20-28 for real names,
+    # so a sentinel 0.0 ranks as the smallest company in the cross-section — an
+    # extreme, wrong size tilt for what is really "share count unknown".
     if market_cap is not None:
-        log_mcap = math.log(market_cap) if market_cap > 0 else 0.0
+        log_mcap = math.log(market_cap) if market_cap > 0 else float("nan")
     else:
         log_mcap = (
             math.log(P * shares_outstanding)
             if P and shares_outstanding and P > 0 and shares_outstanding > 0
-            else 0.0
+            else float("nan")
         )
     feats = {
         "mom_1m": _log_ratio(P, adj_close[pos - 21]),
@@ -268,7 +271,8 @@ def _short_interest_asof(
       short_ratio_z  — (currently) alias of short_ratio; placeholder for
                        cross-sectional z-score if we decide to apply it here
 
-    Gaps (no publication yet, or missing fields) → 0.0.
+    Gaps (no publication yet, or missing fields) → NaN: days-to-cover is never
+    legitimately 0 for a listed name, so a sentinel would rank as "no shorts at all".
     """
     import bisect
     from backend.ml.dataset import _as_date
@@ -277,7 +281,7 @@ def _short_interest_asof(
     out: dict[str, list[float]] = {k: [] for k in keys}
     if not si_rows:
         for _ in as_of_dates:
-            out["short_ratio"].append(0.0)
+            out["short_ratio"].append(float("nan"))
         return out
 
     sorted_rows = sorted(si_rows, key=lambda r: _as_date(r["publication_date"]))
@@ -287,7 +291,7 @@ def _short_interest_asof(
         d = _as_date(d)
         i = bisect.bisect_right(pub_dates, d) - 1
         if i < 0:
-            out["short_ratio"].append(0.0)
+            out["short_ratio"].append(float("nan"))
             continue
         row = sorted_rows[i]
         dtc = row.get("days_to_cover")
@@ -299,5 +303,5 @@ def _short_interest_asof(
         elif si is not None and adv is not None and adv > 0:
             out["short_ratio"].append(float(si) / float(adv))
         else:
-            out["short_ratio"].append(0.0)
+            out["short_ratio"].append(float("nan"))
     return out

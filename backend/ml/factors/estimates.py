@@ -36,7 +36,9 @@ def _estimates_context_asof(
             "price_target_rev_90d", "forward_earnings_yield", "forward_ebitda_yield",
             "revenue_surprise", "eps_surprise",
             "eps_est_rev_30d", "eps_est_rev_90d", "coverage_chg_90d", "pt_num_estimates",
-            "eps_dispersion")
+            "eps_dispersion",
+            # Availability/staleness of the feed itself (see ESTIMATE_MISSING_FEATURES).
+            "est_available", "est_staleness_days")
 
     snap_fields = ("rec_mean", "price_target_mean", "eps_mean",
                    "fwd_pe", "fwd_ev_ebitda", "num_analysts", "pt_num_estimates",
@@ -71,6 +73,16 @@ def _estimates_context_asof(
         i = bisect.bisect_right(dates, target) - 1
         return vals[i] if i >= 0 else None
 
+    def newest_obs(target):
+        """Date of the most recent snapshot (any field) at or before `target`."""
+        best = None
+        for f in snap_fields:
+            dates, _vals = series[f]
+            i = bisect.bisect_right(dates, target) - 1
+            if i >= 0 and (best is None or dates[i] > best):
+                best = dates[i]
+        return best
+
     def pct_rev(field: str, d, days: int) -> float:
         cur, prev = asof(field, d), asof(field, d - timedelta(days=days))
         return (cur - prev) / abs(prev) if cur is not None and prev not in (None, 0) else 0.0
@@ -96,8 +108,11 @@ def _estimates_context_asof(
             (pt - pt90) / abs(pt90) if pt is not None and pt90 not in (None, 0) else 0.0)
         out["forward_earnings_yield"].append(1.0 / pe if pe is not None and pe > 0 else 0.0)
         out["forward_ebitda_yield"].append(1.0 / ev if ev is not None and ev > 0 else 0.0)
-        out["revenue_surprise"].append(surprise_asof("revenue", d) or 0.0)
-        out["eps_surprise"].append(surprise_asof("eps", d) or 0.0)
+        # NaN, not 0.0, when no quarter has been reported yet: "no surprise on file"
+        # is not the same statement as "reported exactly in line with consensus".
+        rev_s, eps_s_val = surprise_asof("revenue", d), surprise_asof("eps", d)
+        out["revenue_surprise"].append(rev_s if rev_s is not None else float("nan"))
+        out["eps_surprise"].append(eps_s_val if eps_s_val is not None else float("nan"))
         out["eps_est_rev_30d"].append(pct_rev("eps_mean", d, 30))
         out["eps_est_rev_90d"].append(pct_rev("eps_mean", d, 90))
         out["coverage_chg_90d"].append((na - na90) if na is not None and na90 is not None else 0.0)
@@ -110,6 +125,12 @@ def _estimates_context_asof(
             out["eps_dispersion"].append(float(eps_s) / abs(float(eps_m)))
         else:
             out["eps_dispersion"].append(0.0)
+
+        newest = newest_obs(d)
+        out["est_available"].append(1.0 if newest is not None else 0.0)
+        out["est_staleness_days"].append(
+            float((d - newest).days) if newest is not None else float("nan")
+        )
     return out
 
 

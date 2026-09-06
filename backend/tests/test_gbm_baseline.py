@@ -17,8 +17,12 @@ import pytest
 from backend.ml.dataset import TickerFrame, build_calendar_grid
 from backend.ml.gbm_baseline import (
     EARNINGS_REACTION_FEATURES,
+    ESTIMATE_SOURCED_FEATURES,
     EXPERIMENTAL_FEATURES,
     FEATURE_COLS,
+    FUNDAMENTAL_FEATURES,
+    FUNDAMENTAL_SOURCED_FEATURES,
+    PRICE_FEATURES,
     LGBMConfig,
     RESIDUAL_MOM_FEATURES,
     WalkForwardConfig,
@@ -87,10 +91,18 @@ def test_build_ticker_rows_shapes_and_columns():
         assert c in cols, f"missing feature {c}"
     for h in HORIZONS:
         assert f"r_{h}" in cols and f"mask_{h}" in cols
-    # No feature should be NaN/inf (the model can't ingest those).
+    # Source-gated contract: a feature is finite, or NaN precisely because its
+    # upstream source has nothing as of that row. This fixture has no filings and
+    # no share count, so fundamentals and log_market_cap are undefined by design.
     for r in rows:
-        for c in FEATURE_COLS:
+        for c in PRICE_FEATURES:
+            if c == "log_market_cap":
+                continue
             assert np.isfinite(r[c]), f"{c} not finite"
+        assert r["fund_available"] == 0.0
+        assert np.isnan(r["log_market_cap"]), "no share count -> cap is undefined"
+        for c in FUNDAMENTAL_FEATURES:
+            assert np.isnan(r[c]), f"{c} should be NaN when no filing exists"
 
 
 def test_rising_series_has_positive_momentum():
@@ -147,7 +159,17 @@ def test_build_ticker_rows_computes_beta_and_earnings_yield():
     assert any(r["roe_ttm"] > 0 for r in rows)
     for r in rows:
         for c in EXPERIMENTAL_FEATURES:
-            assert np.isfinite(r[c]), f"{c} not finite"
+            source_absent = (
+                (c in FUNDAMENTAL_SOURCED_FEATURES and not r["fund_available"])
+                or (c in ESTIMATE_SOURCED_FEATURES and not r["est_available"])
+                # Independently sourced: quarterly surprises, the FINRA feed, and
+                # the staleness clock are NaN when their own source is empty.
+                or c in ("revenue_surprise", "eps_surprise", "short_ratio",
+                         "est_staleness_days")
+            )
+            assert np.isfinite(r[c]) or source_absent, (
+                f"{c} is NaN but its source is present"
+            )
 
 
 # =============================================================
@@ -371,10 +393,15 @@ def test_earnings_reaction_detects_planted_jump_around_filing():
     )
     assert rows
 
-    # All reaction features finite on every row.
+    # Reaction features are defined exactly on rows that have a filing as-of the
+    # grid date; before the first filing they are NaN, not a sentinel 0.0.
+    assert any(r["fund_available"] for r in rows)
     for r in rows:
         for c in EARNINGS_REACTION_FEATURES:
-            assert np.isfinite(r[c]), f"{c} not finite"
+            if r["fund_available"]:
+                assert np.isfinite(r[c]), f"{c} not finite after a filing exists"
+            else:
+                assert np.isnan(r[c]), f"{c} should be NaN before any filing"
     # Once the grid date passes the filing, the most recent reaction snapshot
     # should still carry the planted abnormal return. The universe here is just
     # this ticker + 1 foil, so the equal-weight market absorbs roughly half the
@@ -1089,7 +1116,8 @@ def test_apply_rank_smoothing_blends_toward_prior_and_noops_off():
     # toward the prior ordering (the top-by-raw name should no longer be rank 1).
     rows = [{"ticker_id": t, "horizon": "3M", "relative_rank": r}
             for t, r in zip(range(1, 6), [0.0, 0.25, 0.5, 0.75, 1.0])]
-    prior = {(t, "3M"): [p] for t, p in zip(range(1, 6), [1.0, 0.75, 0.5, 0.25, 0.0])}
+    # State is now the RAW blended value, not the re-ranked percentile.
+    prior = {(t, "3M"): p for t, p in zip(range(1, 6), [1.0, 0.75, 0.5, 0.25, 0.0])}
     specs = {"3M": HorizonSpec(smooth_span=3)}
     out = apply_rank_smoothing([dict(r) for r in rows], specs, prior)
     # ticker 5 had raw rank 1.0 but prior 0.0 → its blended rank must drop below 1.0.
@@ -1438,9 +1466,19 @@ def test_prepare_panel_end_to_end_on_frames():
     grid = build_calendar_grid(frames)
     panel = prepare_panel(frames, grid)
     assert not panel.empty
-    # Rank-normalized features stay in range.
+    # Rank-normalized OBSERVED values stay in range; columns whose source is absent
+    # on this fixture (no filings, no share count) are entirely NaN and are skipped.
     for c in FEATURE_COLS:
-        assert panel[c].min() >= -1.0001 and panel[c].max() <= 1.0001
+        vals = panel[c].dropna()
+        if vals.empty:
+            assert c in FUNDAMENTAL_SOURCED_FEATURES or c == "log_market_cap", (
+                f"{c} is all-NaN but is not source-gated"
+            )
+            continue
+        assert vals.min() >= -1.0001 and vals.max() <= 1.0001
+    # The availability flag itself is never missing — it is the model's handle on
+    # the missingness, so it must stay finite.
+    assert panel["fund_available"].notna().all()
 
 
 # =============================================================
@@ -2329,3 +2367,206 @@ def test_horizon_spec_vol_gate_round_trips_through_serialization():
     legacy = _serialize_spec(spec)
     legacy.pop("vol_gate")
     assert _specs_from_serialized({"3M": legacy})["3M"].vol_gate is False
+
+
+# =============================================================
+# Phase 0 — missing-data semantics, ensemble aggregation, eval/prod parity
+# =============================================================
+
+
+def test_rank_normalize_keeps_nan_out_of_the_ranking():
+    """A missing feature must not be ranked into a real cross-sectional position.
+
+    This is the whole point of the NaN change: under the old sentinel-0.0 path the
+    two nameless rows below would have tied at the *bottom* of a positive-valued
+    feature (0.0 < every observed value), handing the model a fabricated signal.
+    """
+    panel = pd.DataFrame({
+        "date": ["d1"] * 5,
+        "ticker_id": [1, 2, 3, 4, 5],
+        "x": [0.5, 1.5, 2.5, np.nan, np.nan],
+    })
+    out = rank_normalize_features(panel, cols=["x"])
+    vals = out["x"].to_numpy(dtype=float)
+    assert np.isnan(vals[3]) and np.isnan(vals[4])
+    # The three observed names still span the full [-1, 1] scale between them.
+    assert vals[0] == pytest.approx(-1.0)
+    assert vals[1] == pytest.approx(0.0)
+    assert vals[2] == pytest.approx(1.0)
+
+
+def test_rank_normalize_nan_survives_a_single_observation_date():
+    # count <= 1 collapses observed values to 0.0, but must not resurrect a NaN.
+    panel = pd.DataFrame({
+        "date": ["d1", "d1"], "ticker_id": [1, 2], "x": [7.0, np.nan],
+    })
+    out = rank_normalize_features(panel, cols=["x"])
+    assert out["x"].iloc[0] == 0.0
+    assert np.isnan(out["x"].iloc[1])
+
+
+def test_exempt_ids_do_not_shift_member_ranks():
+    """Off-index names are scored against the member distribution, never define it.
+
+    Production carries user-added tickers (leveraged/thematic ETFs among them) in
+    the panel so they can be scored; before this they also sat inside the per-date
+    rank normalization and moved every index name's feature ranks.
+    """
+    members = pd.DataFrame({
+        "date": ["d1"] * 4, "ticker_id": [1, 2, 3, 4], "x": [10.0, 20.0, 30.0, 40.0],
+    })
+    with_outlier = pd.concat([
+        members,
+        pd.DataFrame({"date": ["d1"], "ticker_id": [99], "x": [10_000.0]}),
+    ], ignore_index=True)
+
+    baseline = rank_normalize_features(members, cols=["x"])["x"].to_numpy(dtype=float)
+    exempted = rank_normalize_features(
+        with_outlier, cols=["x"], exempt_ids={99}
+    )["x"].to_numpy(dtype=float)
+    contaminated = rank_normalize_features(with_outlier, cols=["x"])["x"].to_numpy(dtype=float)
+
+    # Members are ranked exactly as if the off-index name were not in the panel.
+    assert exempted[:4] == pytest.approx(baseline)
+    # Without the exemption the outlier compresses them (0.5 instead of 1.0 at top).
+    assert contaminated[3] != pytest.approx(baseline[3])
+    # The exempt name is still scored, at the top of the member distribution.
+    assert exempted[4] == pytest.approx(1.0)
+
+
+def test_seed_ensemble_averages_ranks_not_raw_scores():
+    """LambdaRank scores carry no common scale across seeds, so a raw mean lets the
+    widest-range seed dominate. `_fit_predict` must aggregate in rank space."""
+    from backend.ml.gbm_baseline import _rank01
+
+    # Two "models": both order the names identically for the first three, but the
+    # second has a 100x wider score range and flips the last two.
+    a = np.array([0.0, 1.0, 2.0, 3.0])
+    b = np.array([0.0, 100.0, -100.0, 200.0])
+    raw_mean_order = np.argsort(np.mean([a, b], axis=0))
+    rank_mean_order = np.argsort(np.mean([_rank01(a), _rank01(b)], axis=0))
+    assert list(raw_mean_order) != list(rank_mean_order), (
+        "fixture must actually distinguish the two aggregations"
+    )
+    # Rank-averaging gives each seed one equal vote: name 2 (ranked 3rd and 1st)
+    # must not be dragged to last place by b's -100 raw score.
+    assert list(rank_mean_order) == [0, 2, 1, 3]
+
+
+def test_build_specs_from_args_preserves_promoted_overlay_fields():
+    """A --target override must not silently drop a promoted spec field.
+
+    The old hand-listed constructor omitted knife_lambda / winsorize_pct / vol_gate,
+    so `--target return` shipped 3M without its promoted falling-knife overlay.
+    """
+    from argparse import Namespace
+
+    from backend.ml.gbm_baseline import PRODUCTION_HORIZON_SPECS
+    from backend.ml.gbm_inference import build_specs_from_args
+
+    specs = build_specs_from_args(Namespace(horizons=["3M", "6M"], target="return"))
+    assert specs["3M"].target_mode == "return"          # the override applied
+    assert specs["3M"].knife_lambda == 0.20             # ... and nothing else moved
+    assert specs["3M"].smooth_span == 3
+    assert specs["3M"].feature_cols == PRODUCTION_HORIZON_SPECS["3M"].feature_cols
+    assert specs["6M"].max_train_months == 60
+    for h in ("3M", "6M"):
+        prod = PRODUCTION_HORIZON_SPECS[h]
+        assert specs[h].winsorize_pct == prod.winsorize_pct
+        assert specs[h].vol_gate == prod.vol_gate
+
+
+def test_walk_forward_max_train_months_counts_labeled_dates():
+    """The rolling window counts LABELED training dates, matching production.
+
+    gbm_inference.fit_horizon_models slices by the number of dates that actually
+    carry labels; the walk-forward used to slice by grid position, so the two
+    trained on different data whenever a grid date had no labeled rows.
+    """
+    from backend.ml.gbm_baseline import WalkForwardConfig, walk_forward_ic
+
+    frames = [make_frame(n_days=1500, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(8)]
+    panel = prepare_panel(frames, build_calendar_grid(frames))
+    window = 6
+    # min_child_samples must stay under the per-fold training row count (6 dates x 8
+    # names = 48) or LightGBM never splits, every prediction is constant, and the
+    # fold's Spearman IC is NaN and skipped.
+    res = walk_forward_ic(
+        panel, "1M", LGBMConfig(n_estimators=10, num_leaves=4, min_child_samples=5),
+        WalkForwardConfig(min_train_months=12, max_train_months=window, min_names=4),
+        seed=0, return_records=True,
+    )
+    assert res["folds"], "expected at least one scored fold"
+    # Every fold trains on at most `window` distinct dates, and once enough history
+    # exists it trains on exactly that many — the labeled-date rule, not a grid slice.
+    n_per_date = len(frames)
+    assert all(f["n_train"] <= window * n_per_date for f in res["folds"])
+    assert max(f["n_train"] for f in res["folds"]) == window * n_per_date
+
+
+def test_production_smoothing_matches_the_walk_forward_recursion():
+    """The shipped ranking must be the one the walk-forward measured.
+
+    `ewma_rank_by_ticker` (eval) carries the raw blended value forward; production
+    used to carry the RE-RANKED percentile, which restores full dispersion to the
+    prior at every step and therefore smooths harder than the folds that promoted
+    smooth_span. Chaining `apply_rank_smoothing` across monthly cross-sections must
+    now reproduce the eval ranking exactly.
+    """
+    from backend.ml.gbm_baseline import HorizonSpec, ewma_rank_by_ticker
+    from backend.ml.gbm_inference import apply_rank_smoothing
+
+    span = 3
+    tids = np.array([1, 2, 3, 4, 5])
+    # Three monthly cross-sections whose ordering churns between dates.
+    preds = [
+        np.array([0.10, 0.20, 0.30, 0.40, 0.50]),
+        np.array([0.50, 0.40, 0.30, 0.20, 0.10]),
+        np.array([0.20, 0.50, 0.10, 0.40, 0.30]),
+    ]
+    records = [{"ticker_ids": tids, "pred": p} for p in preds]
+    expected = ewma_rank_by_ticker(records, span)
+
+    specs = {"3M": HorizonSpec(smooth_span=span)}
+    state: dict = {}
+    for step, p in enumerate(preds):
+        raw = _rank01_local(p)
+        rows = [{"ticker_id": int(t), "horizon": "3M", "relative_rank": float(r)}
+                for t, r in zip(tids, raw)]
+        apply_rank_smoothing(rows, specs, dict(state), advance=True)
+        state = {(r["ticker_id"], "3M"): r["smooth_state"] for r in rows}
+        # Spearman only cares about ordering, so compare the induced ranking.
+        got = np.array([r["relative_rank"] for r in rows])
+        assert list(np.argsort(got)) == list(np.argsort(expected[step])), (
+            f"step {step}: production ordering diverged from the walk-forward"
+        )
+        # ... and the carried state is the eval state itself.
+        assert np.allclose([r["smooth_state"] for r in rows], expected[step])
+
+
+def test_non_advancing_run_holds_the_monthly_anchor():
+    """Intra-month (Friday) runs blend against the anchor but must not move it.
+
+    smooth_span was fitted on monthly folds; inference also fires weekly, so
+    advancing every run would compound ~4-5x the validated smoothing.
+    """
+    from backend.ml.gbm_baseline import HorizonSpec
+    from backend.ml.gbm_inference import apply_rank_smoothing
+
+    specs = {"3M": HorizonSpec(smooth_span=3)}
+    rows = [{"ticker_id": t, "horizon": "3M", "relative_rank": r}
+            for t, r in zip(range(1, 5), [0.0, 0.33, 0.66, 1.0])]
+    anchor = {(t, "3M"): 0.5 for t in range(1, 5)}
+
+    held = apply_rank_smoothing([dict(r) for r in rows], specs, anchor, advance=False)
+    assert all(r["smooth_state"] is None for r in held), "a held run must not persist state"
+    advanced = apply_rank_smoothing([dict(r) for r in rows], specs, anchor, advance=True)
+    assert all(r["smooth_state"] is not None for r in advanced)
+    # Both produce the same ranking for the day — only persistence differs.
+    assert [r["relative_rank"] for r in held] == [r["relative_rank"] for r in advanced]
+
+
+def _rank01_local(a):
+    from backend.ml.gbm_baseline import _rank01
+    return _rank01(a)

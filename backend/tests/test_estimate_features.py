@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import math
+
 import pytest
 
 from backend.ml.gbm_baseline import _estimates_context_asof
@@ -68,13 +70,34 @@ def test_no_lookahead():
     assert ctx["rec_mean_level"][0] == 3.0                 # 1/15, not the future 3/15
     assert ctx["price_target_mean"][0] == 0.0              # 2/15 target unseen
     assert ctx["forward_earnings_yield"][0] == 0.0
-    assert ctx["revenue_surprise"][0] == 0.0
-    assert ctx["eps_surprise"][0] == 0.0                   # 3/20 report unseen
+    # No quarter reported yet as of 2/1 -> NaN ("nothing on file"), NOT 0.0, which
+    # would read as "reported exactly in line with consensus".
+    assert math.isnan(ctx["revenue_surprise"][0])
+    assert math.isnan(ctx["eps_surprise"][0])              # 3/20 report unseen
     assert ctx["eps_est_rev_90d"][0] == 0.0                # only one eps_mean seen (4.0)
     assert ctx["coverage_chg_90d"][0] == 0.0               # only one coverage point seen
+    # The feed itself IS available on 2/1 (the 1/15 snapshot), 17 days stale.
+    assert ctx["est_available"][0] == 1.0
+    assert ctx["est_staleness_days"][0] == 17.0
 
 
-def test_empty_all_zero():
+def test_empty_feed_is_unavailable_not_zero():
+    """No LSEG rows at all: the feed is flagged unavailable and the derived
+    surprise/staleness columns are NaN rather than a sentinel 0.0."""
     ctx = _estimates_context_asof([], [], [date(2020, 4, 30), date(2021, 1, 1)])
-    assert all(v == 0.0 for vals in ctx.values() for v in vals)
     assert all(len(vals) == 2 for vals in ctx.values())
+    assert ctx["est_available"] == [0.0, 0.0]
+    for key in ("est_staleness_days", "revenue_surprise", "eps_surprise"):
+        assert all(math.isnan(v) for v in ctx[key]), key
+    # Everything else still falls back to 0.0 here; build_ticker_rows is what masks
+    # those columns to NaN, gated on est_available (see ESTIMATE_SOURCED_FEATURES).
+    plain = set(ctx) - {"est_available", "est_staleness_days",
+                        "revenue_surprise", "eps_surprise"}
+    assert all(v == 0.0 for k in plain for v in ctx[k])
+
+
+def test_staleness_tracks_the_newest_snapshot():
+    ctx = _estimates_context_asof(_rows(), _surprises(),
+                                  [date(2020, 3, 15), date(2020, 3, 25)])
+    assert ctx["est_staleness_days"] == [0.0, 10.0]
+    assert ctx["est_available"] == [1.0, 1.0]

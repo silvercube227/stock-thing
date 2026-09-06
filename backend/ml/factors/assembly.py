@@ -9,7 +9,12 @@ import numpy as np
 
 from backend.ingestion.calendar import HORIZON_TRADING_DAYS
 from backend.ml.dataset import TickerFrame, _as_date, compute_targets
-from backend.ml.factors.constants import EARNINGS_REACTION_FEATURES, FUNDAMENTAL_FEATURES
+from backend.ml.factors.constants import (
+    EARNINGS_REACTION_FEATURES,
+    ESTIMATE_SOURCED_FEATURES,
+    FUNDAMENTAL_FEATURES,
+    FUNDAMENTAL_SOURCED_FEATURES,
+)
 from backend.ml.factors.estimates import _earnings_reaction_asof, _estimates_context_asof
 from backend.ml.factors.fundamentals import (
     _fundamental_context_asof,
@@ -270,6 +275,20 @@ def build_ticker_rows(
         feats["insider_net_buy_6m"] = _safe_ratio(ins_ctx["net_buy_value_6m"][j], market_cap)
         feats["insider_buyers_90d"] = ins_ctx["insider_buyers_90d"][j]
         feats["insider_net_ratio_12m"] = ins_ctx["insider_net_ratio_12m"][j]
+        # Availability of the LSEG feed, the analyst-side analogue of fund_available.
+        feats["est_available"] = est_ctx["est_available"][j]
+        feats["est_staleness_days"] = est_ctx["est_staleness_days"][j]
+        # --- source-absence mask ------------------------------------------------
+        # Where the upstream source has nothing as of this date, the derived columns
+        # are UNDEFINED, not zero. Emitting NaN keeps them out of the cross-sectional
+        # ranking and lets LightGBM route them natively; the availability flags above
+        # stay finite so the model keeps an explicit handle on the missingness.
+        if not fund_avail[j]:
+            for _name in FUNDAMENTAL_SOURCED_FEATURES:
+                feats[_name] = float("nan")
+        if not feats["est_available"]:
+            for _name in ESTIMATE_SOURCED_FEATURES:
+                feats[_name] = float("nan")
         _labels, returns, mask = compute_targets(adj_close, pos)
         row = {
             "date": g,

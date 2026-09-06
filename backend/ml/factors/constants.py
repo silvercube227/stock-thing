@@ -133,6 +133,11 @@ SEASONALITY_FEATURES = [
 # feature it was being served. Still computed on every row, so `--with-sentiment`
 # turns them back on the moment a real headline archive exists.
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
+# Availability / staleness of the LSEG estimate snapshot, the analogue of
+# `fund_available` for the analyst feed. `analyst_estimates` starts in 2012-13, so
+# without this the promoted estimate packs are silently a coverage proxy on early
+# rows. est_staleness_days = calendar days since the newest observed snapshot.
+ESTIMATE_MISSING_FEATURES = ["est_available", "est_staleness_days"]
 FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES
 # EXPERIMENTAL_FEATURES: per-ticker features produced by build_ticker_rows (eligible for
 # `--feature-diagnostics` and `--with-*` packs). knife_score is excluded because it is a
@@ -144,6 +149,7 @@ EXPERIMENTAL_FEATURES = (
     + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES + LOTTERY_FEATURES
     + MICROSTRUCTURE_FEATURES + EPS_DISPERSION_FEATURES + SHORT_INTEREST_FEATURES
     + SEASONALITY_FEATURES + INSIDER_FEATURES + SENTIMENT_FEATURES
+    + ESTIMATE_MISSING_FEATURES
     # KNIFE_FEATURES intentionally excluded — panel-level, not in build_ticker_rows
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /
@@ -152,4 +158,30 @@ EXPERIMENTAL_FEATURES = (
 # carry.
 INDUSTRY_RELATIVE_FEATURES = (
     PRICE_FEATURES + FUNDAMENTAL_FEATURES + VALUATION_FEATURES + QUALITY_FEATURES
+)
+
+# ---------------------------------------------------------------------------
+# Source-gated features: columns that are only DEFINED when their upstream source
+# has an observation as of the row date. build_ticker_rows sets these to NaN when
+# the source is absent, instead of the historical sentinel 0.0.
+#
+# Why this matters: a sentinel 0.0 is then RANKED by rank_normalize_features, so a
+# name with no SEC filing lands at a real position in the cross-section — mid-pack
+# for a signed feature like revenue_growth, in a tail for a positive-only one like
+# earnings_yield. The imputation is silent, column-dependent and signal-bearing
+# (Bryzgalova-Lerner-Lettau-Pelger 2025; Freyberger et al. 2025: characteristic
+# missingness is systematic, not random). NaN lets LightGBM route missing values
+# natively and keeps them out of the ranking entirely.
+#
+# The availability FLAGS (`fund_available`, `est_available`) stay finite 0/1 — they
+# are the model's explicit handle on missingness. Partial-field gaps inside an
+# otherwise-present source (e.g. total_equity null on a filing that has revenue)
+# still fall back to 0.0; that is a documented follow-up, not this pass.
+FUNDAMENTAL_SOURCED_FEATURES = (
+    FUNDAMENTAL_FEATURES + VALUATION_FEATURES + QUALITY_FEATURES
+    + EARNINGS_REACTION_FEATURES
+)
+ESTIMATE_SOURCED_FEATURES = (
+    ANALYST_REVISION_FEATURES + FORWARD_VALUATION_FEATURES
+    + REVISION_MOMENTUM_FEATURES + EPS_DISPERSION_FEATURES
 )
