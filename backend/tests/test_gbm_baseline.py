@@ -2578,3 +2578,114 @@ def test_non_advancing_run_holds_the_monthly_anchor():
 def _rank01_local(a):
     from backend.ml.gbm_baseline import _rank01
     return _rank01(a)
+
+
+# =============================================================
+# Phase 2 — diagnostics, honest benchmarks, top-of-list metrics
+# =============================================================
+
+
+def test_forecast_combination_recovers_a_planted_signal_and_signs_from_train_only():
+    """One vote per feature, signed in the training window. Nothing to overfit but
+    the signs, which is the point of the benchmark."""
+    from backend.ml.gbm_baseline import forecast_combination_predict
+
+    rng = np.random.default_rng(0)
+    n = 200
+    good = rng.normal(size=n)
+    train = pd.DataFrame({
+        "a": good, "b": -good, "c": rng.normal(size=n), "y": good,
+    })
+    test = pd.DataFrame({
+        "a": good, "b": -good, "c": rng.normal(size=n), "y": good,
+    })
+    pred = forecast_combination_predict(train, test, "y", ["a", "b", "c"])
+    # `b` is anti-correlated in training, so it must be flipped, not cancel `a` out.
+    assert pd.Series(pred).corr(pd.Series(test["y"]), method="spearman") > 0.8
+    # A feature that is pure noise in training contributes a sign but no signal; the
+    # combination still tracks the planted factor.
+    assert np.isfinite(pred).all()
+
+
+def test_forecast_combination_ignores_missing_values_rather_than_imputing():
+    from backend.ml.gbm_baseline import forecast_combination_predict
+
+    train = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0], "y": [1.0, 2.0, 3.0, 4.0]})
+    test = pd.DataFrame({"a": [1.0, np.nan, -1.0, 0.5]})
+    pred = forecast_combination_predict(train, test, "y", ["a"])
+    assert np.isfinite(pred).all()          # never NaN out the whole row
+    assert pred[1] == 0.0                   # unobserved -> no vote, not a mid-rank
+
+
+def test_top_of_list_metrics_separate_a_good_top_from_a_good_full_list():
+    """The product ships `order by direction_prob desc`. A model can rank the full
+    list well and still have a bad top decile, and SECB cannot tell."""
+    from backend.ml.gbm_baseline import top_of_list_metrics
+
+    # n=500 like a real cross-section: precision@k is capped at (0.20*n)/k, so a
+    # smaller universe could not reach 1.0 even with a perfect ranking.
+    n = 500
+    r = np.linspace(-1, 1, n)
+    perfect = top_of_list_metrics(r, r)                 # ranking == outcome
+    assert perfect["spread_decile"] > 0
+    assert perfect["precision_at_k"] == pytest.approx(1.0)
+    inverted = top_of_list_metrics(-r, r)
+    assert inverted["spread_decile"] < 0
+    assert inverted["precision_at_k"] == pytest.approx(0.0)
+    # The case the whole metric exists for: a ranking that is right almost everywhere
+    # but wrong exactly where the product looks. Full-list Spearman stays strongly
+    # positive; the decile spread must go negative.
+    sabotaged = r.copy()
+    top_decile = np.argsort(-r)[: int(0.10 * n)]
+    sabotaged[top_decile] = -5.0                        # the picks are the worst names
+    # Still solidly positive on the full list (collapsing a decile onto one value
+    # costs some rank mass, so this is ~0.46, not ~0.9) ...
+    assert pd.Series(r).corr(pd.Series(sabotaged), method="spearman") > 0.4
+    assert top_of_list_metrics(r, sabotaged)["spread_decile"] < 0
+    assert top_of_list_metrics(r, sabotaged)["top_decile_r"] < 0
+
+
+def test_within_sector_ic_breakdown_exposes_a_single_sector_signal():
+    """SECB averages the sectors, so a signal living in exactly one reads the same as
+    one spread evenly across eleven. The breakdown is what distinguishes them."""
+    from backend.ml.gbm_baseline import within_sector_ic, within_sector_ic_breakdown
+
+    n = 30
+    rng = np.random.default_rng(1)
+    df = pd.DataFrame({
+        "sector": ["A"] * n + ["B"] * n,
+        "r_1M": np.concatenate([np.arange(n, dtype=float), rng.normal(size=n)]),
+    })
+    preds = np.concatenate([np.arange(n, dtype=float), rng.normal(size=n)])
+    parts = within_sector_ic_breakdown(preds, df, "r_1M", min_group_size=10)
+    assert parts["A"] == pytest.approx(1.0)      # perfect inside A
+    assert abs(parts["B"]) < 0.5                 # noise inside B
+    # The scalar headline is exactly the mean of the parts it hides.
+    assert within_sector_ic(preds, df, "r_1M", min_group_size=10) == pytest.approx(
+        float(np.mean(list(parts.values())))
+    )
+
+
+def test_tree_curve_reuses_one_fit_and_ends_at_the_headline_ic():
+    """The IC-vs-trees curve must cost no extra training: truncating the SAME fitted
+    models with num_iteration is what makes the complexity question cheap to ask."""
+    from backend.ml.gbm_baseline import _fit_models, _fold_fit_diagnostics
+
+    frames = [make_frame(n_days=1200, trend=0.0002 * (k + 1), tid=k, vol_seed=k)
+              for k in range(10)]
+    panel = prepare_panel(frames, build_calendar_grid(frames))
+    dates = sorted(panel["date"].unique())
+    # NOT the last grid date: the 1M forward return does not exist there yet, so
+    # r_1M is constant and every Spearman comes back NaN.
+    train = panel[panel["date"] <= dates[-8]]
+    test = panel[(panel["date"] == dates[-5]) & panel["mask_1M"]]
+    train = train[train["mask_1M"] & train["r_1M"].notna()]
+    cfg = LGBMConfig(n_estimators=120, num_leaves=4, min_child_samples=5)
+    models = _fit_models(train, "r_1M", cfg, seed=0, shuffle=False,
+                         feature_cols=list(FEATURE_COLS), n_seeds=1)
+    d = _fold_fit_diagnostics(models, train, test, list(FEATURE_COLS), "r_1M",
+                              tree_grid=(25, 60, 120))
+    assert set(d["tree_curve"]) == {25, 60, 120}
+    # Gain importances are normalized per model, so they form a distribution.
+    assert d["importance"] and abs(sum(d["importance"].values()) - 1.0) < 1e-6
+    assert d["ic_train"] == d["ic_train"]     # not NaN

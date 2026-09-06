@@ -830,6 +830,37 @@ def fit_linear_model(
     return model
 
 
+def forecast_combination_predict(
+    train_df, test_df, target_col: str, feature_cols: list[str] | None = None
+) -> np.ndarray:
+    """Equal-weight combination of per-feature univariate forecasts.
+
+    The canonical low-signal-to-noise benchmark: give each characteristic one vote,
+    signed by its association with the target in the TRAINING window only, and average.
+    There is nothing to overfit but N signs. Han-He-Rapach-Zhou (Review of Finance
+    2024) find exactly this kind of regularized-linear + forecast-combination scheme
+    beats random forests and deep nets on US cross-sectional out-of-sample accuracy,
+    so a GBDT that cannot clear it is buying complexity risk and nothing else.
+
+    Features arrive already mapped to within-date ranks in [-1, 1], so they are on a
+    common scale and can be averaged directly. NaN (source absent) contributes
+    nothing rather than a fabricated mid-rank.
+    """
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    y = train_df[target_col]
+    total = np.zeros(len(test_df), dtype=float)
+    used = np.zeros(len(test_df), dtype=float)
+    for c in cols:
+        rho = train_df[c].corr(y, method="spearman")
+        if rho != rho or rho == 0:
+            continue
+        col = test_df[c].to_numpy(dtype=float)
+        ok = np.isfinite(col)
+        total[ok] += float(np.sign(rho)) * col[ok]
+        used[ok] += 1.0
+    return np.divide(total, used, out=np.zeros_like(total), where=used > 0)
+
+
 def _rank01(a: np.ndarray) -> np.ndarray:
     """Map a prediction vector to within-cross-section percentile rank in [0, 1].
 
@@ -859,6 +890,50 @@ def blend_gbdt_linear(
     return (1.0 - weight) * _rank01(gbdt_pred) + weight * _rank01(linear_pred)
 
 
+def _fit_models(
+    train_df,
+    target_col: str,
+    cfg: LGBMConfig,
+    seed: int,
+    shuffle: bool,
+    feature_cols: list[str] | None = None,
+    n_seeds: int = 1,
+) -> list:
+    """Fit the per-fold seed ensemble. Split out from `_fit_predict` so the fold's
+    diagnostics (in-sample IC, tree curve, gain importances) can reuse the SAME fitted
+    models instead of paying for extra fits."""
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    return [
+        fit_lgbm_model(
+            train_df, target_col, cfg,
+            seed=seed if n_seeds == 1 else seed + s * 997,
+            shuffle=shuffle, feature_cols=cols,
+        )
+        for s in range(max(1, n_seeds))
+    ]
+
+
+def _predict_models(models: list, df, feature_cols: list[str] | None = None,
+                    num_iteration: int | None = None) -> np.ndarray:
+    """Ensemble prediction for one cross-section.
+
+    Multi-seed ensembles are averaged in RANK space, not raw-score space: LambdaRank
+    scores carry no fixed scale or offset across independently-seeded models, so a raw
+    mean is a scale-weighted vote in which the widest-range seed dominates. `_rank01`
+    is the same normalization `blend_gbdt_linear` and the target blend already use.
+    A single model is returned raw (rank-transforming it would be a monotone no-op).
+
+    `num_iteration` truncates each model to its first k trees — how the IC-vs-trees
+    curve is produced without refitting.
+    """
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    X = df[cols]
+    kw = {"num_iteration": num_iteration} if num_iteration else {}
+    if len(models) == 1:
+        return np.asarray(models[0].predict(X, **kw), dtype=float)
+    return np.mean([_rank01(np.asarray(m.predict(X, **kw), dtype=float)) for m in models], axis=0)
+
+
 def _fit_predict(
     train_df,
     test_df,
@@ -869,22 +944,8 @@ def _fit_predict(
     feature_cols: list[str] | None = None,
     n_seeds: int = 1,
 ) -> np.ndarray:
-    cols = feature_cols if feature_cols is not None else FEATURE_COLS
-    if n_seeds == 1:
-        return fit_lgbm_model(
-            train_df, target_col, cfg, seed=seed, shuffle=shuffle, feature_cols=cols
-        ).predict(test_df[cols])
-    # Average the seeds in RANK space, not raw-score space. LambdaRank scores have
-    # no fixed scale or offset across independently-seeded models, so a raw mean is
-    # a scale-weighted vote in which one wide-range seed dominates. `_rank01` is the
-    # same normalization `blend_gbdt_linear` / the target blend already use.
-    preds_all = np.stack([
-        _rank01(fit_lgbm_model(
-            train_df, target_col, cfg, seed=seed + s * 997, shuffle=shuffle, feature_cols=cols
-        ).predict(test_df[cols]))
-        for s in range(n_seeds)
-    ])
-    return preds_all.mean(axis=0)
+    models = _fit_models(train_df, target_col, cfg, seed, shuffle, feature_cols, n_seeds)
+    return _predict_models(models, test_df, feature_cols)
 
 
 def _target_col(horizon: str, target_mode: str) -> str:
@@ -957,14 +1018,37 @@ def within_sector_ic(
         "r": test_df[r_col].to_numpy(dtype=float),
         "grp": test_df[group_col].to_numpy(),
     })
-    ics = []
-    for _, grp in tmp.dropna(subset=["grp"]).groupby("grp"):
+    return float(np.mean(list(per_sector.values()))) if (
+        per_sector := within_sector_ic_breakdown(
+            preds, test_df, r_col, group_col=group_col, min_group_size=min_group_size
+        )
+    ) else float("nan")
+
+
+def within_sector_ic_breakdown(
+    preds, test_df, r_col: str, group_col: str = "sector", min_group_size: int = 10
+) -> dict[str, float]:
+    """Per-sector Spearman IC for one cross-section, keyed by sector.
+
+    `within_sector_ic` averages these into the SECB headline and discards the parts,
+    so a signal that lives entirely in one sector is indistinguishable from one spread
+    evenly across eleven. Returning the breakdown is what makes that checkable.
+    """
+    import pandas as pd
+
+    tmp = pd.DataFrame({
+        "pred": np.asarray(preds, dtype=float),
+        "r": test_df[r_col].to_numpy(dtype=float),
+        "grp": test_df[group_col].to_numpy(),
+    })
+    out: dict[str, float] = {}
+    for name, grp in tmp.dropna(subset=["grp"]).groupby("grp"):
         if grp.shape[0] < min_group_size:
             continue
         ic = grp["pred"].corr(grp["r"], method="spearman")
         if ic == ic:
-            ics.append(float(ic))
-    return float(np.mean(ics)) if ics else float("nan")
+            out[str(name)] = float(ic)
+    return out
 
 
 def ewma_rank_by_ticker(
@@ -999,6 +1083,110 @@ def ewma_rank_by_ticker(
             state[t] = raw_rank[i] if t not in state else alpha * raw_rank[i] + (1 - alpha) * state[t]
             sm[i] = state[t]
         out.append(sm)
+    return out
+
+
+def top_of_list_metrics(
+    preds, r: np.ndarray, k: int = 50, decile: float = 0.10
+) -> dict[str, float]:
+    """What the product actually ships: the top of one ranked cross-section.
+
+    SECB is an equal-weighted full-list Spearman averaged over eleven sectors, but the
+    dashboard serves `order by direction_prob desc`. A model can have a genuinely
+    useful top decile and a full-list IC of zero, or the reverse, and the headline
+    cannot tell those apart. Reported per fold so they can be block-bootstrapped like
+    IC (an equal-weighted decile spread is a return, not a correlation, so it is on a
+    scale a person can actually judge).
+
+      spread_decile — mean demeaned return of the top decile minus the bottom decile
+      top_decile_r  — mean demeaned return of the top decile alone (the long-only read)
+      precision_at_k — fraction of the top k that landed in the realized top quintile
+    """
+    p = np.asarray(preds, dtype=float)
+    y = np.asarray(r, dtype=float)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    n = p.size
+    if n < 10:
+        return {"spread_decile": float("nan"), "top_decile_r": float("nan"),
+                "precision_at_k": float("nan")}
+    order = np.argsort(-p)                       # best-ranked first
+    m = max(1, int(round(decile * n)))
+    top_r, bot_r = float(y[order[:m]].mean()), float(y[order[-m:]].mean())
+    kk = min(k, n)
+    winners = set(np.argsort(-y)[: max(1, int(round(0.20 * n)))].tolist())
+    hit = sum(1 for i in order[:kk] if i in winners) / kk
+    return {"spread_decile": top_r - bot_r, "top_decile_r": top_r,
+            "precision_at_k": float(hit)}
+
+
+# Tree counts for the IC-vs-complexity curve. Read off ONE fit via
+# `predict(num_iteration=k)`, so the whole curve costs no extra training.
+TREE_CURVE_GRID = (25, 50, 100, 150, 200, 300, 400, 600)
+
+
+def _fold_fit_diagnostics(
+    models: list, train, test, cols: list[str], r_col: str,
+    tree_grid=TREE_CURVE_GRID, train_dates: int = 12,
+    sector_group_col: str | None = None,
+) -> dict:
+    """In-sample IC, an IC-vs-trees curve, and gain importances for one fold.
+
+    Answers the question the harness could not previously ask at all: is the model
+    over-fitting, under-fitting, or fitting nothing? Train-set IC was never computed,
+    so the in-sample/out-of-sample gap was unobservable, and `n_estimators=300` has
+    never been revisited since the file's first commit.
+
+    The curve reuses the fitted models via `num_iteration`; only the last `train_dates`
+    training cross-sections are scored in-sample, because pooling Spearman across dates
+    would mix cross-sections rather than measure per-date ranking skill.
+    """
+    import pandas as pd
+
+    def _score(preds, df) -> float:
+        """Score with the SAME metric as the headline, so the numbers are comparable.
+
+        Using universe IC here while the promotion bar is SECB would make the
+        over/under-fit gap and the complexity curve answer a different question than
+        the one being decided.
+        """
+        if sector_group_col and sector_group_col in df.columns:
+            return within_sector_ic(preds, df, r_col, group_col=sector_group_col)
+        ic = pd.Series(preds).corr(pd.Series(df[r_col].to_numpy(dtype=float)),
+                                   method="spearman")
+        return float(ic) if ic == ic else float("nan")
+
+    out: dict = {}
+    recent = sorted(train["date"].unique())[-train_dates:]
+    ics = []
+    for d in recent:
+        g = train[train["date"] == d]
+        if len(g) < 10:
+            continue
+        ic = _score(_predict_models(models, g, cols), g)
+        if ic == ic:
+            ics.append(float(ic))
+    out["ic_train"] = float(np.mean(ics)) if ics else float("nan")
+
+    n_trees = getattr(models[0], "n_estimators", None) or max(tree_grid)
+    curve = {}
+    for k in tree_grid:
+        if k > n_trees:
+            continue
+        ic = _score(_predict_models(models, test, cols, num_iteration=k), test)
+        if ic == ic:
+            curve[k] = float(ic)
+    out["tree_curve"] = curve
+
+    # `feature_importances_` is SPLIT COUNT by default, which rewards high-cardinality
+    # features rather than useful ones; gain is the decision-relevant quantity.
+    gains = np.zeros(len(cols), dtype=float)
+    for m in models:
+        g = np.asarray(m.booster_.feature_importance(importance_type="gain"), dtype=float)
+        total = g.sum()
+        if total > 0:
+            gains += g / total
+    out["importance"] = dict(zip(cols, (gains / max(len(models), 1)).tolist(), strict=True))
     return out
 
 
@@ -1484,6 +1672,8 @@ def walk_forward_ic(
     max_test_date=None,
     min_test_date=None,
     vol_gate: bool = False,
+    fit_diagnostics: bool = False,
+    baselines: bool = False,
     return_records: bool = False,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
@@ -1556,10 +1746,10 @@ def walk_forward_ic(
         if test.shape[0] < wf_cfg.min_names or train.empty:
             continue
 
-        preds = _fit_predict(
-            train, test, fit_col, lgb_cfg, seed + fi, shuffle,
-            feature_cols=feature_cols, n_seeds=n_seeds,
-        )
+        cols_used = feature_cols if feature_cols is not None else FEATURE_COLS
+        models = _fit_models(train, fit_col, lgb_cfg, seed + fi, shuffle,
+                             feature_cols=feature_cols, n_seeds=n_seeds)
+        preds = _predict_models(models, test, feature_cols)
         if linear_blend > 0:
             # `test` is a single month-end cross-section here, so rank-blending is
             # well-defined. The null path shuffles both models identically.
@@ -1583,9 +1773,34 @@ def walk_forward_ic(
         if "vol_120d_raw" in test.columns:
             fold["vol_raw_med"] = float(np.nanmedian(test["vol_120d_raw"].to_numpy(dtype=float)))
         if compute_sector_ic:
-            fold["sector_ic"] = within_sector_ic(
+            by_sector = within_sector_ic_breakdown(
                 preds, test, r_col, group_col=sector_group_col
             )
+            fold["sector_ic"] = float(np.mean(list(by_sector.values()))) if by_sector else float("nan")
+            fold["sector_ic_by_group"] = by_sector
+        # The top of the ranked list is what the product ships; SECB cannot see it.
+        fold.update(top_of_list_metrics(preds, test[r_col].to_numpy(dtype=float)))
+        if baselines:
+            # Same fold, same rows, same target — the only difference is the estimator.
+            realized = test[r_col].to_numpy(dtype=float)
+            ridge = fit_linear_model(train, fit_col, feature_cols=cols_used,
+                                     alpha=ridge_alpha, seed=seed + fi, shuffle=shuffle)
+            bench = {
+                "ridge": ridge.predict(
+                    np.nan_to_num(test[cols_used].to_numpy(dtype=float), nan=0.0)),
+                "combo": forecast_combination_predict(train, test, fit_col, cols_used),
+            }
+            for name, bp in bench.items():
+                fold[f"ic_{name}"] = float(
+                    pd.Series(bp).corr(pd.Series(realized), method="spearman"))
+                if compute_sector_ic:
+                    fold[f"sector_ic_{name}"] = within_sector_ic(
+                        bp, test, r_col, group_col=sector_group_col)
+        if fit_diagnostics:
+            fold.update(_fold_fit_diagnostics(
+                models, train, test, cols_used, r_col,
+                sector_group_col=sector_group_col if compute_sector_ic else None,
+            ))
         fold_rows.append(fold)
         risk = {
             key: test[col].to_numpy(dtype=float)
@@ -1634,23 +1849,81 @@ def walk_forward_ic(
             fold["ic"] = float(pd.Series(rk).corr(pd.Series(rec["r"]), method="spearman"))
             if compute_sector_ic and rec["sector"] is not None:
                 sdf = pd.DataFrame({r_col: rec["r"], sector_group_col: rec["sector"]})
-                fold["sector_ic"] = within_sector_ic(rk, sdf, r_col, group_col=sector_group_col)
+                by_sector = within_sector_ic_breakdown(
+                    rk, sdf, r_col, group_col=sector_group_col
+                )
+                fold["sector_ic"] = (float(np.mean(list(by_sector.values())))
+                                     if by_sector else float("nan"))
+                fold["sector_ic_by_group"] = by_sector
+            # The overlays re-rank the cross-section, which is exactly what the
+            # product ships — so the top-of-list metrics have to be recomputed here,
+            # not left describing the pre-overlay model.
+            fold.update(top_of_list_metrics(rk, rec["r"]))
         turnover_smoothed = rank_turnover(records, rank_series=ranks)
 
     result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
     result["turnover_raw"] = rank_turnover(records)
     result["turnover_smoothed"] = turnover_smoothed
     result["n_vol_gated"] = n_gated
+    if compute_sector_ic:
+        # Computed here, ahead of the diagnostics below, which score train and test
+        # with this same metric. sector_summary uses the naive across-fold ICIR —
+        # callers apply block_bootstrap_summary to sector_ic_values for an honest t.
+        s_ics = [r["sector_ic"] for r in fold_rows if r["sector_ic"] == r["sector_ic"]]
+        result["sector_summary"] = summarize(s_ics)
+        result["sector_ic_values"] = s_ics
+
+    # --- top of the ranked list (what the product ships) ---
+    def _col(name):
+        return [f[name] for f in fold_rows if f.get(name) == f.get(name)]
+    result["top_of_list"] = {
+        name: summarize(_col(name))
+        for name in ("spread_decile", "top_decile_r", "precision_at_k")
+    }
+    # --- per-sector IC: which sectors carry the headline average ---
+    if compute_sector_ic:
+        per_sector: dict[str, list[float]] = {}
+        for f in fold_rows:
+            for sec, v in (f.get("sector_ic_by_group") or {}).items():
+                per_sector.setdefault(sec, []).append(v)
+        result["sector_ic_by_group"] = {
+            sec: {"n_folds": len(v), "mean_ic": float(np.mean(v))}
+            for sec, v in sorted(per_sector.items())
+        }
+    # --- honest benchmarks: does the GBDT earn its complexity? ---
+    if baselines:
+        result["baselines"] = {
+            name: {
+                "universe": summarize(_col(f"ic_{name}")),
+                **({"sector": summarize(_col(f"sector_ic_{name}"))}
+                   if compute_sector_ic else {}),
+            }
+            for name in ("ridge", "combo")
+        }
+    # --- fit diagnostics: over/under-fit and the complexity curve ---
+    if fit_diagnostics and fold_rows:
+        curve: dict[int, list[float]] = {}
+        imp: dict[str, list[float]] = {}
+        for f in fold_rows:
+            for k, v in (f.get("tree_curve") or {}).items():
+                curve.setdefault(k, []).append(v)
+            for c, v in (f.get("importance") or {}).items():
+                imp.setdefault(c, []).append(v)
+        result["fit_diagnostics"] = {
+            "train": summarize(_col("ic_train")),
+            # Same metric on both sides: the train IC is SECB whenever the headline is,
+            # so comparing it against the universe summary would overstate the gap.
+            "test": result["sector_summary"] if compute_sector_ic else result["summary"],
+            "tree_curve": {k: float(np.mean(v)) for k, v in sorted(curve.items())},
+            "importance": dict(sorted(
+                ((c, float(np.mean(v))) for c, v in imp.items()),
+                key=lambda kv: -kv[1],
+            )),
+        }
     if return_records:
         # Raw per-fold (ticker_ids, pred, r, sector) so a caller can sweep smoothing
         # spans / turnover WITHOUT refitting (the fits dominate cost).
         result["records"] = records
-    if compute_sector_ic:
-        # sector_summary uses the same naive ICIR×√N formula as universe — caller
-        # should apply block_bootstrap_summary on sector_ic_values for honest t.
-        s_ics = [r["sector_ic"] for r in fold_rows if r["sector_ic"] == r["sector_ic"]]
-        result["sector_summary"] = summarize(s_ics)
-        result["sector_ic_values"] = s_ics
     return result
 
 
@@ -2180,6 +2453,8 @@ async def run(args) -> None:
                                max_test_date=args.max_test_date,
                                min_test_date=args.min_test_date,
                                vol_gate=args.vol_gate,
+                               fit_diagnostics=args.fit_diagnostics,
+                               baselines=args.baselines,
                                return_records=(knife_grid is not None
                                                or blend_grid is not None
                                                or args.size_neutral_ic))
@@ -2356,6 +2631,62 @@ async def run(args) -> None:
                 seed=args.seed,
             )
             _print_bootstrap("BOOT", boot)
+
+        tol = real.get("top_of_list") or {}
+        if tol:
+            print("\n[TOP OF LIST] what the product actually ships "
+                  "(SECB is a full-list average and cannot see this):")
+            print(f"  {'metric':<16} {'mean':>9} {'std':>8} {'hit':>6}  n={tol['spread_decile']['n_folds']}")
+            for name, label in (("spread_decile", "decile spread"),
+                                ("top_decile_r", "top decile ret"),
+                                ("precision_at_k", "precision@50")):
+                s = tol[name]
+                print(f"  {label:<16} {s['mean_ic']:>+9.4f} {s['std_ic']:>8.4f} {s['hit_rate']:>6.2f}")
+            spread = [f["spread_decile"] for f in real["folds"]
+                      if f.get("spread_decile") == f.get("spread_decile")]
+            if spread:
+                b = block_bootstrap_summary(spread, block_size=block_size,
+                                            reps=args.block_bootstrap_reps, seed=args.seed)
+                print(f"  decile spread  block={block_size}  t_block={b['t_block']:+.2f}  "
+                      f"p={b['p_value']:.4f}  ci95=[{b['ci_low']:+.4f}, {b['ci_high']:+.4f}]")
+
+        by_sec = real.get("sector_ic_by_group") or {}
+        if by_sec:
+            print("\n[BY SECTOR] the parts SECB averages away "
+                  "(a signal living in one sector reads the same as one spread evenly):")
+            for sec, s in sorted(by_sec.items(), key=lambda kv: -kv[1]["mean_ic"]):
+                print(f"  {sec:<26} n={s['n_folds']:>4}  mean_ic={s['mean_ic']:>+.4f}")
+
+        bl = real.get("baselines")
+        if bl:
+            key = "sector" if args.sector_neutral_ic else "universe"
+            gbdt = (real["sector_summary"] if args.sector_neutral_ic
+                    else real["summary"])["mean_ic"]
+            print(f"\n[BASELINES] same folds, same target — is the GBDT earning its "
+                  f"complexity? ({'SECB' if args.sector_neutral_ic else 'universe'} IC)")
+            print(f"  {'estimator':<22} {'mean_ic':>9} {'icir':>7} {'hit':>6}")
+            print(f"  {'GBDT (headline)':<22} {gbdt:>+9.4f}")
+            for name, label in (("ridge", "ridge"),
+                                ("combo", "forecast combination")):
+                s = bl[name][key]
+                print(f"  {label:<22} {s['mean_ic']:>+9.4f} {s['icir']:>7.3f} "
+                      f"{s['hit_rate']:>6.2f}   (delta vs GBDT {gbdt - s['mean_ic']:+.4f})")
+
+        fd = real.get("fit_diagnostics")
+        if fd:
+            tr, te = fd["train"]["mean_ic"], fd["test"]["mean_ic"]
+            print(f"\n[FIT] in-sample IC {tr:+.4f}  vs  out-of-sample {te:+.4f}  "
+                  f"(gap {tr - te:+.4f})")
+            if fd["tree_curve"]:
+                print("  IC vs trees (same fits, truncated via num_iteration):")
+                print("   " + "  ".join(f"{k}:{v:+.4f}" for k, v in fd["tree_curve"].items()))
+                best = max(fd["tree_curve"].items(), key=lambda kv: kv[1])
+                print(f"   peak at {best[0]} trees (IC {best[1]:+.4f}); "
+                      f"production uses {lgb_cfg.n_estimators}")
+            top = list(fd["importance"].items())[:15]
+            print("  top gain importances:")
+            for c, v in top:
+                print(f"   {c:<28} {v:.4f}")
 
         if args.null_reps > 0:
             print(f"\nrunning {args.null_reps} shuffle-null reps ...")
@@ -2619,6 +2950,18 @@ def main() -> None:
                         "of headlines, so the columns are ~98%% zero across the panel "
                         "and cannot be validated. Turn on once a headline archive is "
                         "backfilled.")
+    p.add_argument("--baselines", action="store_true",
+                   help="score a ridge and an equal-weight forecast combination on the "
+                        "SAME folds as the GBDT. Han-He-Rapach-Zhou (RoF 2024) find "
+                        "regularized-linear + combination beats RF/DNN on US "
+                        "cross-sectional OOS accuracy, so a GBDT that cannot clear "
+                        "these is buying complexity risk and nothing else.")
+    p.add_argument("--fit-diagnostics", action="store_true",
+                   help="report in-sample vs out-of-sample IC, an IC-vs-number-of-trees "
+                        "curve (read off the same fits via num_iteration, so no extra "
+                        "training), and gain-based feature importances averaged over "
+                        "folds. Answers whether the model is over- or under-fitting — "
+                        "train IC was never computed, so that gap was unobservable.")
     p.add_argument("--with-estimate-missing", action="store_true",
                    help="add the LSEG availability pack (est_available, "
                         "est_staleness_days) — the analyst-feed analogue of "

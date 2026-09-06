@@ -152,6 +152,79 @@ window, no overlays.
 
 Still nothing significant, still below every floor.
 
+### 2026-09-06 — Phase 2: diagnostics and honest benchmarks (measurement only)
+
+No model change. Four things the harness previously could not measure at all. All
+runs: selection folds, single-seed, production per-horizon config, refreshed cache.
+
+**2.1 The model is massively over-fit.** Train IC was never computed, so the
+in-sample/out-of-sample gap was unobservable. Scored on the headline metric (SECB),
+in-sample over the last 12 training cross-sections:
+
+| Horizon | in-sample SECB | out-of-sample SECB | gap |
+|---------|----------------|--------------------|-----|
+| 3M | +0.2985 | +0.0037 | +0.295 |
+| 6M | +0.2373 | −0.0086 | +0.246 |
+| 1Y | +0.2422 | −0.0088 | +0.251 |
+
+`LGBMConfig`'s docstring claims it is "deliberately shallow + regularized ... should
+resist memorizing the train cross-sections". It does not. The IC-vs-trees curve (read
+off the same fits via `num_iteration`, no extra training) peaks well below the
+configured 300 at every horizon: **3M at 200, 6M at 50, 1Y at 100**. The differences
+are sub-floor, so this is not yet a promotion case — it is a specification finding
+that makes Phase 4.1 and 4.3 concrete.
+
+**2.2 Ridge beats the GBDT at every horizon.** Same folds, same target, same features;
+only the estimator differs.
+
+| Horizon | GBDT | ridge | forecast combination |
+|---------|------|-------|----------------------|
+| 3M | +0.0037 | **+0.0139** | −0.0239 |
+| 6M | −0.0034 | **+0.0074** | −0.0210 |
+| 1Y | −0.0111 | **+0.0041** | −0.0729 |
+
+Ridge is the only estimator positive at all three horizons, and at 3M it is the first
+thing measured on this panel to land inside the literature's honest large-cap range
+(0.01–0.02) — though still below the 0.0231 detection floor, so **not significant**.
+Consistent with Han-He-Rapach-Zhou (RoF 2024) and with the over-fitting above.
+
+**The pre-written criterion was about the COMBINATION, and the GBDT passes it 3/3.**
+The ridge result is a post-hoc comparison and is explicitly *not* grounds for
+promotion; it earns its own pre-registered test in Phase 4. The equal-weight
+combination fails badly everywhere — one vote per feature over 20-23 columns that are
+largely collinear or noise dilutes rather than diversifies.
+
+**2.3 The top of the list — what the product actually ships — is weak or negative.**
+SECB is a full-list average over eleven sectors; the dashboard serves
+`order by direction_prob desc`. Per fold, on the demeaned return:
+
+| Horizon (production config) | decile spread | t_block | top-decile return | hit | precision@50 |
+|---|---|---|---|---|---|
+| 3M (knife 0.20 + smooth 3) | +0.0051 | +0.43 | −0.0057 | 0.46 | 0.225 |
+| 6M (lambdarank, rolling-60) | −0.0003 | −0.01 | −0.0111 | 0.46 | 0.268 |
+| 1Y (lambdarank, smooth 4)   | −0.0061 | −0.15 | −0.0057 | 0.47 | 0.270 |
+
+**The top decile has underperformed the cross-sectional median at every horizon**, and
+no decile spread is distinguishable from zero. Precision@50 is mildly above the 0.20
+chance rate everywhere, so the ranking finds slightly more winners than chance while
+losing on magnitude — the falling-knife shape.
+
+**The 3M overlays are vindicated on exactly the metric that motivated them, and it was
+invisible to SECB.** Same fold set, overlays off vs on: decile spread −0.0014 → +0.0051,
+top-decile return −0.0135 → −0.0057, hit 0.32 → 0.46. SECB *falls* slightly under the
+overlays, which is why this could never have been seen before.
+
+**2.3b Per-sector heterogeneity dwarfs the headline.** 3M SECB +0.0037 is the mean of
+eleven sector ICs spanning **+0.045 (Consumer Staples) to −0.043 (Industrials)**, seven
+positive and four negative. `Communication Services` (n=60) and `Real Estate` (n=81)
+have fewer folds than the rest (n=114) — correct PIT behaviour, since those sectors did
+not exist for the whole panel.
+
+**Incidental, and uncomfortable:** the highest gain-importance feature at 3M is
+`fund_available` (0.094), ahead of `vol_120d` and `log_market_cap`. A missingness
+indicator is the single most-used input in the book — and it is the same feature the
+2026-08 audit flagged as a survivorship-availability proxy. Worth its own ablation.
+
 ## Outstanding
 
 - 8-seed confirmation of the rank-averaged ensemble at 6M/1Y (no criterion attached; it
