@@ -338,3 +338,27 @@ def test_sector_on_falls_back_when_history_is_absent_or_uncovered():
                 "sector": "Financials", "industry": None}]
     assert _sector_on(history, date(2015, 1, 1), fallback) == fallback
     assert _sector_on(history, date(2021, 1, 1), fallback)[0] == "Financials"
+
+
+def test_ticker_frame_accepts_every_kwarg_load_frames_passes():
+    """Guard against a field being dropped from TickerFrame.
+
+    load_frames is the only caller that passes the full kwarg set, and it needs a
+    live DB — so an editing slip that removed the `membership` field passed the whole
+    suite and only surfaced on a real cache refresh. This pins the constructor
+    contract without needing a database.
+    """
+    from backend.ml.dataset import TickerFrame
+
+    frame = TickerFrame(
+        ticker_id=1, embedding_idx=1, symbol="T1",
+        prices=[], fundamentals=[], sentiment=[],
+        shares_outstanding=100, sector="Information Technology", industry="Software",
+        estimates=[], surprises=[], short_interest=[], insiders=[],
+        membership=[{"valid_from": date(2015, 1, 1), "valid_to": None}],
+        sector_history=[{"valid_from": date(2015, 1, 1), "valid_to": None,
+                         "sector": "Information Technology", "industry": "Software"}],
+        removed_at=None,
+    )
+    assert frame.membership and frame.sector_history
+    assert frame.removed_at is None

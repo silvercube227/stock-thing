@@ -82,6 +82,7 @@ class TickerFrame:
     # index_membership intervals [{valid_from, valid_to}] (valid_to exclusive, null =
     # current). None means "not loaded" (pre-migration cache) and is distinct from []
     # ("loaded; never a member") — the membership filter has to tell those apart.
+    membership: list[dict] | None = None
     # sector_history intervals [{valid_from, valid_to, sector, industry}] (valid_to
     # exclusive, null = current). None = table not loaded; build_ticker_rows then
     # falls back to the static `sector`/`industry` above.
