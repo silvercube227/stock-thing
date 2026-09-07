@@ -260,6 +260,41 @@ def _seasonality_asof(
     return out
 
 
+def _range_vol(high: list, low: list, pos: int, window: int) -> float:
+    """Parkinson (1980) range volatility over the trailing `window` bars.
+
+    sqrt( mean( ln(high/low)^2 ) / (4 ln 2) ) — daily, comparable in scale to the
+    close-to-close std the book already uses. The intra-bar range uses two more
+    observations per day than a close-to-close return, so for the same window it is a
+    markedly lower-variance estimate of the same volatility. It is also split-safe:
+    high and low are adjusted together, so their RATIO is unaffected.
+    """
+    if pos + 1 < window:
+        return float("nan")
+    acc, n = 0.0, 0
+    for i in range(pos - window + 1, pos + 1):
+        h, lo = high[i], low[i]
+        if h and lo and h > 0 and lo > 0 and h >= lo:
+            acc += math.log(h / lo) ** 2
+            n += 1
+    if n < max(5, window // 2):
+        return float("nan")
+    return math.sqrt(acc / n / (4.0 * math.log(2.0)))
+
+
+def _dividend_yield_ttm(dividends: list, price: float | None, pos: int) -> float:
+    """Trailing 12-month cash dividends over the current price.
+
+    yfinance reports per-share dividends on the ex-date in the same adjusted units as
+    the price series, so the ratio is consistent. Non-payers legitimately yield 0.0 —
+    that is an observation, not a missing value, so it is NOT NaN.
+    """
+    if not price or price <= 0 or pos + 1 < 252:
+        return float("nan")
+    total = sum(d for d in dividends[max(0, pos - 251): pos + 1] if d)
+    return float(total) / float(price)
+
+
 def _short_interest_asof(
     si_rows: list[dict], as_of_dates: list
 ) -> dict[str, list[float]]:

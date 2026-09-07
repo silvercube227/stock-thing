@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import math
+from datetime import timedelta
 
 import numpy as np
 
@@ -22,7 +23,9 @@ from backend.ml.factors.fundamentals import (
 )
 from backend.ml.factors.insiders import _insider_context_asof
 from backend.ml.factors.price import (
+    _dividend_yield_ttm,
     _price_features,
+    _range_vol,
     _seasonality_asof,
     _short_interest_asof,
 )
@@ -202,6 +205,11 @@ def build_ticker_rows(
         float(r["close"]) if r.get("close") is not None else None for r in prices
     ]
     volume = [float(r.get("volume") or 0.0) for r in prices]
+    # high/low/dividend have been stored since the first ingest and were never
+    # selected until now; `.get` tolerates frames cached before they were added.
+    high = [float(r["high"]) if r.get("high") is not None else None for r in prices]
+    low = [float(r["low"]) if r.get("low") is not None else None for r in prices]
+    dividends = [float(r.get("dividend") or 0.0) for r in prices]
     shares = frame.shares_outstanding
 
     entries = []  # (grid_date, pos, bar_date)
@@ -224,6 +232,17 @@ def build_ticker_rows(
     sent = _build_sentiment_series(bar_dates, frame.sentiment)       # (k, 2)
     fund_ctx = _fundamental_context_asof(frame.fundamentals, bar_dates)
     pit_shares = _shares_outstanding_asof(frame.fundamentals, bar_dates)
+    # Same PIT lookup a year earlier — the denominator for net share issuance. Using
+    # the as-of helper (rather than differencing filings) means the comparison is
+    # "what was on file then" vs "what is on file now", which is what an investor
+    # could actually have observed.
+    pit_shares_1y = _shares_outstanding_asof(
+        frame.fundamentals, [d - timedelta(days=365) for d in bar_dates],
+        with_filed_at=True,
+    )
+    pit_shares_dated = _shares_outstanding_asof(
+        frame.fundamentals, bar_dates, with_filed_at=True
+    )
     reaction = _earnings_reaction_asof(
         frame.fundamentals,
         bar_positions,
@@ -314,6 +333,25 @@ def build_ticker_rows(
         feats["insider_buyers_90d"] = ins_ctx["insider_buyers_90d"][j]
         feats["insider_net_ratio_12m"] = ins_ctx["insider_net_ratio_12m"][j]
         # Availability of the LSEG feed, the analyst-side analogue of fund_available.
+        # Buybacks read negative, secondary offerings positive. NaN unless BOTH share
+        # counts are on file: "no prior filing" is not "no issuance".
+        (now_sh, now_filed), (prior_sh, prior_filed) = pit_shares_dated[j], pit_shares_1y[j]
+        feats["net_issuance"] = (
+            (now_sh / prior_sh - 1.0)
+            if now_sh and prior_sh and now_sh > 0 and prior_sh > 0
+            # Both lookups landing on the SAME filing is not an observation of a year
+            # of issuance — it just means nothing new has been filed. Returning 0.0
+            # there would put a fabricated exact-zero cluster into the cross-sectional
+            # ranking for every sparse filer.
+            and now_filed != prior_filed
+            else float("nan")
+        )
+        feats["range_vol_20d"] = _range_vol(high, low, pos, 20)
+        feats["range_vol_60d"] = _range_vol(high, low, pos, 60)
+        feats["dividend_yield_ttm"] = _dividend_yield_ttm(dividends, adj_close[pos], pos)
+        for _name in ("revenue_est_rev_30d", "revenue_est_rev_90d",
+                      "eps_num_est_chg_90d", "coverage_level", "coverage_drop_90d"):
+            feats[_name] = est_ctx[_name][j]
         feats["est_available"] = est_ctx["est_available"][j]
         feats["est_staleness_days"] = est_ctx["est_staleness_days"][j]
         # --- source-absence mask ------------------------------------------------

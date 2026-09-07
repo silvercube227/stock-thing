@@ -59,6 +59,10 @@ from backend.ml.factors import (  # noqa: F401
     EPS_SURPRISE_FEATURES,
     ESTIMATE_MISSING_FEATURES,
     ESTIMATE_SOURCED_FEATURES,
+    ANALYST_BREADTH_FEATURES,
+    ISSUANCE_FEATURES,
+    PAYOUT_FEATURES,
+    RANGE_VOL_FEATURES,
     ESTIMATE_SURPRISE_FEATURES,
     EXPERIMENTAL_FEATURES,
     FEATURE_COLS,
@@ -2335,6 +2339,14 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(SENTIMENT_FEATURES)
     if getattr(args, "with_estimate_missing", False):
         cols += list(ESTIMATE_MISSING_FEATURES)
+    if getattr(args, "with_issuance", False):
+        cols += list(ISSUANCE_FEATURES)
+    if getattr(args, "with_analyst-breadth".replace("-", "_"), False):
+        cols += list(ANALYST_BREADTH_FEATURES)
+    if getattr(args, "with_payout", False):
+        cols += list(PAYOUT_FEATURES)
+    if getattr(args, "with_range_vol", False):
+        cols += list(RANGE_VOL_FEATURES)
     # Ad-hoc single features (e.g. isolating one member of a pack for an ablation).
     if getattr(args, "extra_features", None):
         cols += [c.strip() for c in args.extra_features.split(",") if c.strip()]
@@ -2490,8 +2502,21 @@ async def run(args) -> None:
             print(f"  {'feature':>24} {'|corr|bk':>9} {'|corr|ER':>9} {'sec_ic':>8} "
                   f"{'sec_t':>7} {'sec_p':>8} {'ic_side':>8} {'ic_mid':>8} {'ic_trend':>8} "
                   f"  top correlates")
+            # The book has to be the horizon's ACTUAL production feature list, not
+            # bare FEATURE_COLS: the promoted per-horizon packs (coverage_chg_90d at
+            # 3M, revenue_surprise at 6M/1Y) are part of what a candidate must be
+            # decorrelated FROM. Comparing against the base 19 only would let a
+            # near-duplicate of an already-promoted feature pass the gate — the
+            # decorrelation illusion that killed E2 and E6 after the fits were spent.
+            prod_spec = PRODUCTION_HORIZON_SPECS.get(args.horizon, HorizonSpec())
+            book = [
+                c for c in (prod_spec.feature_cols or list(FEATURE_COLS))
+                if c not in set(candidates)
+            ]
+            print(f"decorrelation book: {len(book)} columns "
+                  f"(production feature list for {args.horizon})")
             for row in feature_diagnostics(
-                diag_panel, args.horizon, candidates,
+                diag_panel, args.horizon, candidates, existing_cols=book,
                 sector_group_col=args.neutralize_by,
                 min_names=args.min_names,
                 block_size=block_size,
@@ -3053,6 +3078,24 @@ def main() -> None:
                         "training), and gain-based feature importances averaged over "
                         "folds. Answers whether the model is over- or under-fitting — "
                         "train IC was never computed, so that gap was unobservable.")
+    p.add_argument("--with-issuance", action="store_true",
+                   help="add net share issuance (shares now vs shares a year ago, both "
+                        "point-in-time from the filing cover page). Pontiff-Woodgate; "
+                        "Fama-French 2008 find it pervasive across size groups. Needs "
+                        "no new ingestion.")
+    p.add_argument("--with-analyst-breadth", action="store_true",
+                   help="add the analyst-breadth pack (consensus revenue revisions, "
+                        "EPS estimate-count change, coverage level, coverage LOSS). "
+                        "Extends coverage_chg_90d, the cleanest feature in the "
+                        "post-audit diagnostics, using LSEG columns already ingested.")
+    p.add_argument("--with-payout", action="store_true",
+                   help="add trailing-12m dividend yield, from price_history.dividend "
+                        "(stored since the first ingest, never selected until now).")
+    p.add_argument("--with-range-vol", action="store_true",
+                   help="add Parkinson high/low range volatility (20d/60d). A "
+                        "lower-variance estimate of what vol_20d/vol_60d already "
+                        "proxy, so treat it as a REPLACEMENT for the close-to-close "
+                        "vol block rather than an addition.")
     p.add_argument("--with-estimate-missing", action="store_true",
                    help="add the LSEG availability pack (est_available, "
                         "est_staleness_days) — the analyst-feed analogue of "

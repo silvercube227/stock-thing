@@ -68,9 +68,16 @@ def make_frame(n_days: int, trend: float, tid: int, vol_seed: int = 0) -> Ticker
     prices = []
     for i in range(n_days):
         price *= 1.0 + trend + rng.normal(0, 0.01)  # geometric drift + daily noise
+        close = max(price, 1.0)
+        # high/low so the Parkinson range-vol builder has real bars to work on, and a
+        # dividend column so the payout builder is exercised (0.0 = a non-payer, which
+        # is an observation rather than a gap).
         prices.append({
             "trade_date": d0 + timedelta(days=i),
-            "adj_close": max(price, 1.0),
+            "adj_close": close,
+            "high": close * 1.005,
+            "low": close * 0.995,
+            "dividend": 0.0,
             "volume": 1_000_000 + 1000 * i,
         })
     return TickerFrame(tid, tid, f"T{tid}", prices, [], [])
@@ -162,10 +169,12 @@ def test_build_ticker_rows_computes_beta_and_earnings_yield():
             source_absent = (
                 (c in FUNDAMENTAL_SOURCED_FEATURES and not r["fund_available"])
                 or (c in ESTIMATE_SOURCED_FEATURES and not r["est_available"])
-                # Independently sourced: quarterly surprises, the FINRA feed, and
-                # the staleness clock are NaN when their own source is empty.
+                # Independently sourced: quarterly surprises, the FINRA feed, the
+                # staleness clock, and net issuance (which needs a share count on file
+                # a YEAR earlier, not merely any filing) are NaN when their own source
+                # is empty.
                 or c in ("revenue_surprise", "eps_surprise", "short_ratio",
-                         "est_staleness_days")
+                         "est_staleness_days", "net_issuance")
             )
             assert np.isfinite(r[c]) or source_absent, (
                 f"{c} is NaN but its source is present"
@@ -2756,3 +2765,101 @@ def test_production_specs_carry_the_promoted_capacity_settings():
     for h in ("6M", "1Y"):
         assert PRODUCTION_HORIZON_SPECS[h].lgb_cfg.objective == "lambdarank"
         assert PRODUCTION_HORIZON_SPECS[h].lgb_cfg.lambdarank_truncation_level == 100
+
+
+def test_net_issuance_reads_negative_for_a_buyback_and_positive_for_a_raise():
+    """shares_now / shares_1y_ago - 1, both point-in-time from the filing cover page.
+
+    Uses the as-of lookup at two dates rather than differencing consecutive filings,
+    so the comparison is "what was on file then" vs "what is on file now" — what an
+    investor could actually have observed.
+    """
+    prices = [{"trade_date": date(2018, 1, 2) + timedelta(days=i),
+               "adj_close": 100.0, "volume": 1_000_000} for i in range(1400)]
+    frame = TickerFrame(1, 1, "T1", prices, [], [])
+
+    def filing(filed, shares):
+        return {"filed_at": filed, "period_end": filed - timedelta(days=30),
+                "filing_type": "10-K", "revenue": 1e6, "net_income": 1e5,
+                "gross_margin": 0.4, "operating_margin": 0.1, "total_debt": 0,
+                "total_equity": 5e5, "fcf": 8e4, "shares_outstanding": shares}
+
+    # 10% buyback over the year, then a 20% raise the year after.
+    frame.fundamentals = [filing(date(2019, 3, 1), 1_000_000),
+                          filing(date(2020, 3, 1), 900_000),
+                          filing(date(2021, 3, 1), 1_080_000)]
+    rows = {r["date"]: r for r in build_ticker_rows(frame, build_calendar_grid([frame]))}
+
+    after_buyback = [r for d, r in rows.items() if date(2020, 4, 1) <= d <= date(2021, 1, 1)]
+    assert after_buyback and all(
+        r["net_issuance"] == pytest.approx(900_000 / 1_000_000 - 1) for r in after_buyback
+    )
+    after_raise = [r for d, r in rows.items() if d >= date(2021, 4, 1)]
+    assert after_raise and all(
+        r["net_issuance"] == pytest.approx(1_080_000 / 900_000 - 1) for r in after_raise
+    )
+    # Before a prior-year count exists the feature is undefined, not 0.0 — "no filing
+    # a year ago" is not "no issuance".
+    early = [r for d, r in rows.items() if d < date(2020, 3, 1)]
+    assert early and all(np.isnan(r["net_issuance"]) for r in early)
+
+
+def test_net_issuance_is_undefined_when_both_lookups_hit_the_same_filing():
+    """A sparse filer whose latest filing answers BOTH the now and the year-ago lookup
+    has reported no new share count — that is not an observation of zero issuance.
+    Returning 0.0 would drop a fabricated exact-zero cluster into the ranking."""
+    prices = [{"trade_date": date(2018, 1, 2) + timedelta(days=i),
+               "adj_close": 100.0, "volume": 1_000_000} for i in range(1000)]
+    frame = TickerFrame(1, 1, "T1", prices, [], [])
+    frame.fundamentals = [{
+        "filed_at": date(2019, 3, 1), "period_end": date(2019, 1, 31),
+        "filing_type": "10-K", "revenue": 1e6, "net_income": 1e5,
+        "gross_margin": 0.4, "operating_margin": 0.1, "total_debt": 0,
+        "total_equity": 5e5, "fcf": 8e4, "shares_outstanding": 1_000_000,
+    }]
+    rows = build_ticker_rows(frame, build_calendar_grid([frame]))
+    later = [r for r in rows if r["date"] >= date(2020, 3, 1)]
+    assert later, "expected rows more than a year after the only filing"
+    assert all(np.isnan(r["net_issuance"]) for r in later)
+
+
+def test_parkinson_range_vol_tracks_the_intra_bar_range_and_ignores_splits():
+    """Parkinson uses the high/low range, so it sees two more observations per day
+    than a close-to-close return. It is also split-safe: high and low are adjusted
+    together, so their RATIO — the only thing the estimator reads — is unchanged."""
+    from backend.ml.factors.price import _range_vol
+
+    n = 120
+    tight_h = [100.0 * 1.002] * n
+    tight_l = [100.0 * 0.998] * n
+    wide_h = [100.0 * 1.02] * n
+    wide_l = [100.0 * 0.98] * n
+    tight = _range_vol(tight_h, tight_l, n - 1, 60)
+    wide = _range_vol(wide_h, wide_l, n - 1, 60)
+    assert 0 < tight < wide
+
+    # A 10:1 split scales both bounds identically -> identical volatility.
+    split_h = [h / 10.0 for h in wide_h]
+    split_l = [lo / 10.0 for lo in wide_l]
+    assert _range_vol(split_h, split_l, n - 1, 60) == pytest.approx(wide)
+
+    # Not enough history, or too few usable bars, is undefined rather than 0.0.
+    assert np.isnan(_range_vol(wide_h, wide_l, 5, 60))
+    assert np.isnan(_range_vol([None] * n, [None] * n, n - 1, 60))
+
+
+def test_dividend_yield_is_trailing_twelve_months_over_price():
+    """A non-payer legitimately yields 0.0 — that is an observation, not a gap, so it
+    must not be NaN and must not be dropped from the ranking."""
+    from backend.ml.factors.price import _dividend_yield_ttm
+
+    n = 400
+    divs = [0.0] * n
+    for i in (n - 300, n - 200, n - 100, n - 10):   # four quarterly payments
+        divs[i] = 0.50
+    # Only the trailing 252 bars count, so the payment 300 bars back is excluded.
+    y = _dividend_yield_ttm(divs, 100.0, n - 1)
+    assert y == pytest.approx(1.50 / 100.0)
+    assert _dividend_yield_ttm([0.0] * n, 100.0, n - 1) == 0.0
+    assert np.isnan(_dividend_yield_ttm(divs, 100.0, 10))     # < 1y of history
+    assert np.isnan(_dividend_yield_ttm(divs, 0.0, n - 1))    # no usable price

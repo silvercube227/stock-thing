@@ -339,6 +339,52 @@ those statistics). This is a post-hoc observation from a run made for another pu
 so it is **not** grounds to demote anything — it earns its own criterion and its own
 run, alongside the Phase 2 ridge finding.
 
+### 2026-09-06 — Phase 3.1-3.3: six candidates, ALL REJECTED at the gate (no fits spent)
+
+**3.0 JKP by-size pre-validation: BLOCKED, not skipped.** jkpfactors.com serves factor
+returns only through an interactive selector or WRDS; the public S3 bucket denies
+listing and exposes only the cutoff files. Needs a manual download (jkpfactors.com/data
+→ US, mega+large, monthly factor returns). It orders 3.1-3.4 rather than gating them,
+so the rest proceeded.
+
+**Gate (pre-written):** |corr| < 0.5 vs the book AND standalone within-sector block-IC
+`sec_p` < 0.10 at ≥2 horizons AND not sideways-only.
+
+| Candidate | best sec_ic (p) | top book correlate | verdict |
+|---|---|---|---|
+| `net_issuance` | −0.0208 @1Y (0.16) | revenue_growth 0.20 | **REJECTED** — p fails at all three |
+| `revenue_est_rev_30d/90d` | +0.0073 @3M (0.55) | revenue_growth 0.32 | **REJECTED** |
+| `coverage_level` | −0.0252 @1Y (0.17) | **log_market_cap 0.45** | **REJECTED** — largely a size proxy |
+| `dividend_yield_ttm` | −0.0141 @1Y (0.59) | vol_120d 0.33 | **REJECTED** |
+| `range_vol_20d/60d` | +0.0018 @3M (0.93) | **vol_60d 0.91** | **REJECTED** — it IS the vol block |
+| `eps_num_est_chg_90d` | +0.0225 @3M (0.0035) | coverage_chg_90d 0.47 | **REJECTED** — p passes at 1 of 3 |
+| `coverage_drop_90d` | −0.0284 @3M (0.0005) | **coverage_chg_90d 0.83** | **REJECTED** — see below |
+
+**The gate itself had a hole, and finding it was the main result.** `run()` called
+`feature_diagnostics` without `existing_cols`, so the decorrelation book was bare
+`FEATURE_COLS` — the promoted per-horizon packs were **never** in it. Under that book
+`coverage_drop_90d` looked like the best candidate in months: |corr| 0.056, sec_ic
+−0.0284, sec_p 0.0005, consistently negative across all three efficiency-ratio
+tertiles. With the book corrected to the horizon's production feature list it is
+**0.83 correlated with `coverage_chg_90d`, which is already promoted at 3M** — the
+"new" signal was the existing feature's signal seen again. This is precisely the
+decorrelation illusion that killed E2 and E6 in 2026-07, except those were caught only
+*after* the ablation fits were spent. Fixed: the gate now uses
+`PRODUCTION_HORIZON_SPECS[h].feature_cols` minus the candidates, and prints the book size.
+
+**`coverage_drop_90d` is a genuine near-miss worth pre-registering later.** At 6M and
+1Y, where `coverage_chg_90d` is not in the book, it decorrelates cleanly (top correlate
+vol_60d 0.07). It clears p at 6M (−0.0221, p=0.0260, all three tertiles negative) and
+fails at 1Y (+0.0062, p=0.49, sign flips). So it passes the FULL gate at exactly one
+horizon and the pre-written bar is two. Not promoted, and the bar is deliberately not
+being relaxed to fit the result — that is the multiple-testing sin the protocol exists
+to prevent. A 6M-specific criterion, written before the run, would be the honest way to
+revisit it.
+
+Also settled: **Parkinson range volatility is not a replacement for the close-to-close
+vol block** — it correlates 0.87-0.91 with `vol_20d`/`vol_60d` and carries no
+independent within-sector signal. The lower-variance estimator measures the same thing.
+
 ## Outstanding
 
 - 8-seed confirmation of the rank-averaged ensemble at 6M/1Y (no criterion attached; it

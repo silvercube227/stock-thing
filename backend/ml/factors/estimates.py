@@ -37,12 +37,19 @@ def _estimates_context_asof(
             "revenue_surprise", "eps_surprise",
             "eps_est_rev_30d", "eps_est_rev_90d", "coverage_chg_90d", "pt_num_estimates",
             "eps_dispersion",
+            # Analyst-breadth pack: consensus REVENUE revisions (the exact analogue of
+            # the promoted eps_est_rev_*, from a column that was already ingested), and
+            # coverage as a level plus a one-sided drop rather than only a 90d delta.
+            "revenue_est_rev_30d", "revenue_est_rev_90d",
+            "eps_num_est_chg_90d", "coverage_level", "coverage_drop_90d",
             # Availability/staleness of the feed itself (see ESTIMATE_MISSING_FEATURES).
             "est_available", "est_staleness_days")
 
     snap_fields = ("rec_mean", "price_target_mean", "eps_mean",
                    "fwd_pe", "fwd_ev_ebitda", "num_analysts", "pt_num_estimates",
-                   "eps_std_dev")
+                   "eps_std_dev",
+                   # Ingested monthly since 2026-05 and read by nothing until now.
+                   "revenue_mean", "eps_num_inc_estimates")
     series: dict[str, tuple[list, list]] = {f: ([], []) for f in snap_fields}
     for r in sorted(est_rows or [], key=lambda r: _as_date(r["as_of_date"])):
         d = _as_date(r["as_of_date"])
@@ -125,6 +132,23 @@ def _estimates_context_asof(
             out["eps_dispersion"].append(float(eps_s) / abs(float(eps_m)))
         else:
             out["eps_dispersion"].append(0.0)
+
+        # Revenue-consensus revision momentum: same construction as the promoted
+        # eps_est_rev_*, on the revenue line. Analysts revise revenue and EPS on
+        # different information, so this is not a duplicate of the EPS pack.
+        out["revenue_est_rev_30d"].append(pct_rev("revenue_mean", d, 30))
+        out["revenue_est_rev_90d"].append(pct_rev("revenue_mean", d, 90))
+        ne, ne90 = (asof("eps_num_inc_estimates", d),
+                    asof("eps_num_inc_estimates", d - timedelta(days=90)))
+        out["eps_num_est_chg_90d"].append(
+            (ne - ne90) if ne is not None and ne90 is not None else 0.0)
+        out["coverage_level"].append(na if na is not None else 0.0)
+        # Coverage LOSS only. Li & You (JAE 2015) find initiations are largely an
+        # investor-recognition effect, which is mechanically weak in the S&P 500;
+        # terminations are the side with a plausible information story, so the
+        # one-sided version is the hypothesis rather than the symmetric delta.
+        out["coverage_drop_90d"].append(
+            float(max(0.0, na90 - na)) if na is not None and na90 is not None else 0.0)
 
         newest = newest_obs(d)
         out["est_available"].append(1.0 if newest is not None else 0.0)

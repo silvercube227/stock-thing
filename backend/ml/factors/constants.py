@@ -104,6 +104,34 @@ KNIFE_FEATURES = ["knife_score"]
 # analysts → NEGATIVE expected return (short-selling constraint prevents full
 # arbitrage of disagreed-on names). Opt-in via --with-eps-dispersion.
 EPS_DISPERSION_FEATURES = ["eps_dispersion"]
+# Net share issuance (Pontiff-Woodgate 2008; Fama-French 2008 find it pervasive ACROSS
+# size groups, which is rare for an anomaly and the reason it is worth testing here).
+# net_issuance = shares_now / shares_1y_ago - 1, both point-in-time from the filing
+# cover page, so a buyback reads NEGATIVE and a raise reads positive. Needs no new
+# ingestion: `fundamentals.shares_outstanding` has been PIT since migration 011, and
+# no post-2010 large-cap test of this signal was located in the literature review —
+# it is genuinely open rather than a known null.
+ISSUANCE_FEATURES = ["net_issuance"]
+# Payout: trailing 12-month cash dividends over price. `price_history.dividend` has
+# been stored since the first ingest and never selected. Boudoukh et al. net payout
+# yield; the buyback leg needs the EDGAR expansion, so this is the dividend half.
+PAYOUT_FEATURES = ["dividend_yield_ttm"]
+# Range-based realized volatility (Parkinson 1980) from the stored high/low, which
+# were likewise never selected. Uses the intra-bar range rather than close-to-close,
+# giving roughly 5x the efficiency per observation — a lower-variance estimate of the
+# SAME quantity vol_20d/vol_60d already proxy, so this is a REPLACEMENT candidate for
+# the collinear close-to-close vol block, not an addition to it.
+RANGE_VOL_FEATURES = ["range_vol_20d", "range_vol_60d"]
+# Analyst BREADTH, the thread the post-audit program flagged as most promising:
+# coverage_chg_90d was the cleanest feature in the Stage-3 diagnostics (sec_ic +0.024,
+# sec_p 0.009, only 0.057 correlated with the book). These extend that idea using LSEG
+# columns already ingested but read by nothing — consensus REVENUE revisions (the
+# analogue of the promoted eps_est_rev_*), the change in the number of included EPS
+# estimates, coverage as a level, and coverage LOSS specifically.
+ANALYST_BREADTH_FEATURES = [
+    "revenue_est_rev_30d", "revenue_est_rev_90d",
+    "eps_num_est_chg_90d", "coverage_level", "coverage_drop_90d",
+]
 # Short interest (FINRA Reg SHO): days-to-cover ratio (short_interest /
 # avg_daily_volume). High DTC = crowded short = contrarian long candidate OR
 # further squeeze risk. PIT-safe on publication_date (~14d after settlement).
@@ -149,7 +177,8 @@ EXPERIMENTAL_FEATURES = (
     + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES + LOTTERY_FEATURES
     + MICROSTRUCTURE_FEATURES + EPS_DISPERSION_FEATURES + SHORT_INTEREST_FEATURES
     + SEASONALITY_FEATURES + INSIDER_FEATURES + SENTIMENT_FEATURES
-    + ESTIMATE_MISSING_FEATURES
+    + ESTIMATE_MISSING_FEATURES + ISSUANCE_FEATURES + PAYOUT_FEATURES
+    + RANGE_VOL_FEATURES + ANALYST_BREADTH_FEATURES
     # KNIFE_FEATURES intentionally excluded — panel-level, not in build_ticker_rows
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /
@@ -184,4 +213,5 @@ FUNDAMENTAL_SOURCED_FEATURES = (
 ESTIMATE_SOURCED_FEATURES = (
     ANALYST_REVISION_FEATURES + FORWARD_VALUATION_FEATURES
     + REVISION_MOMENTUM_FEATURES + EPS_DISPERSION_FEATURES
+    + ANALYST_BREADTH_FEATURES
 )

@@ -432,7 +432,7 @@ def to_arrays(samples: list[Sample]) -> dict[str, np.ndarray]:
 # count is a market cap, and there the adjustment is future information. Both are
 # selected: adj_close for returns, close for market cap.
 _PRICE_SQL = """
-select ticker_id, trade_date, close, adj_close, volume
+select ticker_id, trade_date, close, adj_close, volume, high, low, dividend
   from price_history
  where ticker_id = any($1::bigint[])
  order by ticker_id, trade_date
