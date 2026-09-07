@@ -530,6 +530,16 @@ def apply_target_modes(
         sec_ret = pd.Series(out[f"y_{h}_sector_return"], index=out.index)
         sec_ret = sec_ret.where(out[m].astype(bool))  # NaN outside the horizon mask
 
+        # --- Sector-relative RANK target (Cakici-Zaremba 2025) ---
+        # Per-date percentile of the sector-relative return, in (0, 1]. Their finding
+        # is that TARGET preprocessing dominates feature preprocessing, that rank
+        # targets roughly triple predictive accuracy versus raw returns, and — the
+        # part that matters here — that the edge is specifically a LARGE-CAP
+        # phenomenon which reverses in micro caps. It is the continuous sibling of
+        # `sector_grade`: same ordering information, no qcut discretization, and it
+        # keeps an L2 fit (no ranker, so no 14x compute).
+        out[f"y_{h}_sector_rank"] = sec_ret.groupby(out["date"]).rank(pct=True)
+
         def _grade_bucket(s):
             if s.notna().sum() < n_grades:
                 return pd.Series(np.nan, index=s.index)
@@ -2764,7 +2774,7 @@ def main() -> None:
     p.add_argument("--target", default="return",
                    choices=["return", "rank", "quantile", "sector_return",
                             "sector_return_vol", "beta_resid", "beta_sector_resid",
-                            "sector_grade"],
+                            "sector_grade", "sector_rank"],
                    help="training target transform (scoring is always vs realized "
                         "universe-demeaned return; sector_return / beta_resid / "
                         "beta_sector_resid are alpha-residual modes; "
@@ -2772,7 +2782,9 @@ def main() -> None:
                         "floored at the per-date 20th pct — homoskedasticizes label "
                         "noise and shrinks high-vol labels, goal A + B lever; "
                         "sector_grade = per-date qcut of sector_return into ordinal "
-                        "grades for a --objective lambdarank fit)")
+                        "grades for a --objective lambdarank fit; sector_rank = the "
+                        "continuous per-date percentile of sector_return, the "
+                        "Cakici-Zaremba rank target, which keeps an L2 fit)")
     p.add_argument(
         "--n-buckets", type=int, default=5,
         help="equal-count buckets for --target quantile",

@@ -2689,3 +2689,40 @@ def test_tree_curve_reuses_one_fit_and_ends_at_the_headline_ic():
     # Gain importances are normalized per model, so they form a distribution.
     assert d["importance"] and abs(sum(d["importance"].values()) - 1.0) < 1e-6
     assert d["ic_train"] == d["ic_train"]     # not NaN
+
+
+def test_sector_rank_target_is_the_percentile_of_the_sector_relative_return():
+    """The Cakici-Zaremba rank target: same ordering as sector_return, mapped to a
+    per-date percentile. It keeps an L2 fit, unlike sector_grade which needs a ranker."""
+    d, d2 = date(2020, 1, 31), date(2020, 2, 29)
+    df = pd.DataFrame({
+        "date": [d] * 6 + [d2] * 6,
+        "sector": ["Tech"] * 6 + ["Tech"] * 6,
+        "r_1M": [0.10, 0.05, 0.00, -0.05, -0.10, 0.20] * 2,
+        "mask_1M": [True] * 12,
+    })
+    for h in HORIZONS:
+        if f"r_{h}" not in df:
+            df[f"r_{h}"] = 0.0
+        if f"mask_{h}" not in df:
+            df[f"mask_{h}"] = False
+    df["r_1M"] = [0.10, 0.05, 0.00, -0.05, -0.10, 0.20] * 2
+    df["mask_1M"] = [True] * 12
+
+    out = apply_target_modes(df, sector_min_group_size=5)
+    rank, sec = out["y_1M_sector_rank"], out["y_1M_sector_return"]
+    # Order-preserving within each date, and bounded in (0, 1].
+    for dd in (d, d2):
+        m = out["date"] == dd
+        assert rank[m].min() > 0 and rank[m].max() == pytest.approx(1.0)
+        assert (
+            pd.Series(sec[m]).corr(pd.Series(rank[m]), method="spearman")
+            == pytest.approx(1.0)
+        )
+    # Ranks are per-date, so the same raw return maps to the same percentile on both
+    # dates here — that is the point: the target is scale-free across cross-sections.
+    assert sorted(rank[out["date"] == d]) == pytest.approx(
+        sorted(rank[out["date"] == d2])
+    )
+    # A masked row has no sector return and therefore no rank.
+    assert out["y_1M_sector_rank"].notna().all()

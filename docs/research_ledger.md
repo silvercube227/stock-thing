@@ -225,6 +225,40 @@ not exist for the whole panel.
 indicator is the single most-used input in the book — and it is the same feature the
 2026-08 audit flagged as a survivorship-availability proxy. Worth its own ablation.
 
+### 2026-09-06 — Phase 2.4: 3M rank target — REJECTED at its pre-written criterion
+
+**Hypothesis.** Cakici & Zaremba (SSRN 6615698, 2025): target preprocessing dominates
+feature preprocessing; rank targets roughly triple predictive accuracy versus raw
+returns, **and the edge is specifically a large-cap phenomenon** that reverses in
+micro caps. 3M is the one horizon still fitting L2 on a raw relative return, so it is
+where the prior should bite. New `sector_rank` target = per-date percentile of
+`sector_return` (the continuous sibling of `sector_grade`, keeps an L2 fit and avoids
+the ranker's 14x compute).
+
+**Criterion (pre-written).** Promote if SECB ICIR improves ≥10% AND mean SECB IC is
+not lower by more than 0.003.
+
+**Result.** Matched folds and seeds, production 3M pack, expanding window, no overlays:
+
+| 3M target | folds | SECB IC | ICIR | t_block | verdict |
+|-----------|-------|---------|------|---------|---------|
+| `sector_return` / L2 (production) | 114 | +0.0037 | +0.038 | +0.23 | — |
+| `sector_rank` / L2 | 114 | −0.0008 | −0.008 | −0.05 | **FAIL** (ΔIC −0.0045) |
+| `sector_grade` / LambdaRank | 114 | +0.0008 | +0.009 | +0.06 | **FAIL** (ΔIC −0.0029) |
+
+**Verdict: REJECTED.** Production 3M keeps `sector_return`/L2. Both alternatives are
+worse on both halves of the criterion. All three sit far below the 0.0231 floor, so
+the honest reading is "no difference is detectable here and neither alternative earns
+the change" rather than "ranking is proven harmful".
+
+Why the prior may not transfer: the Cakici-Zaremba result is a broad multi-market
+panel against a RAW return target, whereas `sector_return` is already a
+within-(date, sector) demean — a normalization of its own. Ranking on top of that
+discards the magnitude information that survives it, and the 2026-07 E3 result on
+this panel (winsorizing the 3M label degraded it monotonically) already said 3M's
+fat-tailed labels carry signal rather than noise. This is the third transform of the
+3M label to be rejected, which is itself evidence about the horizon.
+
 ## Outstanding
 
 - 8-seed confirmation of the rank-averaged ensemble at 6M/1Y (no criterion attached; it
