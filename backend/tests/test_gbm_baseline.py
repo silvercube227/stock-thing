@@ -2726,3 +2726,33 @@ def test_sector_rank_target_is_the_percentile_of_the_sector_relative_return():
     )
     # A masked row has no sector return and therefore no rank.
     assert out["y_1M_sector_rank"].notna().all()
+
+
+def test_overlap_aware_cfg_scales_the_leaf_minimum_with_the_horizon():
+    """A 6M label spans six months, so consecutive monthly rows share five-sixths of
+    their outcome window: the effective sample is ~rows/H. `min_child_samples = 50`
+    counted RAW rows, so the fit was regularized against a sample it does not have."""
+    from backend.ml.gbm_baseline import overlap_aware_cfg
+
+    assert overlap_aware_cfg("1M").min_child_samples == 50
+    assert overlap_aware_cfg("3M").min_child_samples == 150
+    assert overlap_aware_cfg("6M").min_child_samples == 300
+    assert overlap_aware_cfg("1Y").min_child_samples == 600
+    # Other knobs pass through untouched, so the ranker horizons keep their objective.
+    cfg = overlap_aware_cfg("6M", objective="lambdarank", lambdarank_truncation_level=100)
+    assert cfg.objective == "lambdarank" and cfg.lambdarank_truncation_level == 100
+    assert cfg.min_child_samples == 300
+
+
+def test_production_specs_carry_the_promoted_capacity_settings():
+    """Phase 4.1/4.3 promotions, pinned so a future edit cannot quietly undo them."""
+    from backend.ml.gbm_baseline import PRODUCTION_HORIZON_SPECS
+
+    expected_min_child = {"1M": 50, "3M": 150, "6M": 300, "1Y": 600}
+    for h, spec in PRODUCTION_HORIZON_SPECS.items():
+        assert spec.lgb_cfg.n_estimators == 150, f"{h} tree count"
+        assert spec.lgb_cfg.min_child_samples == expected_min_child[h], h
+    # The ranker horizons keep LambdaRank at the top-100 truncation.
+    for h in ("6M", "1Y"):
+        assert PRODUCTION_HORIZON_SPECS[h].lgb_cfg.objective == "lambdarank"
+        assert PRODUCTION_HORIZON_SPECS[h].lgb_cfg.lambdarank_truncation_level == 100

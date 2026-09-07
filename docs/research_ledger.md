@@ -259,6 +259,86 @@ this panel (winsorizing the 3M label degraded it monotonically) already said 3M'
 fat-tailed labels carry signal rather than noise. This is the third transform of the
 3M label to be rejected, which is itself evidence about the horizon.
 
+### 2026-09-06 — Phase 4.1 + 4.3: capacity and overlap-aware regularization — BOTH PROMOTED
+
+Run after Phase 2 measured an in-sample/out-of-sample SECB gap of +0.25 to +0.30 — the
+first direct evidence that the model was memorizing its training cross-sections.
+
+**4.1 Tree count.** The IC-vs-trees curve peaked at **200 / 50 / 100** by horizon
+against a configured 300. Pooled by mean Δ versus 300 across horizons, **150** is the
+peak — and the only candidate whose *worst* horizon is non-negative, which is exactly
+the criterion. (A fixed learning rate and no early stopping mean the first N trees of a
+300-tree fit ARE the N-tree fit, so the curve and a refit agree; the A/B confirms it.)
+
+*Criterion (pre-written): mean SECB IC ≥ baseline at EVERY horizon.*
+
+| Horizon | folds | SECB @300 | SECB @150 | Δ |
+|---------|-------|-----------|-----------|-----|
+| 3M | 114 | +0.0037 | +0.0037 | +0.0000 |
+| 6M | 108 | −0.0034 | +0.0034 | +0.0068 |
+| 1Y |  96 | −0.0111 | −0.0089 | +0.0022 |
+
+**PASS.**
+
+**4.3 Overlap-aware leaf minimum.** A 6M label spans six months, so consecutive
+monthly rows share five-sixths of their outcome window: the effective sample is
+≈ rows/H. `min_child_samples = 50` counted RAW rows, so the fit was regularized against
+a sample it does not have — the overlap was corrected in the metric (block bootstrap)
+but never in the fit. Scaled to 50 × horizon-months = **150 / 300 / 600**
+(`overlap_aware_cfg`), on top of 150 trees.
+
+| Horizon | folds | SECB @mcs 50 | SECB @mcs eff | Δ | ICIR |
+|---------|-------|--------------|---------------|-----|------|
+| 3M | 114 | +0.0037 | +0.0069 | +0.0032 | +0.037 → +0.069 |
+| 6M | 108 | +0.0034 | +0.0037 | +0.0003 | +0.026 → +0.027 |
+| 1Y |  96 | −0.0089 | −0.0047 | +0.0042 | −0.080 → −0.046 |
+
+**PASS.**
+
+**Mechanism confirmed, not just the outcome.** At 3M the in-sample/out-of-sample gap
+fell from **+0.2948 to +0.2183** — in-sample IC dropped 0.299 → 0.225 while
+out-of-sample rose 0.0037 → 0.0069. Less memorization, slightly better generalization,
+which is the stated reason for the change.
+
+**Combined, versus the Phase 1 reference:** 3M +0.0037 → **+0.0069**, 6M −0.0034 →
+**+0.0037**, 1Y −0.0111 → **−0.0047**. Two of three horizons now positive. On the
+production LambdaRank config 6M also improves (−0.0086 → −0.0075), so the change is
+not an artifact of the L2 reference configuration. **Everything is still far below the
+detection floors (0.023 / 0.046 / 0.059) — this bought a better-specified model, not
+edge.**
+
+**Parity bug found and fixed while promoting this.** The research CLI built `lgb_cfg`
+from scratch instead of the horizon's production spec, so the promoted per-horizon
+`min_child_samples` would have been invisible to every future sweep — the identical
+failure to the 6M rolling-60 window in Phase 0.2. `run()` now starts from
+`PRODUCTION_HORIZON_SPECS[h].lgb_cfg`, explicit flags override, and the resolved config
+is printed. `--objective` / `--lambdarank-truncation` default to the spec; a
+return-like `--target` with a spec-supplied ranking objective falls back to L2 with a
+printed note rather than erroring.
+
+### 2026-09-06 — POST-PHASE-4 REFERENCE (supersedes the Phase 1 row)
+
+Each horizon on **its own production config** (3M `sector_return`/L2 + revision
+momentum; 6M `sector_grade`/LambdaRank + rolling-60; 1Y `sector_grade`/LambdaRank +
+smooth 4), selection folds, single seed, refreshed cache:
+
+| Horizon | folds | SECB IC | t_block | min_detect | vs pre-Phase-4 |
+|---------|-------|---------|---------|------------|----------------|
+| 3M | 114 | **+0.0069** | +0.74 | 0.0231 | +0.0037 → +0.0069 |
+| 6M | 108 | −0.0075 | −0.70 | 0.0461 | −0.0086 → −0.0075 |
+| 1Y |  96 | **+0.0024** | +0.14 | 0.0585 | −0.0088 → +0.0024 |
+
+Nothing is significant; everything sits below its own floor.
+
+**Flagged for a future pre-registered test — the 6M LambdaRank promotion may not
+survive the fixed panel.** At 6M on the same folds and capacity settings, plain
+L2 on `sector_return` now scores **+0.0037** while the promoted LambdaRank on
+`sector_grade` scores **−0.0075**. LambdaRank was promoted in 2026-07 on the
+pre-2026-08-21 contaminated panel (CLAUDE.md already carries a provenance warning on
+those statistics). This is a post-hoc observation from a run made for another purpose,
+so it is **not** grounds to demote anything — it earns its own criterion and its own
+run, alongside the Phase 2 ridge finding.
+
 ## Outstanding
 
 - 8-seed confirmation of the rank-averaged ensemble at 6M/1Y (no criterion attached; it

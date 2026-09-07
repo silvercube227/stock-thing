@@ -100,10 +100,27 @@ from backend.ml.model import HORIZONS
 
 @dataclass
 class LGBMConfig:
-    """Deliberately shallow + regularized: cross-sectional return signal is weak,
-    so the baseline should resist memorizing the train cross-sections."""
+    """Shallow + heavily regularized: cross-sectional return signal is weak, so the
+    model has to be stopped from memorizing the training cross-sections.
 
-    n_estimators: int = 300
+    That was always the intent, but it was never checked. `--fit-diagnostics`
+    (2026-09-06) measured in-sample SECB of +0.30/+0.24/+0.24 against out-of-sample
+    +0.004/-0.009/-0.009 — the model WAS memorizing, comprehensively. Two changes
+    followed, each passing its own pre-written criterion:
+
+      n_estimators 300 -> 150     the IC-vs-trees curve peaked at 200/50/100 by
+                                  horizon; 150 is the pooled peak and the only
+                                  candidate weakly better at EVERY horizon.
+      min_child_samples per H     see `overlap_aware_cfg` — 50 was calibrated against
+                                  the raw row count, which overlapping labels inflate.
+
+    Together they lifted SECB at all three horizons (3M +0.0037 -> +0.0069, 6M
+    -0.0034 -> +0.0037, 1Y -0.0111 -> -0.0047) and cut the 3M in-sample/out-of-sample
+    gap from +0.295 to +0.218. All still far below the detection floors — this bought
+    a better-specified model, not edge.
+    """
+
+    n_estimators: int = 150
     learning_rate: float = 0.03
     num_leaves: int = 15
     max_depth: int = 4
@@ -183,6 +200,24 @@ class HorizonSpec:
     vol_gate: bool = False
 
 
+# Overlapping labels: a 6M row's label spans six months, so consecutive monthly rows
+# share five-sixths of their outcome window. The effective sample size is roughly
+# rows / H_months, meaning a leaf holding 50 raw rows holds only ~50/H INDEPENDENT
+# observations. `min_child_samples = 50` was calibrated against the raw count, so the
+# model was regularized against a sample it does not have — the overlap was corrected
+# in the metric (block bootstrap) but never in the fit. Scaling the leaf minimum by the
+# horizon restores the intended ~50 effective observations per leaf.
+_MIN_CHILD_SAMPLES_PER_EFFECTIVE_OBS = 50
+
+
+def overlap_aware_cfg(horizon: str, **kwargs) -> LGBMConfig:
+    """LGBMConfig whose leaf minimum counts EFFECTIVE, not raw, observations."""
+    months = max(1, round(HORIZON_TRADING_DAYS[horizon] / 21))
+    return LGBMConfig(
+        min_child_samples=_MIN_CHILD_SAMPLES_PER_EFFECTIVE_OBS * months, **kwargs
+    )
+
+
 # Per-horizon production training defaults. Update this dict — and only this dict
 # — when a sweep promotes a new target / hyperparameter / feature pack. The
 # inference path reads it as its starting config; the walk-forward sweep tool
@@ -260,14 +295,17 @@ _BASELINE_PLUS_REVMOM = FEATURE_COLS + REVISION_MOMENTUM_FEATURES
 #     (6M rolling-60, 1Y smooth_span=4) compose unchanged — they act on the ranker's
 #     percentile ranks (monotone-invariant). Inference needs ZERO changes: fit_lgbm_model
 #     branches on lgb_cfg.objective, LGBMRanker.predict has the same signature.
-_LAMBDARANK_CFG = LGBMConfig(objective="lambdarank", lambdarank_truncation_level=100)
+_RANKER_KW = {"objective": "lambdarank", "lambdarank_truncation_level": 100}
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
-    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM,
+    "3M": HorizonSpec(target_mode="sector_return", lgb_cfg=overlap_aware_cfg("3M"),
+                      feature_cols=_BASELINE_PLUS_REVMOM,
                       smooth_span=3, knife_lambda=0.20),
-    "6M": HorizonSpec(target_mode="sector_grade", lgb_cfg=_LAMBDARANK_CFG,
+    "6M": HorizonSpec(target_mode="sector_grade",
+                      lgb_cfg=overlap_aware_cfg("6M", **_RANKER_KW),
                       feature_cols=_BASELINE_PLUS_SURPRISE, max_train_months=60),
-    "1Y": HorizonSpec(target_mode="sector_grade", lgb_cfg=_LAMBDARANK_CFG,
+    "1Y": HorizonSpec(target_mode="sector_grade",
+                      lgb_cfg=overlap_aware_cfg("1Y", **_RANKER_KW),
                       feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
 }
 
@@ -2311,16 +2349,43 @@ def _compose_feature_cols(args) -> list[str]:
 
 
 async def run(args) -> None:
-    lgb_cfg = LGBMConfig(
-        objective=args.objective,
-        lambdarank_truncation_level=args.lambdarank_truncation,
+    # Start from the horizon's PRODUCTION hyperparameters, exactly as the training
+    # window does, so a re-validation measures the model that actually ships. Building
+    # a fresh LGBMConfig here instead was the same eval/prod split that hid the 6M
+    # rolling-60 window: the promoted per-horizon min_child_samples (150/300/600) would
+    # have been invisible to every sweep. Explicit flags still win.
+    spec_cfg = getattr(
+        PRODUCTION_HORIZON_SPECS.get(args.horizon, HorizonSpec()), "lgb_cfg", LGBMConfig()
     )
-    if args.subsample is not None:
-        lgb_cfg = replace(lgb_cfg, subsample=args.subsample)
-    if args.objective in _RANKING_OBJECTIVES:
+    overrides = {
+        k: v for k, v in (
+            ("objective", args.objective),
+            ("lambdarank_truncation_level", args.lambdarank_truncation),
+            ("subsample", args.subsample),
+            ("n_estimators", args.n_estimators),
+            ("min_child_samples", args.min_child_samples),
+        ) if v is not None
+    }
+    lgb_cfg = replace(spec_cfg, **overrides)
+    if overrides:
+        print("lgb_cfg overrides: " + ", ".join(f"{k}={v}" for k, v in overrides.items()))
+    # A ranking objective needs ordinal grades. If the objective came from the
+    # horizon's spec (6M/1Y ship lambdarank) but the caller deliberately chose a
+    # return-like target for an ablation, fall back to L2 rather than refusing —
+    # the target is the thing they asked for. An EXPLICIT --objective still errors.
+    if (lgb_cfg.objective in _RANKING_OBJECTIVES and args.target != "sector_grade"
+            and args.objective is None):
+        print(f"note: {args.horizon} ships objective={lgb_cfg.objective}, but "
+              f"--target {args.target} is not an ordinal grade — using regression. "
+              f"Pass --target sector_grade to measure the production objective.")
+        lgb_cfg = replace(lgb_cfg, objective="regression")
+    print(f"lgb_cfg: objective={lgb_cfg.objective} n_estimators={lgb_cfg.n_estimators} "
+          f"min_child_samples={lgb_cfg.min_child_samples} "
+          f"(base: production spec for {args.horizon})")
+    if lgb_cfg.objective in _RANKING_OBJECTIVES:
         if args.target != "sector_grade":
             raise SystemExit(
-                f"--objective {args.objective} requires --target sector_grade "
+                f"objective {lgb_cfg.objective} requires --target sector_grade "
                 f"(ordinal grade labels), got --target {args.target}"
             )
         if args.with_linear_blend > 0:
@@ -2474,7 +2539,8 @@ async def run(args) -> None:
         smooth_tag = f", smooth_span={args.smooth_span}" if args.smooth_span > 0 else ""
         knife_tag = f", knife_lambda={args.knife_lambda}" if args.knife_lambda > 0 else ""
         wins_tag = f", winsorize={args.winsorize_target}" if args.winsorize_target > 0 else ""
-        obj_tag = f", objective={args.objective}" if args.objective != "regression" else ""
+        obj_tag = (f", objective={lgb_cfg.objective}"
+                   if lgb_cfg.objective != "regression" else "")
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
               f"(expanding walk-forward, target={args.target}{obj_tag}{smooth_tag}{knife_tag}{wins_tag}) ---")
         if knife_grid is not None and real.get("records"):
@@ -2819,19 +2885,21 @@ def main() -> None:
                         "cross-section toward names that are NOT both high-vol and "
                         "downtrending; composes ahead of --smooth-span. Suppresses "
                         "'falling knife' picks at the top and lowers turnover.")
-    p.add_argument("--objective", default="regression",
+    p.add_argument("--objective", default=None,
                    choices=["regression", "lambdarank", "rank_xendcg"],
-                   help="LightGBM training objective. 'regression' = pointwise L2 "
-                        "(default). 'lambdarank'/'rank_xendcg' switch to LGBMRanker "
-                        "(learning-to-rank, aligned with rank-IC scoring); require "
+                   help="LightGBM training objective. Default: the horizon's "
+                        "production objective (6M/1Y ship lambdarank). 'regression' = "
+                        "pointwise L2; 'lambdarank'/'rank_xendcg' switch to LGBMRanker "
+                        "(learning-to-rank, aligned with rank-IC scoring) and require "
                         "--target sector_grade (ordinal grades + per-date query group)")
     p.add_argument("--rank-grades", type=int, default=5, metavar="K",
                    help="number of ordinal grades for --target sector_grade (per-date "
                         "qcut buckets); default 5 matches the quantile-bucket convention")
-    p.add_argument("--lambdarank-truncation", type=int, default=500, metavar="N",
+    p.add_argument("--lambdarank-truncation", type=int, default=None, metavar="N",
                    help="LambdaRank list-truncation level (pairs beyond rank N are "
-                        "ignored in the gradient); default 500 >= cross-section size "
-                        "for full-list ranking. Lower focuses the loss on the top.")
+                        "ignored in the gradient). Default: the horizon's production "
+                        "value (100, the top of the list the product ships). Pass "
+                        ">= the cross-section size for full-list ranking.")
     p.add_argument("--subsample", type=float, default=None, metavar="F",
                    help="row-bagging fraction override (default: LGBMConfig 0.8). "
                         "Used to smoke the bagging x pairwise-gradient interaction "
@@ -2962,6 +3030,17 @@ def main() -> None:
                         "of headlines, so the columns are ~98%% zero across the panel "
                         "and cannot be validated. Turn on once a headline archive is "
                         "backfilled.")
+    p.add_argument("--n-estimators", type=int, default=None, metavar="N",
+                   help="boosting rounds (default: LGBMConfig's 300). Use with "
+                        "--fit-diagnostics to read the IC-vs-trees curve first; a "
+                        "fixed learning rate and no early stopping mean the first N "
+                        "trees of a 300-tree fit ARE the N-tree fit, so the curve and "
+                        "a refit agree.")
+    p.add_argument("--min-child-samples", type=int, default=None, metavar="N",
+                   help="minimum rows per leaf (default 50). The default is calibrated "
+                        "against the RAW row count, but overlapping labels mean the "
+                        "effective sample size is roughly rows/H — so the model is "
+                        "regularized against a sample it does not have.")
     p.add_argument("--baselines", action="store_true",
                    help="score a ridge and an equal-weight forecast combination on the "
                         "SAME folds as the GBDT. Han-He-Rapach-Zhou (RoF 2024) find "
