@@ -263,22 +263,20 @@ def test_reuse_guard_ignores_a_short_trading_halt():
 # =============================================================
 
 
-def test_terminal_series_gets_a_label_from_its_last_trade():
-    """A name that stops trading inside the horizon used to be MASKED, which drops it
-    from both training and the scored cross-section — residual survivorship in the
-    label. With `terminal` the exit falls back to the last available close."""
+def test_terminal_flag_cannot_invent_last_trade_proceeds():
+    """Only documented_targets can establish an explicit terminal outcome."""
     from backend.ml.dataset import compute_targets
 
     # 30 bars: entry at index 1, but 1M (21 bars) would need index 22 — present;
     # 3M (63 bars) is past the end.
     prices = [100.0 + i for i in range(30)]
     _lab, ret, mask = compute_targets(prices, end_idx=0, terminal=True)
-    assert mask["3M"] is True
-    assert ret["3M"] == pytest.approx(math.log(prices[-1] / prices[1]))
-    # A real loss survives too — the negative tail is the half that matters most.
+    assert mask["3M"] is False
+    assert ret["3M"] == 0.0
+    # A price collapse alone does not establish the subsequent recovery value.
     crash = [100.0] * 25 + [20.0]
     _l2, ret2, mask2 = compute_targets(crash, end_idx=0, terminal=True)
-    assert mask2["1Y"] is True and ret2["1Y"] < 0
+    assert mask2["1Y"] is False and ret2["1Y"] == 0.0
 
 
 def test_right_censored_series_is_still_masked():
@@ -325,18 +323,18 @@ def test_sector_on_returns_the_label_as_of_the_row_date():
     assert _sector_on(history, date(2025, 1, 1), fallback)[0] == "Communication Services"
 
 
-def test_sector_on_falls_back_when_history_is_absent_or_uncovered():
+def test_sector_on_falls_back_only_when_history_was_not_loaded():
     from backend.ml.factors.assembly import _sector_on
 
     fallback = ("Health Care", "Biotech")
     # Table not loaded (pre-migration cache) -> static tickers label, i.e. the old
     # behaviour exactly.
     assert _sector_on(None, date(2015, 1, 1), fallback) == fallback
-    assert _sector_on([], date(2015, 1, 1), fallback) == fallback
-    # A date before the first interval also falls back rather than guessing.
+    assert _sector_on([], date(2015, 1, 1), fallback) == (None, None)
+    # A known coverage gap must not borrow the present-day classification.
     history = [{"valid_from": date(2020, 1, 1), "valid_to": None,
                 "sector": "Financials", "industry": None}]
-    assert _sector_on(history, date(2015, 1, 1), fallback) == fallback
+    assert _sector_on(history, date(2015, 1, 1), fallback) == (None, None)
     assert _sector_on(history, date(2021, 1, 1), fallback)[0] == "Financials"
 
 
@@ -362,3 +360,51 @@ def test_ticker_frame_accepts_every_kwarg_load_frames_passes():
     )
     assert frame.membership and frame.sector_history
     assert frame.removed_at is None
+
+
+def test_retirement_truncates_contiguous_reused_bars():
+    """Starwood, Rockwell Collins and Harman keep trading under a new owner.
+
+    The gap rule cannot see these: the next company's bars are contiguous with
+    the original's, so only the vendor retirement date separates them.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    start = _date(2016, 1, 4)
+    rows = [{"trade_date": start + _td(days=i)} for i in range(0, 500, 7)]
+    kept = _drop_reused_symbol_bars(rows, None, _date(2016, 9, 23))
+    assert kept, "the security's own bars must survive"
+    assert max(r["trade_date"] for r in kept) <= _date(2016, 9, 23)
+    assert len(kept) < len(rows)
+
+
+def test_index_removal_alone_never_truncates_a_live_listing():
+    """TechnipFMC left the index in 2021 and still trades; its bars are real."""
+    from datetime import date as _date, timedelta as _td
+
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    rows = [{"trade_date": _date(2021, 1, 4) + _td(days=i)} for i in range(0, 900, 7)]
+    assert _drop_reused_symbol_bars(rows, _date(2021, 2, 12), None) == rows
+
+
+def test_retirement_and_gap_rules_compose():
+    from datetime import date as _date, timedelta as _td
+
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    rows = [{"trade_date": _date(2018, 1, 3) + _td(days=i)} for i in range(0, 200, 7)]
+    rows += [{"trade_date": _date(2020, 6, 1) + _td(days=i)} for i in range(0, 100, 7)]
+    kept = _drop_reused_symbol_bars(rows, _date(2018, 12, 3), _date(2018, 11, 27))
+    assert all(r["trade_date"] <= _date(2018, 11, 27) for r in kept)
+
+
+def test_no_retirement_date_leaves_the_series_untouched():
+    from datetime import date as _date, timedelta as _td
+
+    from backend.ml.dataset import _drop_reused_symbol_bars
+
+    rows = [{"trade_date": _date(2020, 1, 2) + _td(days=i)} for i in range(0, 300, 7)]
+    assert _drop_reused_symbol_bars(rows, None, None) == rows

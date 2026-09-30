@@ -38,6 +38,7 @@ import numpy as np
 from backend.config import get_settings
 from backend.ingestion.db import pool_context
 from backend.ml.dataset import (
+    IncompatibleFrameCache,
     build_calendar_grid,
     load_frames,
     load_frames_cached,
@@ -135,6 +136,8 @@ def fit_horizon_models(
             & panel[m_col].astype(bool)
             & panel[t_col].notna()
         ]
+        if f"label_end_{h}" in train:
+            train = train[train[f"label_end_{h}"].notna() & (train[f"label_end_{h}"] < as_of)]
         if exclude_ids:
             train = train[~train["ticker_id"].isin(exclude_ids)]
         if spec.max_train_months is not None:
@@ -783,6 +786,15 @@ async def _resolve_production_model(pool) -> tuple[str, str]:
     return str(row["model_version_id"]), str(row["weights_path"])
 
 
+async def _load_scoring_universe(pool):
+    try:
+        return await load_frames_cached(pool)
+    except IncompatibleFrameCache:
+        # User-facing add-ticker jobs have no --refresh-cache control. Reload
+        # the schema-compatible inputs; never fabricate missing metadata.
+        return await load_frames_cached(pool, refresh=True)
+
+
 async def score_single_ticker(pool, symbol: str) -> dict:
     """Score ONE already-ingested ticker against the current S&P cross-section.
 
@@ -825,7 +837,7 @@ async def score_single_ticker(pool, symbol: str) -> dict:
     # DB-efficient load: reuse the cached universe (no full-universe re-pull) and
     # fetch only the new ticker fresh, then splice it in (dropping any stale copy
     # already in the cache).
-    universe = await load_frames_cached(pool)
+    universe = await _load_scoring_universe(pool)
     new_frames = await load_frames(pool, symbols=[symbol])
     if not new_frames:
         raise SystemExit(f"no frame data for {symbol} — ingestion incomplete")

@@ -58,3 +58,6 @@ stockproject/
 
 # local frame cache (load_frames_cached) — never commit
 .frame_cache/
+.frame_cache_research/
+.news_cache/
+.research/

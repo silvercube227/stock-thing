@@ -1,0 +1,10 @@
+{
+  "scope": "Recover native original-security evidence before terminal valuation; existing stored histories require parity review, including dates before retirement.",
+  "identity_evidence": ".research/verification/identity-lifecycle-archive.json",
+  "securities": [
+    {"symbol": "CA", "ticker_id": 712, "ric": "CA.OQ^K18", "isin": "US12673P1057", "cik": "356028", "status": "unverified_existing_history_requires_backfill"},
+    {"symbol": "COL", "ticker_id": 709, "ric": "COL.N^K18", "isin": "US7743411016", "cik": "1137411", "status": "unverified_existing_history_requires_backfill"},
+    {"symbol": "HAR", "ticker_id": 749, "ric": "HAR.N^C17", "isin": "US4130861093", "cik": "800459", "status": "unverified_existing_history_requires_backfill"},
+    {"symbol": "HOT", "ticker_id": 759, "ric": "HOT.N^I16", "isin": "US85590A4013", "cik": "316206", "status": "unverified_existing_history_requires_backfill"}
+  ]
+}

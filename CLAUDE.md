@@ -2,6 +2,99 @@
 
 Personal long-only stock and ETF trend prediction app. Not for active trading — for directional awareness over 3M, 6M, and 1Y horizons.
 
+### Current research priority — user correction, 2026-09-19
+
+Run exploratory experiments with the available data. The user explicitly rejected
+further open-ended correctness work as a prerequisite. Read the exploratory
+standard at the **top** of `docs/experiment_gate_status.md`; older certification
+checklists below do not override it. Target 95% coverage, regard 90% as acceptable,
+and report any shortfall without silently claiming adequate coverage or postponing
+the first usable exploratory fit indefinitely. Preserve chronology, paired
+samples, frozen inputs/exclusions and missing-value masks. Do not relabel sources
+verified or claim production readiness.
+
+The runner supports `--exploratory`. The current reference is
+`.research/exploratory-reference-2026-09-19-v2`; stress, macro, accounting and
+preselected stress + macro screens COMPLETED under
+`.research/experiments-2026-09-19-v2/exploratory`. None earns confirmation:
+paired sector-IC deltas are -0.00555, +0.00167, -0.01634 and +0.00019 respectively.
+Analyst/3M screening subsequently completed: paired ΔIC +0.00717, earning
+eight-seed confirmation. Confirmation is complete and inconclusive: paired ΔIC
++0.00460, Holm-adjusted p=0.22748, top-decile change -0.00041. No experiment
+process remains running, and no configuration is promoted. Snapshot:
+`.research/exploratory-analyst-2026-09-19-v1`, with 204,062 provisional monthly
+observations across 796 securities; paired usable coverage is 87.03%.
+The exploratory flag admits these rows without setting `verified=True` or changing
+default production feature assembly. News and universe remain unexecuted.
+Inspect actual results
+before restarting anything. V1 attempts stopped before fits;
+v2 uses the reconstructed SPX cohort instead of overcounted legacy DB membership.
+The combined exploratory pack was preselected as stress + macro. Continue usable
+family experiments and results analysis before additional source archaeology.
+See `docs/exploratory_results_2026_09_19.md`. The analyst changes passed 32 focused
+feature, runner and preparation tests; both real-data prediction pairs passed
+controls and chronology checks.
+
+### Long-horizon research update (2026-09-07)
+
+2026-09-18 gate work: 143 exact-RIC membership intervals are now applied to
+registered research-only securities after rollback and post-commit verification;
+CVH/DTV/GR/MRP remain blocked by lifecycle-session discrepancies. All 729 existing
+intervals were preserved. The fresh 878-frame audit snapshot has 872 intervals,
+but the 147 registered histories still have no applied prices. The identity
+auditor now rejects issuer-only mappings and blank-RIC context as securities.
+Accounting masks unknown sectors. Shared source gates remain incomplete; no
+registered experiment ran. Current evidence and remaining work are recorded in
+`docs/experiment_gate_status.md` and `docs/reference_gate_progress.md`.
+
+2026-09-08 correctness follow-up: migration 021 adds documented per-ticker
+`price_source_exclusions`. COL/HAR Yahoo histories disagree with native prices
+even before retirement and are now excluded from model frames; all raw database
+rows are retained. Frame cache version **7** rejects pre-exclusion caches. Native
+CA/COL/HAR/HOT recovery candidates remain uncertified. Reviewed embedded special
+cash is counted once, increasing historical normalization to 140/147 securities;
+this is transformation evidence, not full source certification. See
+`docs/experiment_gate_status.md` for current dependencies and receipts.
+
+Storage preference: gzip-compress research snapshots and frame caches by default.
+Their existing `.pkl` paths may hold gzip transport; use `open_artifact` or the
+snapshot/cache loaders, which also support legacy plain pickles. Snapshot hashes
+refer to decompressed bytes. Avoid redundant full-size copies; never remove raw
+evidence or manifests to save space. Historical code replay can decompress transport
+first without changing the recorded content hash. The verified one-time conversion
+freed 3.58 GB; see `.research/verification/storage-compression.json`.
+
+The current research protocol is `docs/long_horizon_signal_program.md`; source
+readiness is `docs/signal_source_readiness.json`. These supersede the historical
+standalone two-horizon gate, the absolute-IC floor applied to A/B deltas, and the
+description of 2024+ as untouched. The seven registered comparisons use immutable
+snapshots, paired calendar-block inference, and fixed primary horizons. Production
+feature specifications remain frozen; no real-data feature trial or promotion has
+occurred in this implementation.
+
+New correctness rules: reconstruct as-traded prices from explicit action metadata,
+use dated split-aligned shares (no current-share fallback), and require documented
+terminal proceeds. Missing/unverified bases yield NaN; unknown exits remain masked.
+Historical price targets need a verified adjustment basis. Frame cache version 3
+rejects legacy pickles; add-ticker scoring automatically reloads them from the DB.
+Migrations 017–019 are applied. All seven new research tables have RLS enabled
+and browser-role grants revoked; the backend add-ticker DB integration passed with
+RLS. SEC backfill processed 720 securities and stored 397,625 accounting facts.
+Separate price/share action metadata now classifies 179 adjustments (44 price-only);
+131 remain unknown. Envision's documented $46 cash acquisition is stored. RIC-level
+membership reconciles after a source-reviewed zero-duration predecessor event,
+but 267 missing/mismatched and two ambiguous DB identity candidates remain.
+Review unresolved adjustment/identity/terminal coverage before retraining. See
+`docs/signal_live_verification.md` for actual checks and remaining work.
+
+Research entrypoints are `scripts.signal_research`, `scripts.probe_signal_sources`,
+`scripts.backfill_signal_data`, and `scripts.news_research`. Macro is versioned and
+snapshot-bound, news raw text stays in local SQLite, and S&P 1500 research belongs
+in a separate local PostgreSQL database. The current dated-GICS probe did not
+establish historical coverage; ALFRED credentials and independent news annotations
+are outstanding. Historical findings below are preserved with their original
+provenance and do not override this update.
+
 ### Stack
 - **Frontend:** Next.js 15 App Router + TypeScript + Tailwind (deploys to Vercel)
 - **Backend:** FastAPI (asyncpg, runs locally on M4 Mac)
@@ -408,3 +501,12 @@ For multi-step tasks, state a brief plan:
 2. [Step] → verify: [check]
 3. [Step] → verify: [check]
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+Latest gate work (2026-09-19): 146/147 registered membership intervals applied;
+MRP remains unresolved. Lifecycle receipt adds GR cash and masked CVH/DTV
+terminal events; DB now has 875 membership intervals and 11 events. Prior research snapshot predates
+this repair. Dedicated Docker research PostgreSQL is initialized at localhost:55432
+with separate caches and no securities yet. Blinded 400-story news annotation
+package is `.news_cache/annotation-review/review-2026-09-19-v1/`; human labels
+remain blank. 45/60 fetch windows failed timestamp order, raw archives preserved;
+no timestamp substitutions or gate promotions. See experiment_gate_status.md.

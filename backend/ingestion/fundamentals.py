@@ -147,7 +147,7 @@ def _is_natural_period(entry: dict, form: str) -> bool:
     return False
 
 
-def _shares_by_accn(facts_json: dict) -> dict[str, int]:
+def _shares_by_accn(facts_json: dict, with_metadata: bool = False) -> dict:
     """{accession -> shares outstanding} from the filing cover page.
 
     `tickers.shares_outstanding` is a single CURRENT scalar, so pairing it with a
@@ -184,6 +184,12 @@ def _shares_by_accn(facts_json: dict) -> dict[str, int]:
             # the latest measurement. Maximizing (-priority, end) gives both.
             if current is None or (-priority, end) > (-current[0], current[1]):
                 best[accn] = (priority, end, int(val))
+    if with_metadata:
+        return {accn: {"shares_outstanding": val, "shares_measured_at": _parse_date(end),
+                       "shares_concept": ":".join(SHARES_CONCEPTS[priority]),
+                       "shares_kind": "point_in_time" if priority < 2 else "weighted_average",
+                       "shares_basis": "as_reported" if priority < 2 else "unverified"}
+                for accn, (priority, end, val) in best.items()}
     return {accn: val for accn, (_, _, val) in best.items()}
 
 
@@ -249,7 +255,7 @@ def parse_companyfacts(facts_json: dict, ticker_id: int) -> list[dict]:
                     (end, entry["val"], priority)
                 )
 
-    shares_by_accn = _shares_by_accn(facts_json)
+    shares_by_accn = _shares_by_accn(facts_json, with_metadata=True)
 
     rows: list[dict] = []
     for accn, f in accn_data.items():
@@ -308,7 +314,8 @@ def parse_companyfacts(facts_json: dict, ticker_id: int) -> list[dict]:
                 "total_debt": total_debt,
                 "total_equity": equity,
                 "fcf": fcf,
-                "shares_outstanding": shares_by_accn.get(accn),
+                "shares_outstanding": None,
+                **shares_by_accn.get(accn, {}),
             }
         )
     return rows
@@ -341,11 +348,12 @@ _UPSERT_SQL = """
 insert into fundamentals (
     ticker_id, accession_number, filing_type, period_end, filed_at,
     revenue, net_income, gross_margin, operating_margin,
-    total_debt, total_equity, fcf, shares_outstanding, ingested_at
+    total_debt, total_equity, fcf, shares_outstanding,
+    shares_measured_at, shares_concept, shares_kind, shares_basis, ingested_at
 ) values (
     $1, $2, $3, $4, $5,
     $6, $7, $8, $9,
-    $10, $11, $12, $13, now()
+    $10, $11, $12, $13, $14, $15, $16, $17, now()
 )
 on conflict (ticker_id, accession_number) do update set
     filing_type        = excluded.filing_type,
@@ -359,6 +367,10 @@ on conflict (ticker_id, accession_number) do update set
     total_equity       = excluded.total_equity,
     fcf                = excluded.fcf,
     shares_outstanding = excluded.shares_outstanding,
+    shares_measured_at = excluded.shares_measured_at,
+    shares_concept     = excluded.shares_concept,
+    shares_kind        = excluded.shares_kind,
+    shares_basis       = excluded.shares_basis,
     ingested_at        = now()
 """
 
@@ -381,6 +393,10 @@ async def _upsert_filings(conn: asyncpg.Connection, rows: list[dict]) -> int:
             r["total_equity"],
             r["fcf"],
             r.get("shares_outstanding"),
+            r.get("shares_measured_at"),
+            r.get("shares_concept"),
+            r.get("shares_kind"),
+            r.get("shares_basis"),
         )
         for r in rows
     ]

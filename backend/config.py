@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # LSEG Workspace (analyst estimates). Uses the lseg.data desktop session, which
     # talks to a locally-running Workspace; the app key authorizes that session.
     lseg_app_key: str = Field(default="")
+    fred_api_key: str = Field(default="")
+    news_cache_dir: Path = REPO_ROOT / ".news_cache"
+    research_dir: Path = REPO_ROOT / ".research"
 
     models_dir: Path = MODELS_DIR
     # On-disk cache of load_frames() pulls, so repeated local experiment/backtest

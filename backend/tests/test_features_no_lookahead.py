@@ -392,21 +392,19 @@ def test_market_cap_prefers_raw_close_times_pit_shares():
     assert cap == 100_000.0  # raw x PIT, not adj x static
 
 
-def test_market_cap_falls_back_to_adjusted_times_static_shares():
-    """Without a filed share count we keep the legacy formula — and deliberately
-    pair the STATIC (current, post-split) count with the ADJUSTED series, since
-    those two are split-consistent with each other."""
+def test_market_cap_refuses_current_share_fallback():
+    """Current shares cannot establish historical market capitalization."""
     from backend.ml.factors.assembly import _market_cap_at
 
     cap = _market_cap_at(
         raw_close=[100.0], adj_close=[82.0], pos=0,
         pit_shares=None, static_shares=2_000,
     )
-    assert cap == 164_000.0
+    assert np.isnan(cap)
 
 
-def test_market_cap_is_zero_when_nothing_is_available():
+def test_market_cap_is_missing_when_nothing_is_available():
     from backend.ml.factors.assembly import _market_cap_at
 
-    assert _market_cap_at([None], [None], 0, None, None) == 0.0
-    assert _market_cap_at([0.0], [0.0], 0, 5.0, 5) == 0.0
+    assert np.isnan(_market_cap_at([None], [None], 0, None, None))
+    assert np.isnan(_market_cap_at([0.0], [0.0], 0, 5.0, 5))

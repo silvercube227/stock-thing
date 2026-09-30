@@ -33,6 +33,7 @@ import pickle
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 
@@ -40,7 +41,6 @@ from backend.config import get_settings
 from backend.ingestion.calendar import HORIZON_TRADING_DAYS
 from backend.ml.features import SEQUENCE_LENGTH, build_sample
 from backend.ml.model import HORIZONS
-from collections import defaultdict
 
 Split = str  # "train" | "val" | "holdout"
 
@@ -91,6 +91,14 @@ class TickerFrame:
     # Used to (a) detect symbol REUSE at load time and (b) tell a delisted series
     # apart from one that is merely right-censored by the panel's end date.
     removed_at: date | None = None
+    security_events: list[dict] | None = None
+    accounting_facts: list[dict] | None = None
+    fixed_estimates: list[dict] | None = None
+    news: list[dict] | None = None
+    news_coverage: list[dict] | None = None
+    price_source_exclusions: dict | None = None
+    price_history_start: date | None = None
+    price_history_start_source: dict | None = None
 
 
 @dataclass
@@ -140,16 +148,9 @@ def compute_targets(
     `end_idx + 1 + H` (the exit) exist with positive prices; otherwise it is masked
     (label 0, return 0.0).
 
-    `terminal=True` says the series ENDED — the company was acquired or delisted —
-    rather than being right-censored by the panel's end date. Masking those is a
-    residual survivorship bias in the LABEL: a name that stops trading inside the
-    next H bars silently leaves both the training set and the scored cross-section,
-    so the model never learns what precedes an exit and the metric never scores it.
-    In large caps the exits are mostly acquisitions (a positive tail) plus a few
-    failures (a sharp negative one), and dropping both truncates the label
-    distribution at each end. When `terminal`, the exit price falls back to the last
-    available close (hold-to-last-trade). Right-censored series keep masking, because
-    there the future genuinely has not happened yet.
+    `terminal` is a deprecated compatibility argument and cannot establish proceeds.
+    Missing exits remain masked. GBM assembly uses documented_targets for explicit
+    corporate-action outcomes and actual execution/realization dates.
     """
     labels: dict[str, int] = {}
     returns: dict[str, float] = {}
@@ -161,8 +162,6 @@ def compute_targets(
         j = entry_idx + HORIZON_TRADING_DAYS[h]
         if j < n:
             future = adj_close[j]
-        elif terminal and n - 1 > entry_idx:
-            future = adj_close[n - 1]   # hold to last trade
         else:
             future = None
         if future is not None and base is not None and base > 0 and future > 0:
@@ -426,13 +425,13 @@ def to_arrays(samples: list[Sample]) -> dict[str, np.ndarray]:
 # =============================================================
 
 
-# `close` is the RAW as-traded price; `adj_close` is back-adjusted, so its LEVEL at
-# date t embeds every split/dividend after t. Ratios of adj_close are correct (the
-# factors cancel), which is what returns/momentum use — but a level times a share
-# count is a market cap, and there the adjustment is future information. Both are
-# selected: adj_close for returns, close for market cap.
+# Yahoo `close` is split-adjusted. Assembly reconstructs the as-traded price
+# using explicit split/source metadata before multiplying by dated shares.
 _PRICE_SQL = """
-select ticker_id, trade_date, close, adj_close, volume, high, low, dividend
+select ticker_id, trade_date, close, adj_close, volume, high, low, dividend,
+       split_factor, source, to_jsonb(price_history)->>'price_basis' as price_basis,
+       (to_jsonb(price_history)->>'share_split_factor')::numeric as share_split_factor,
+       to_jsonb(price_history)->>'share_action_source' as share_action_source
   from price_history
  where ticker_id = any($1::bigint[])
  order by ticker_id, trade_date
@@ -440,7 +439,11 @@ select ticker_id, trade_date, close, adj_close, volume, high, low, dividend
 
 _FUND_SQL = """
 select ticker_id, filed_at, period_end, filing_type, revenue, net_income, gross_margin,
-       operating_margin, total_debt, total_equity, fcf, shares_outstanding
+       operating_margin, total_debt, total_equity, fcf, shares_outstanding,
+       (to_jsonb(fundamentals)->>'shares_measured_at')::date as shares_measured_at,
+       to_jsonb(fundamentals)->>'shares_concept' as shares_concept,
+       to_jsonb(fundamentals)->>'shares_kind' as shares_kind,
+       to_jsonb(fundamentals)->>'shares_basis' as shares_basis
   from fundamentals
  where ticker_id = any($1::bigint[])
  order by ticker_id, filed_at
@@ -488,7 +491,8 @@ select ticker_id, accession_number, transaction_idx, insider_cik,
 """
 
 _MEMBERSHIP_SQL = """
-select ticker_id, valid_from, valid_to
+select ticker_id, valid_from, valid_to,
+       coalesce(to_jsonb(index_membership)->>'index_id', 'SPX') as index_id
   from index_membership
  where ticker_id = any($1::bigint[])
  order by ticker_id, valid_from
@@ -520,9 +524,31 @@ _REUSE_MIN_GAP_DAYS = 180
 _REUSE_MIN_LAG_DAYS = 90
 
 
-def _drop_reused_symbol_bars(price_rows: list[dict], removed_at: date | None) -> list[dict]:
-    """Drop bars that belong to a different company trading under a reused symbol."""
-    if removed_at is None or not price_rows:
+def _drop_reused_symbol_bars(
+    price_rows: list[dict],
+    removed_at: date | None,
+    security_retired_at: date | None = None,
+) -> list[dict]:
+    """Drop bars that belong to a different company trading under a reused symbol.
+
+    Two independent signals. `security_retired_at` is the vendor's date for the
+    security ceasing to exist, and it is authoritative: Starwood, Rockwell Collins
+    and Harman have bars running six months, two years and five years past their
+    retirement with no gap at all, so the shape-based rule below cannot see them.
+    `removed_at` only records leaving the index, which is not the end of a listing
+    (TechnipFMC left in 2021 and still trades), so it remains a heuristic applied
+    to the series shape.
+    """
+    if not price_rows:
+        return price_rows
+    if security_retired_at is not None:
+        limit = security_retired_at
+        kept = [r for r in price_rows if _as_date(r["trade_date"]) <= limit]
+        if len(kept) != len(price_rows):
+            price_rows = kept
+            if not price_rows:
+                return price_rows
+    if removed_at is None:
         return price_rows
     cutoff = removed_at + timedelta(days=_REUSE_MIN_LAG_DAYS)
     prev: date | None = None
@@ -551,7 +577,51 @@ async def _fetch_chunked(pool, sql: str, ids: list[int], chunk: int = 100) -> li
     return out
 
 
-async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFrame]:
+def _price_source_exclusions(value):
+    """Parse reviewed exclusions strictly; malformed evidence must stop loading."""
+    import json
+
+    if value is None:
+        return {}
+    exclusions = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(exclusions, dict):
+        raise ValueError('Price source exclusions must be an evidence mapping')
+    for source, evidence in exclusions.items():
+        if (not isinstance(source, str) or not source or not isinstance(evidence, dict)
+                or not isinstance(evidence.get('reason'), str) or not evidence['reason']
+                or not isinstance(evidence.get('artifact'), str) or not evidence['artifact']
+                or not isinstance(evidence.get('sha256'), str) or len(evidence['sha256']) != 64
+                or any(c not in '0123456789abcdef' for c in evidence['sha256'])):
+            raise ValueError('Price source exclusion lacks audit provenance')
+    return exclusions
+
+
+def _exclude_price_sources(rows, exclusions):
+    return [r for r in rows if r.get('source') not in exclusions] if exclusions else rows
+
+
+def _price_history_start(value, source):
+    if value is None and source is None:
+        return None, None
+    if value is None or source is None:
+        raise ValueError('Price history start requires paired evidence')
+    import json
+    evidence = json.loads(source) if isinstance(source, str) else source
+    # Same strict artifact/hash/reason requirements as source quarantines.
+    _price_source_exclusions({'history_start':evidence})
+    start = date.fromisoformat(value) if isinstance(value,str) else _as_date(value)
+    if not isinstance(start,date):
+        raise ValueError('Invalid price history start date')
+    return start, evidence
+
+
+def _trim_predecessor_prices(rows, start):
+    return [r for r in rows if _as_date(r['trade_date']) >= start] if start else rows
+
+
+async def load_frames(pool, symbols: list[str] | None = None,
+                      index_ids: tuple[str, ...] = ("SPX",),
+                      include_research: bool = False) -> list[TickerFrame]:
     """Pull all training data from Supabase into per-ticker frames.
 
     If `symbols` is given, restrict to those (used for the single-ticker overfit
@@ -560,21 +630,50 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     if symbols:
         ticker_rows = await pool.fetch(
             "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, "
-            "industry, removed_at "
+            "industry, removed_at, "
+            "(to_jsonb(tickers)->>'security_retired_at') security_retired_at, "
+            "(to_jsonb(tickers)->>'price_history_start') price_history_start, "
+            "(to_jsonb(tickers)->>'price_history_start_source') price_history_start_source, "
+            "(to_jsonb(tickers)->>'price_source_exclusions') price_source_exclusions "
             "from tickers "
-            "where symbol = any($1::text[]) order by ticker_id",
+            "where symbol = any($1::text[]) "
+            "and (coalesce((to_jsonb(tickers)->>'research_only')::boolean,false)=false "
+            "or $2::boolean) order by ticker_id",
             symbols,
+            include_research,
         )
     else:
         ticker_rows = await pool.fetch(
             "select ticker_id, symbol, embedding_idx, shares_outstanding, sector, "
-            "industry, removed_at from tickers order by ticker_id"
+            "industry, removed_at, "
+            "(to_jsonb(tickers)->>'security_retired_at') security_retired_at, "
+            "(to_jsonb(tickers)->>'price_history_start') price_history_start, "
+            "(to_jsonb(tickers)->>'price_history_start_source') price_history_start_source, "
+            "(to_jsonb(tickers)->>'price_source_exclusions') price_source_exclusions from tickers "
+            "where coalesce((to_jsonb(tickers)->>'research_only')::boolean,false)=false "
+            "or $1::boolean order by ticker_id", include_research,
         )
     ids = [r["ticker_id"] for r in ticker_rows]
     if not ids:
         return []
+    exclusions_by_id = {
+        r['ticker_id']: _price_source_exclusions(r.get('price_source_exclusions'))
+        for r in ticker_rows
+    }
+    starts_by_id = {r['ticker_id']:_price_history_start(r.get('price_history_start'),
+                    r.get('price_history_start_source')) for r in ticker_rows}
     _removed_at_by_id = {
         r["ticker_id"]: (_as_date(r["removed_at"]) if r["removed_at"] else None)
+        for r in ticker_rows
+    }
+    # Read through to_jsonb so a database without migration 020 still loads; the
+    # value therefore arrives as text.
+    _retired_at_by_id = {
+        r["ticker_id"]: (
+            date.fromisoformat(r["security_retired_at"])
+            if r["security_retired_at"]
+            else None
+        )
         for r in ticker_rows
     }
 
@@ -608,16 +707,25 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     except Exception:  # noqa: BLE001 — table may not exist yet
         membership_rows = []
         membership_loaded = False
-    # sector_history is optional (migration 015). Absent => every row keeps the static
-    # tickers.sector, i.e. exactly the pre-PIT behaviour.
+    # Missing table retains legacy compatibility; a successfully loaded table
+    # with no intervals means UNKNOWN, never today's sector backfilled in time.
+    sector_history_loaded = True
+    import asyncpg
     try:
-        sector_history_rows = await _fetch_chunked(pool, _SECTOR_HISTORY_SQL, ids)
-    except Exception:  # noqa: BLE001 — table may not exist yet
+        if hasattr(pool, 'transaction'):
+            async with pool.transaction():
+                sector_history_rows = await _fetch_chunked(pool, _SECTOR_HISTORY_SQL, ids)
+        else:
+            sector_history_rows = await _fetch_chunked(pool, _SECTOR_HISTORY_SQL, ids)
+    except asyncpg.UndefinedTableError:
         sector_history_rows = []
+        sector_history_loaded = False
 
     by_ticker_prices = {
         tid: _drop_reused_symbol_bars(
-            rows, _removed_at_by_id.get(tid)
+            _trim_predecessor_prices(_exclude_price_sources(rows, exclusions_by_id[tid]),
+                                     starts_by_id[tid][0]),
+            _removed_at_by_id.get(tid), _retired_at_by_id.get(tid)
         )
         for tid, rows in _group(price_rows).items()
     }
@@ -628,7 +736,28 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
     by_ticker_si = _group(si_rows)
     by_ticker_ins = _group(ins_rows)
     by_ticker_membership = _group(membership_rows)
+    by_ticker_membership = {
+        tid: [r for r in rows if r.get("index_id", "SPX") in index_ids]
+        for tid, rows in by_ticker_membership.items()
+    }
     by_ticker_sector_history = _group(sector_history_rows)
+
+    optional = {}
+    for attribute, table in (("security_events", "security_events"),
+                             ("accounting_facts", "accounting_facts"),
+                             ("fixed_estimates", "fixed_estimates"),
+                             ("news", "research_news_daily"),
+                             ("news_coverage", "research_news_coverage")):
+        import asyncpg
+        try:
+            sql = f"select * from {table} where ticker_id = any($1::bigint[])"
+            if hasattr(pool, "transaction"):
+                async with pool.transaction():
+                    optional[attribute] = _group(await _fetch_chunked(pool, sql, ids))
+            else:
+                optional[attribute] = _group(await _fetch_chunked(pool, sql, ids))
+        except asyncpg.UndefinedTableError:
+            optional[attribute] = {}
 
     frames: list[TickerFrame] = []
     for r in ticker_rows:
@@ -636,9 +765,13 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
         frames.append(
             TickerFrame(
                 ticker_id=tid,
+                **{key: grouped.get(tid, []) for key, grouped in optional.items()},
                 embedding_idx=r["embedding_idx"],
                 symbol=r["symbol"],
                 prices=by_ticker_prices.get(tid, []),
+                price_source_exclusions=exclusions_by_id[tid],
+                price_history_start=starts_by_id[tid][0],
+                price_history_start_source=starts_by_id[tid][1],
                 fundamentals=by_ticker_fund.get(tid, []),
                 sentiment=by_ticker_sent.get(tid, []),
                 shares_outstanding=r["shares_outstanding"],
@@ -650,22 +783,31 @@ async def load_frames(pool, symbols: list[str] | None = None) -> list[TickerFram
                 insiders=by_ticker_ins.get(tid, []),
                 membership=(by_ticker_membership.get(tid, [])
                             if membership_loaded else None),
-                sector_history=by_ticker_sector_history.get(tid) or None,
+                sector_history=(by_ticker_sector_history.get(tid, [])
+                                if sector_history_loaded else None),
                 removed_at=_as_date(r["removed_at"]) if r["removed_at"] else None,
             )
         )
     return frames
 
 
-def _frame_cache_key(symbols: list[str] | None) -> str:
+FRAME_CACHE_VERSION = 8
+
+
+class IncompatibleFrameCache(ValueError):
+    """A caller must reload data instead of supplying missing correctness fields."""
+
+
+def _frame_cache_key(symbols: list[str] | None, universe_tag: str = "sp500") -> str:
     """Stable cache filename stem for a symbol set ("all" when unrestricted)."""
     if not symbols:
-        return "all"
+        return "all" if universe_tag == "sp500" else f"all_{universe_tag}"
     digest = hashlib.sha1(",".join(sorted(symbols)).encode()).hexdigest()[:16]
-    return f"sym-{digest}"
+    return f"sym-{digest}" + (f"_{universe_tag}" if universe_tag != "sp500" else "")
 
 
-def write_frames_cache(frames: list[TickerFrame], symbols: list[str] | None = None) -> "Path":
+def write_frames_cache(frames: list[TickerFrame], symbols: list[str] | None = None,
+                       universe_tag: str = "sp500") -> "Path":
     """Atomically write `frames` to the on-disk cache for a symbol set.
 
     Lets a caller that already has frames in memory (e.g. production inference,
@@ -673,20 +815,21 @@ def write_frames_cache(frames: list[TickerFrame], symbols: list[str] | None = No
     single-ticker scoring path can read the universe from disk instead of
     re-pulling the full history.
     """
-    from pathlib import Path
-
     cache_dir = get_settings().frame_cache_dir
-    path = cache_dir / f"frames_{_frame_cache_key(symbols)}.pkl"
+    path = cache_dir / f"frames_{_frame_cache_key(symbols, universe_tag)}.pkl"
     cache_dir.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".pkl.tmp")
-    with tmp.open("wb") as f:
-        pickle.dump(frames, f)
+    import gzip
+    with gzip.open(tmp, "wb", compresslevel=6) as f:
+        pickle.dump({"version": FRAME_CACHE_VERSION, "universe": universe_tag,
+                     "frames": frames}, f)
     tmp.replace(path)  # atomic: never leave a half-written cache file
     return path
 
 
 async def load_frames_cached(
-    pool, symbols: list[str] | None = None, refresh: bool = False
+    pool, symbols: list[str] | None = None, refresh: bool = False,
+    universe_tag: str = "sp500",
 ) -> list[TickerFrame]:
     """load_frames() with an on-disk pickle cache, for local experiments only.
 
@@ -701,17 +844,29 @@ async def load_frames_cached(
     calls `load_frames` so it always scores on fresh data.
     """
     cache_dir = get_settings().frame_cache_dir
-    path = cache_dir / f"frames_{_frame_cache_key(symbols)}.pkl"
+    path = cache_dir / f"frames_{_frame_cache_key(symbols, universe_tag)}.pkl"
     if path.exists() and not refresh:
-        with path.open("rb") as f:
-            frames = pickle.load(f)
+        from backend.ml.compressed_io import open_artifact
+        with open_artifact(path) as f:
+            cached = pickle.load(f)
+        if not isinstance(cached, dict) or cached.get("version") != FRAME_CACHE_VERSION:
+            raise IncompatibleFrameCache("incompatible frame cache: rerun with --refresh-cache")
+        if cached.get("universe") != universe_tag:
+            raise ValueError("frame cache universe mismatch")
+        frames = cached["frames"]
         print(f"[frame-cache] hit: {path} ({len(frames)} tickers) — no Supabase egress")
         return frames
 
     why = "refresh" if refresh else "miss"
     print(f"[frame-cache] {why}: pulling full history from Supabase ...")
-    frames = await load_frames(pool, symbols=symbols)
-    write_frames_cache(frames, symbols=symbols)
+    if universe_tag == "sp500":
+        frames = await load_frames(pool, symbols=symbols)
+    elif universe_tag == "sp1500":
+        frames = await load_frames(pool, symbols=symbols, index_ids=("SPX", "SP400", "SP600"),
+                                   include_research=True)
+    else:
+        raise ValueError("unknown universe")
+    write_frames_cache(frames, symbols=symbols, universe_tag=universe_tag)
     print(f"[frame-cache] wrote {path} ({len(frames)} tickers)")
     return frames
 

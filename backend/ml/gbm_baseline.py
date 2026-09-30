@@ -324,6 +324,8 @@ def assemble_panel(
     grid: list,
     max_stale_days: int = 7,
     market_returns: dict | None = None,
+    allow_provisional_estimates: bool = False,
+    allow_provisional_news: bool = False,
 ):
     """Stack every ticker's rows into one tidy panel DataFrame (raw features)."""
     import pandas as pd
@@ -336,6 +338,8 @@ def assemble_panel(
                 grid,
                 max_stale_days=max_stale_days,
                 market_returns=market_returns,
+                allow_provisional_estimates=allow_provisional_estimates,
+                allow_provisional_news=allow_provisional_news,
             )
         )
     return pd.DataFrame(rows)
@@ -654,6 +658,10 @@ def prepare_panel(
     membership_filter: bool = False,
     membership_exempt_ids: set | None = None,
     log=lambda *_: None,
+    macro=None,
+    market_returns_override=None,
+    allow_provisional_estimates=False,
+    allow_provisional_news=False,
 ):
     """Full pipeline: assemble → demean target → rank-normalize features → targets.
 
@@ -663,12 +671,15 @@ def prepare_panel(
     padded with names the index had not yet promoted. `membership_exempt_ids` keeps
     rows that never have membership by design (user-added off-index tickers).
     """
-    market_returns = build_universe_return_map(frames)
+    market_returns = (market_returns_override if market_returns_override is not None
+                      else build_universe_return_map(frames))
     panel = assemble_panel(
         frames,
         grid,
         max_stale_days=max_stale_days,
         market_returns=market_returns,
+        allow_provisional_estimates=allow_provisional_estimates,
+        allow_provisional_news=allow_provisional_news,
     )
     if panel.empty:
         return panel
@@ -685,7 +696,8 @@ def prepare_panel(
     # knife_score is computed post-normalization from the [-1,1] inputs and is
     # already [0,1] within-date — exclude it from the normalization step.
     base_cols = rank_cols or FEATURE_COLS
-    norm_cols = [c for c in base_cols if c != "knife_score"]
+    from backend.ml.factors.long_horizon import MACRO_FEATURES, STRESS_FEATURES, TRANSFORMS
+    norm_cols = [c for c in base_cols if c != "knife_score" and c not in TRANSFORMS]
     panel = rank_normalize_features(
         panel,
         cols=norm_cols,
@@ -698,6 +710,16 @@ def prepare_panel(
     # Add knife_score if requested (knife_score in base_cols means --with-knife-feature).
     if "knife_score" in base_cols:
         panel = add_knife_score_feature(panel)
+    if set(base_cols) & set(STRESS_FEATURES):
+        medians = panel.groupby("date")["vol_120d_raw"].median().sort_index()
+        flags = dict(zip(medians.index, vol_gate_flags(medians.tolist()), strict=True))
+        for col, momentum in zip(STRESS_FEATURES, ("mom_3m", "mom_12_1"), strict=True):
+            panel[col] = panel["date"].map(flags).astype(float) * panel[momentum]
+    if set(base_cols) & set(MACRO_FEATURES):
+        from backend.ml.factors.long_horizon import add_macro_features
+        if macro is None:
+            raise ValueError("macro features require a versioned macro snapshot")
+        panel = add_macro_features(panel, frames, macro, market_returns)
     market_horizon_returns = build_market_horizon_returns(market_returns, grid)
     panel = apply_target_modes(
         panel, n_buckets, market_horizon_returns=market_horizon_returns,
@@ -754,6 +776,30 @@ def walk_forward_folds(grid_dates: list, min_train_months: int, embargo_steps: i
     for i in range(min_train_months + embargo_steps, len(grid_dates)):
         folds.append((grid_dates[i], grid_dates[i - embargo_steps]))
     return folds
+
+
+def select_walk_forward_samples(panel, horizon, target_mode, test_date, cutoff,
+                                wf_cfg, label_realized_before=None, eval_index_ids=None):
+    """Shared pre-fit selection for the actual runner and coverage audits."""
+    mask, target = f'mask_{horizon}', _target_col(horizon, target_mode)
+    end, entry = f'label_end_{horizon}', f'entry_{horizon}'
+    train = panel[(panel['date'] <= cutoff) & panel[mask] & panel[target].notna()]
+    if end in train:
+        train = train[train[end].notna() & (train[end] < test_date)]
+    if wf_cfg.max_train_months is not None:
+        train_dates = sorted(train['date'].unique())
+        if len(train_dates) > wf_cfg.max_train_months:
+            train = train[train['date'] >= train_dates[-wf_cfg.max_train_months]]
+    test = panel[(panel['date'] == test_date) & panel[mask]]
+    if label_realized_before is not None:
+        if end not in test:
+            raise ValueError('actual label dates required for research selection')
+        test = test[test[end].notna() & (test[end] < label_realized_before)]
+    if eval_index_ids is not None:
+        test = test[test['index_id'].isin(eval_index_ids)]
+    if entry in test and (test[entry] <= test['date']).any():
+        raise ValueError('entry must follow the feature cutoff')
+    return train, test
 
 
 def fit_lgbm_model(
@@ -1727,6 +1773,8 @@ def walk_forward_ic(
     fit_diagnostics: bool = False,
     baselines: bool = False,
     return_records: bool = False,
+    eval_index_ids: tuple[str, ...] | None = None,
+    label_realized_before=None,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
 
@@ -1752,7 +1800,7 @@ def walk_forward_ic(
 
     lgb_cfg = lgb_cfg or LGBMConfig()
     wf_cfg = wf_cfg or WalkForwardConfig()
-    r_col, m_col = f"r_{horizon}", f"mask_{horizon}"
+    r_col = f"r_{horizon}"
     t_col = _target_col(horizon, target_mode)
     # Winsorize the TRAINING label only (per-date quantile clip); scoring stays on
     # the unclipped realized return `r_col`. Precompute a clipped column once over
@@ -1785,16 +1833,10 @@ def walk_forward_ic(
     fold_rows: list[dict] = []
     records: list[dict] = []  # per-fold (ticker_ids, raw pred, realized r, sector) for smoothing/turnover
     for fi, (test_date, cutoff) in enumerate(folds):
-        train = panel[(panel["date"] <= cutoff) & panel[m_col] & panel[t_col].notna()]
-        if wf_cfg.max_train_months is not None:
-            # Count LABELED training dates, matching gbm_inference.fit_horizon_models
-            # exactly. Slicing by grid position instead would keep a different number
-            # of real training dates whenever a grid date carries no labeled rows, so
-            # the walk-forward would measure a different model than production ships.
-            train_dates = sorted(train["date"].unique())
-            if len(train_dates) > wf_cfg.max_train_months:
-                train = train[train["date"] >= train_dates[-wf_cfg.max_train_months]]
-        test = panel[(panel["date"] == test_date) & panel[m_col]]
+        end_col, entry_col = f"label_end_{horizon}", f"entry_{horizon}"
+        train, test = select_walk_forward_samples(
+            panel, horizon, target_mode, test_date, cutoff, wf_cfg,
+            label_realized_before, eval_index_ids)
         if test.shape[0] < wf_cfg.min_names or train.empty:
             continue
 
@@ -1870,6 +1912,8 @@ def walk_forward_ic(
             "size": (test["log_market_cap"].to_numpy(dtype=float)
                      if "log_market_cap" in test.columns else None),
             "risk": risk,
+            **({"entry_date": test[entry_col].to_numpy(), "label_end": test[end_col].to_numpy()}
+               if entry_col in test and end_col in test else {}),
         })
         log(
             f"  fold {test_date}  ic {ic:+.4f}  "
@@ -1912,6 +1956,8 @@ def walk_forward_ic(
             # not left describing the pre-overlay model.
             fold.update(top_of_list_metrics(rk, rec["r"]))
         turnover_smoothed = rank_turnover(records, rank_series=ranks)
+    else:
+        ranks = [rec["pred"].copy() for rec in records]
 
     result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
     result["turnover_raw"] = rank_turnover(records)
@@ -1976,6 +2022,8 @@ def walk_forward_ic(
         # Raw per-fold (ticker_ids, pred, r, sector) so a caller can sweep smoothing
         # spans / turnover WITHOUT refitting (the fits dominate cost).
         result["records"] = records
+        result["prediction_records"] = [dict(rec, pred=np.asarray(pred))
+                                        for rec, pred in zip(records, ranks, strict=True)]
     return result
 
 
@@ -2166,6 +2214,7 @@ def block_bootstrap_summary(
             "mean_ic": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
             "p_value": float("nan"), "effective_blocks": 0.0, "t_block": float("nan"),
             "se_block": float("nan"), "min_detect_ic": float("nan"),
+            "approx_95pct_threshold_ic": float("nan"),
         }
 
     block_size = max(1, min(int(block_size), n))
@@ -2184,6 +2233,7 @@ def block_bootstrap_summary(
             "effective_blocks": effective_blocks, "t_block": t_block,
             "se_block": se_block,
             "min_detect_ic": 1.96 * se_block if se_block == se_block else float("nan"),
+            "approx_95pct_threshold_ic": 1.96 * se_block,
         }
 
     rng = np.random.default_rng(seed)
@@ -2218,6 +2268,7 @@ def block_bootstrap_summary(
         "t_block": t_block,
         "se_block": se_block,
         "min_detect_ic": 1.96 * se_block if se_block == se_block else float("nan"),
+        "approx_95pct_threshold_ic": 1.96 * se_block,
     }
 
 
@@ -2282,15 +2333,10 @@ def _print_bootstrap(tag: str, s: dict) -> None:
 
 
 def _print_power(tag: str, s: dict) -> None:
-    """Statistical-power read: the smallest |mean IC| this block count can resolve.
-
-    For overlapping long-horizon labels (1Y) eff_blocks is small, so min_detect|IC|
-    is large — a non-significant result there may be a power ceiling, not a dead
-    signal. Read mean_ic against min_detect, not just against zero.
-    """
+    """Approximate significance threshold, not a power-calibrated detectable effect."""
     print(
         f"{tag:<5} eff_blocks={s['effective_blocks']:.1f}  se={s['se_block']:.4f}  "
-        f"min_detect|IC|@95%={s['min_detect_ic']:.4f}  "
+        f"approx_95pct_threshold_ic={s['approx_95pct_threshold_ic']:.4f}  "
         f"(observed mean_ic={s['mean_ic']:+.4f})"
     )
 
@@ -2347,6 +2393,9 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(PAYOUT_FEATURES)
     if getattr(args, "with_range_vol", False):
         cols += list(RANGE_VOL_FEATURES)
+    if getattr(args, "research_pack", None):
+        from backend.ml.factors.long_horizon import PACKS
+        cols += PACKS[args.research_pack]
     # Ad-hoc single features (e.g. isolating one member of a pack for an ablation).
     if getattr(args, "extra_features", None):
         cols += [c.strip() for c in args.extra_features.split(",") if c.strip()]
@@ -3107,6 +3156,8 @@ def main() -> None:
                         "(isolate one member of a pack for a targeted ablation, e.g. "
                         "--extra-features sales_to_price). Columns must be produced by "
                         "build_ticker_rows.")
+    p.add_argument("--research-pack", choices=("analyst", "news", "accounting", "stress", "macro"),
+                   help="registered pack diagnostics; use scripts.signal_research for matched fits")
     p.add_argument("--industry-relative", action="store_true",
                    help="rank-normalize price/fundamental/valuation/quality "
                         "features within (date, industry) instead of universe-wide")

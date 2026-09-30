@@ -1,0 +1,6 @@
+{
+  "scope": "Verify Linde successor prices/actions over the Praxair terminal-valuation window only. Do not infer pre-merger identity from a linked current RIC.",
+  "securities": [
+    {"ric": "LIN.OQ", "symbol": "LIN", "ticker_id": 360, "status": "unverified_existing_history_requires_backfill"}
+  ]
+}

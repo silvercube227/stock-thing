@@ -64,6 +64,8 @@ def make_frame(n_days: int, trend: float, tid: int, vol_seed: int = 0) -> Ticker
     """A daily price series starting 2018-01-02 with drift `trend` and mild noise."""
     rng = np.random.default_rng(vol_seed)
     d0 = date(2018, 1, 2)
+    from backend.ingestion.calendar import trading_days_between
+    sessions = trading_days_between(d0, d0 + timedelta(days=n_days * 2 + 30))[:n_days]
     price = 100.0
     prices = []
     for i in range(n_days):
@@ -73,7 +75,7 @@ def make_frame(n_days: int, trend: float, tid: int, vol_seed: int = 0) -> Ticker
         # dividend column so the payout builder is exercised (0.0 = a non-payer, which
         # is an observation rather than a gap).
         prices.append({
-            "trade_date": d0 + timedelta(days=i),
+            "trade_date": sessions[i],
             "adj_close": close,
             "high": close * 1.005,
             "low": close * 0.995,
@@ -154,8 +156,13 @@ def test_build_ticker_rows_computes_beta_and_earnings_yield():
             "total_debt": 1_000_000,
             "total_equity": 10_000_000,
             "fcf": 2_000_000,
+            "shares_outstanding": 1_000_000,
+            "shares_measured_at": date(2018, 3, 1),
+            "shares_kind": "point_in_time", "shares_basis": "as_reported",
         }
     ]
+    for p in frame_a.prices:
+        p.update(close=p["adj_close"], split_factor=1., source="yfinance")
     market_returns = build_universe_return_map([frame_a, frame_b])
     rows = build_ticker_rows(frame_a, build_calendar_grid([frame_a, frame_b]), market_returns=market_returns)
 
@@ -174,7 +181,7 @@ def test_build_ticker_rows_computes_beta_and_earnings_yield():
                 # a YEAR earlier, not merely any filing) are NaN when their own source
                 # is empty.
                 or c in ("revenue_surprise", "eps_surprise", "short_ratio",
-                         "est_staleness_days", "net_issuance")
+                         "est_staleness_days", "net_issuance", "price_target_upside")
             )
             assert np.isfinite(r[c]) or source_absent, (
                 f"{c} is NaN but its source is present"

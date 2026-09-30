@@ -1,0 +1,114 @@
+{
+  "scope": "documented_index_membership_after_security_termination",
+  "policy": "Index removal and cessation of trading are distinct dates. Preserve the publisher's membership interval, but do not manufacture prices or permit entry after the documented final trading session. These reviews do not certify historical price completeness or successor valuations.",
+  "events": [
+    {
+      "symbol": "CVH_index",
+      "source": "https://press.spglobal.com/2013-05-03-Macerich-Set-to-Join-the-S-P-500-3D-Systems-to-Join-the-S-P-MidCap-400-CoreSite-Realty-to-Join-the-S-P-SmallCap-600"
+    },
+    {
+      "symbol": "CVH_terminal",
+      "source": "https://www.sec.gov/Archives/edgar/data/1054833/000119312513204454/d533402d8k.htm"
+    },
+    {
+      "symbol": "DTV_index",
+      "source": "https://press.spglobal.com/2015-07-24-Signet-Jewelers-Set-to-Join-the-S-P-500-PAREXEL-International-Catalent-to-Join-the-S-P-MidCap-400-Others-to-Join-S-P-SmallCap-600"
+    },
+    {
+      "symbol": "DTV_terminal",
+      "source": "https://www.sec.gov/Archives/edgar/data/732717/000073271715000069/form8k.htm"
+    },
+    {
+      "symbol": "GR_index",
+      "source": "https://press.spglobal.com/2012-07-26-Ensco-plc-Set-to-Join-the-S-P-500"
+    },
+    {
+      "symbol": "GR_terminal",
+      "source": "https://www.sec.gov/Archives/edgar/data/42542/000119312512328867/d388891d8k.htm"
+    }
+  ],
+  "reviews": [
+    {
+      "ric": "CVH.N^E13",
+      "ticker_id": 831,
+      "isin": "US2228621049",
+      "cik": "1054833",
+      "valid_from": "2010-01-01",
+      "valid_to": "2013-05-09",
+      "last_trade_date": "2013-05-06",
+      "completion_date": "2013-05-07",
+      "effective_date": "2013-05-07",
+      "vendor_retire_date": "2013-05-07",
+      "reviewed_lifecycle_exception_dates": [
+        "2013-05-08"
+      ],
+      "evidence_keys": [
+        "CVH_index",
+        "CVH_terminal"
+      ],
+      "cash_per_share": 27.3,
+      "successor_shares_per_share": 0.3885,
+      "successor_ric": "AET.N^K18",
+      "payoff_status": "pending_successor_price_basis_verification",
+      "reason": "S&P explicitly removed Coventry after the May 8 close. Coventry's completion filing requested suspension before the May 7 open. The last native price is May 6; May 7-8 are nontradable index-retention dates, not missing bars to invent."
+    },
+    {
+      "ric": "DTV.OQ^G15",
+      "ticker_id": 838,
+      "isin": "US25490A3095",
+      "cik": "1465112",
+      "valid_from": "2010-01-01",
+      "valid_to": "2015-07-29",
+      "last_trade_date": "2015-07-24",
+      "completion_date": "2015-07-24",
+      "effective_date": "2015-07-27",
+      "vendor_retire_date": "2015-07-27",
+      "reviewed_lifecycle_exception_dates": [
+        "2015-07-28"
+      ],
+      "evidence_keys": [
+        "DTV_index",
+        "DTV_terminal"
+      ],
+      "cash_per_share": 28.5,
+      "successor_shares_per_share": 1.892,
+      "successor_ric": "T.N",
+      "payoff_status": "pending_successor_price_basis_verification",
+      "reason": "S&P removed DIRECTV after the July 28 close despite the July 24 merger. AT&T's completion filing gives the fixed consideration and cessation of trading. The native final bar is July 24. July 27 is the first session with no new DIRECTV entry; it is not a claim that the legal merger happened July 27."
+    },
+    {
+      "ric": "GR.N^G12",
+      "ticker_id": 854,
+      "isin": "US3823881061",
+      "cik": "42542",
+      "valid_from": "2010-01-01",
+      "valid_to": "2012-07-31",
+      "last_trade_date": "2012-07-26",
+      "completion_date": "2012-07-26",
+      "effective_date": "2012-07-27",
+      "vendor_retire_date": "2012-07-27",
+      "reviewed_lifecycle_exception_dates": [
+        "2012-07-30"
+      ],
+      "evidence_keys": [
+        "GR_index",
+        "GR_terminal"
+      ],
+      "cash_per_share": 127.5,
+      "successor_shares_per_share": 0,
+      "successor_ric": null,
+      "payoff_status": "pending_target_price_basis_verification",
+      "reason": "S&P removed Goodrich after the July 30 close. Its completion filing establishes the July 26 merger and cash consideration; the NYSE filed Form 25 on July 27. Native prices end July 26. Preserve index membership while keeping subsequent sessions nontradable."
+    }
+  ],
+  "unresolved": [
+    {
+      "ric": "MRP.N",
+      "reason": "The archived January 21 membership start is the issuer's record date. S&P's February 5 notice places Millrose in the S&P 600 from February 10 following the February 7 spin-off, and the issuer documents February 7 regular-way trading. Neither source proves an S&P 500 interval beginning January 21. Require independent parent-index snapshots or an explicit spin-off index treatment notice; do not infer or clip an interval.",
+      "evidence_sources": [
+        "https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20250205-1476446/1476446_5-len-mrp-spin.pdf",
+        "https://www.sec.gov/Archives/edgar/data/2017206/000119312525068773/d931976d10k.htm"
+      ]
+    }
+  ]
+}

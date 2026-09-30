@@ -1,5 +1,84 @@
 # Research ledger
 
+## Current protocol — corrected 2026-09-07
+
+The long-horizon program is registered in `docs/long_horizon_signal_program.md`.
+Its seven fixed primary comparisons use matched per-date IC differences, calendar
+blocks that preserve gaps, a doubled-block sensitivity check, and seven-comparison
+Holm adjustment. Absolute model uncertainty is reported separately from incremental
+uncertainty. The legacy `min_detect_ic = 1.96 * SE` is an approximate significance
+threshold, not a power-calibrated detectable effect and not a universal floor on
+paired improvements. Diagnostics are informative; standalone two-horizon p-values
+and pairwise correlations no longer universally veto registered conditional packs.
+
+2024+ has already been inspected and is **validation history**, not an untouched
+holdout for this program. Existing trial outcomes below remain historical records;
+this protocol change does not retroactively promote rejected candidates.
+
+### 2026-09-07 — foundation correctness follow-up; no fits
+
+Migration 019 separates price adjustments from actual share-count ratios. LSEG
+corroborated 179 events, including 44 pricing-only adjustments; 131 remain unknown.
+GE share inflation from spin-offs was corrected. All 27 sampled raw price checks
+matched LSEG within 6e-8 relative error. Membership RIC/session reconstruction now
+passes after one evidenced Envision predecessor review (876 intervals/862 RICs);
+DB identity mapping remains incomplete (593 unique candidates, 267 missing or
+mismatched, two ambiguous). Envision's SEC-documented $46 cash exit was inserted
+with live matured-label checks. Accounting feature coverage was audited, without
+return-based fitting. Full suite: 345 passed; add-ticker/RLS integration passed
+again. See `docs/signal_live_verification.md` for evidence and limits. No feature
+comparison or production promotion has run.
+
+### 2026-09-07 — live migration/backfill follow-up; no fits
+
+Migrations 017/018 were applied after a rollback rehearsal; 728 membership rows
+were preserved. RLS is enabled on seven new tables, with browser-role grants
+revoked. The real backend add-ticker DB helpers passed a rollback integration
+check under RLS, while anonymous/authenticated reads and writes were denied.
+Legacy frame caches now reload automatically for add-ticker scoring.
+
+The full SEC backfill processed 720 securities, 41,135 filings and 397,625 facts.
+Eight fixed source replay cases passed. Membership retrieval returned 751 events
+and 503 current RICs; strict reconstruction rejects an unresolved EVHC.N^L16
+same-day join/leave. No assumed interval was replaced to force reconciliation.
+Full backend suite: 339 passed. See `docs/signal_live_verification.md` and
+`docs/signal_source_readiness.json`. Corrected-reference certification, feature
+comparisons and prospective selection remain incomplete; no signal is claimed.
+
+### 2026-09-07 — initial infrastructure and read-only source probes; no fits
+
+**Pre-registered comparisons:** analyst/3M, news/6M, accounting/1Y, stress/6M,
+macro/6M, expanded training/6M, combined/6M. Screen at paired ΔIC ≥0.003;
+confirmation and practical checks follow the program document. Unexecuted tests
+count as p=1 in the family. No real-data trial has been run in this implementation.
+
+**Implemented:** immutable input manifests (including macro), final-prediction
+artifacts, paired evaluation, strict source readiness, versioned frame caches,
+price/share basis repair, documented terminal labels, registered feature builders,
+news version storage/annotation gate, source adapters/backfills, and migration 017.
+Production feature specifications remain unchanged.
+
+**Probe results:** LSEG monthly EPS includes absolute fiscal labels; 32 SPX events
+were returned for 2010; BNI's dead RIC has prices; the GICS query returned only a
+current sector with no date; the archive yielded 11 Reuters English stories after
+switching to supported newest-first sorting and typed headline parsing. Example
+version timestamps were midnight-only, requiring conservative availability and
+further source-semantic review. ALFRED credentials are absent; local PostgreSQL
+executables are absent. Exact readiness is in `docs/signal_source_readiness.json`.
+
+**Verdict:** data execution remains blocked at foundation/source gates. Migration
+017, full backfills, corrected reference construction, real-data ablations and
+prospective selection have not run. Synthetic tests validate implementation, not
+investment signal. No IC improvement or significance is claimed.
+
+**Verification:** 338 backend tests passed; targeted static checks and whitespace
+checks passed. The synthetic end-to-end test fits LightGBM, saves final predictions
+and validates matched evaluation artifacts. No live database migration was applied.
+
+---
+
+## Historical protocol and entries (preserved)
+
 Every experiment run against the panel, with its acceptance criterion written down
 **before** the run. This is the trial count any deflated statistic needs (Gençay 2026,
 arXiv:2608.27734, certified 0 of ~100 mined strategies on 453 US large caps once trials

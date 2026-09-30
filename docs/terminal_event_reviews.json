@@ -1,0 +1,16 @@
+{
+  "identity_artifact": ".research/verification/security-identity-lseg.json",
+  "identity_sha256": "0f7d5ed053c5dcd76b8b1ffb8e7a6ae293da2296111267c5a473eea12bbb9878",
+  "events": [
+    {
+      "symbol": "EVHC",
+      "cik": "0001678531",
+      "ric": "EVHC.N^J18",
+      "isin": "US29414D1000",
+      "effective_date": "2018-10-11",
+      "last_trade_date": "2018-10-10",
+      "cash_value": 46.0,
+      "source": "https://www.sec.gov/Archives/edgar/data/1678531/000119312518297466/d637722d8k.htm"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "source_artifact": ".research/verification/corporate-actions-lseg.json",
+  "source_sha256": "3adf8f833d866c2d8fccea74cd1d69950ad8ee38b91fd87744179ccb9d6e11e4",
+  "semantics_reference": "https://developers.lseg.com/en/article-catalog/article/workspace-corporate-actions-content-set-guide",
+  "events": [
+    {
+      "symbol": "AAPL",
+      "trade_date": "2014-06-09",
+      "expected_price_factor": 7,
+      "share_split_factor": 7,
+      "event_type": "Share Split"
+    },
+    {
+      "symbol": "AAPL",
+      "trade_date": "2020-08-31",
+      "expected_price_factor": 4,
+      "share_split_factor": 4,
+      "event_type": "Share Split"
+    },
+    {
+      "symbol": "NVDA",
+      "trade_date": "2021-07-20",
+      "expected_price_factor": 4,
+      "share_split_factor": 4,
+      "event_type": "Share Split"
+    },
+    {
+      "symbol": "NVDA",
+      "trade_date": "2024-06-10",
+      "expected_price_factor": 10,
+      "share_split_factor": 10,
+      "event_type": "Share Split"
+    },
+    {
+      "symbol": "GE",
+      "trade_date": "2019-02-26",
+      "expected_price_factor": 1.04,
+      "share_split_factor": 1,
+      "event_type": "Demerger"
+    },
+    {
+      "symbol": "GE",
+      "trade_date": "2021-08-02",
+      "expected_price_factor": 0.125,
+      "share_split_factor": 0.125,
+      "event_type": "Share Consolidation"
+    },
+    {
+      "symbol": "GE",
+      "trade_date": "2023-01-04",
+      "expected_price_factor": 1.281,
+      "share_split_factor": 1,
+      "event_type": "Demerger"
+    },
+    {
+      "symbol": "GE",
+      "trade_date": "2024-04-02",
+      "expected_price_factor": 1.253,
+      "share_split_factor": 1,
+      "event_type": "Demerger"
+    }
+  ],
+  "session_date_evidence": {
+    "GE:2023-01-04": "https://www.ge.com/news/press-releases/ge-completes-separation-of-ge-healthcare",
+    "GE:2024-04-02": "https://www.gevernova.com/news/press-releases/ge-vernova-completes-spin-off-begins-trading-new-york-stock-exchange",
+    "NVDA:2024-06-10": "https://nvidianews.nvidia.com/news/nvidia-announces-financial-results-for-first-quarter-fiscal-2025"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "status": "scoped_corporate_action_review_not_full_security_certification",
+  "events": [
+    {
+      "symbol": "COV",
+      "ric": "COV.N^A15",
+      "event_date": "2011-03-21",
+      "source": "https://www.sec.gov/Archives/edgar/data/1385187/000119312511012918/ddef14a.htm",
+      "finding": "Reverse 1-for-100 followed by forward 100-for-1 applies to registered accounts; issuer explicitly says street-name shares are unaffected. Do not apply either leg alone or infer a 100-fold price adjustment. Registered-holder fractional cash-out is not a universal per-share cash dividend."
+    },
+    {
+      "symbol": "COV",
+      "ric": "COV.N^A15",
+      "event_date": "2011-03-21",
+      "source": "https://www.eurex.com/ex-en/find/circulars/Covidien-PLC-ISIN-Change-227866",
+      "finding": "Exchange confirms effective March 21 conversion and ISIN change. Identifier transition must be recorded in security continuity; no price discontinuity alone disproves neither action nor transition."
+    }
+  ]
+}

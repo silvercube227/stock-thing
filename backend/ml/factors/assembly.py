@@ -9,7 +9,7 @@ from datetime import timedelta
 import numpy as np
 
 from backend.ingestion.calendar import HORIZON_TRADING_DAYS
-from backend.ml.dataset import TickerFrame, _as_date, compute_targets
+from backend.ml.dataset import TickerFrame, _as_date
 from backend.ml.factors.constants import (
     EARNINGS_REACTION_FEATURES,
     ESTIMATE_SOURCED_FEATURES,
@@ -22,6 +22,11 @@ from backend.ml.factors.fundamentals import (
     _shares_outstanding_asof,
 )
 from backend.ml.factors.insiders import _insider_context_asof
+from backend.ml.factors.pit import aligned_shares, as_traded_closes, documented_targets
+from backend.ml.factors.long_horizon import (
+    accounting_features, fixed_estimate_features, news_features,
+)
+from backend.ingestion.index_lseg import index_on
 from backend.ml.factors.price import (
     _dividend_yield_ttm,
     _price_features,
@@ -39,7 +44,7 @@ from backend.ml.features import (
 from backend.ml.model import HORIZONS
 
 
-def build_universe_return_map(frames: list[TickerFrame]) -> dict:
+def build_universe_return_map(frames: list[TickerFrame], membership_filter: bool = False) -> dict:
     """Equal-weight universe daily log return by trade date."""
     by_date: dict = {}
     for frame in frames:
@@ -49,19 +54,14 @@ def build_universe_return_map(frames: list[TickerFrame]) -> dict:
             cur = float(row["adj_close"]) if row["adj_close"] is not None else None
             if prev is not None and cur is not None and prev > 0 and cur > 0:
                 d = _as_date(row["trade_date"])
-                by_date.setdefault(d, []).append(math.log(cur / prev))
+                if not membership_filter or _in_index_on(getattr(frame, "membership", None), d):
+                    by_date.setdefault(d, []).append(math.log(cur / prev))
             prev = cur
     return {d: float(np.mean(vals)) for d, vals in by_date.items() if vals}
 
 
-# A name whose last bar predates the panel's end by more than this has stopped
-# trading (acquired/delisted); anything inside it is just the normal ragged edge of
-# a live series. ~3 weeks of trading days.
-_TERMINAL_GAP_DAYS = 21
-
-
 def _sector_on(history: list[dict] | None, when, fallback: tuple):
-    """(sector, industry) as of `when`, falling back to the static tickers labels.
+    """Dated labels; legacy fallback only when history was not loaded (None).
 
     Intervals are [valid_from, valid_to) and non-overlapping (enforced by
     seed_sector_history.py), so at most one matches. Without this every row carried
@@ -69,9 +69,9 @@ def _sector_on(history: list[dict] | None, when, fallback: tuple):
     (`sector_return` / `sector_grade`) and the headline metric (`within_sector_ic`),
     pre-2018 rows were demeaned against, and scored inside, peer groups that did not
     exist: Communication Services was created in Sept 2018 and Real Estate in Sept
-    2016. 6.1% of member-months carry a different sector than today's.
+    2016. Missing intervals and missing dated industries remain unknown.
     """
-    if not history:
+    if history is None:
         return fallback
     for iv in history:
         vf = _as_date(iv["valid_from"])
@@ -79,8 +79,8 @@ def _sector_on(history: list[dict] | None, when, fallback: tuple):
             break                      # ordered by valid_from; no later one can match
         vt = iv["valid_to"]
         if vt is None or when < _as_date(vt):
-            return iv["sector"] or fallback[0], iv.get("industry") or fallback[1]
-    return fallback
+            return iv["sector"], iv.get("industry")
+    return None, None
 
 
 def _in_index_on(membership: list[dict] | None, when) -> bool | None:
@@ -109,28 +109,15 @@ def _market_cap_at(
     pit_shares: float | None,
     static_shares: int | None,
 ) -> float:
-    """Point-in-time market cap at bar `pos`, with an explicit fallback chain.
+    """As-traded close times dated, split-aligned shares; unknown is NaN.
 
-    1. `close[pos] x shares as-reported on or before this bar` — the honest one.
-       Raw close is the as-traded price and the filing's share count is
-       contemporaneous, so the product is the cap as it stood that day.
-    2. `adj_close[pos] x tickers.shares_outstanding` — the legacy formula, used
-       only when no filing carries a share count. Deliberately keeps adj_close
-       here: the static column holds TODAY's post-split count, which is
-       split-consistent with the adjusted series but not with the raw one.
-       Still contaminated (back-adjustment embeds future dividends, and the
-       count is current rather than historical) — it is a floor, not a target.
-    3. 0.0 when neither is available (the existing missing-value convention;
-       per-date rank normalization places these consistently).
+    Legacy arguments remain for call compatibility but cannot supply a fallback.
     """
     price = raw_close[pos] if pos < len(raw_close) else None
     if price is not None and price > 0 and pit_shares is not None and pit_shares > 0:
         return float(price * pit_shares)
 
-    adj = adj_close[pos]
-    if adj is not None and adj > 0 and static_shares is not None and static_shares > 0:
-        return float(adj * static_shares)
-    return 0.0
+    return float("nan")
 
 
 def build_market_horizon_returns(
@@ -183,6 +170,8 @@ def build_ticker_rows(
     grid: list,
     max_stale_days: int = 7,
     market_returns: dict | None = None,
+    allow_provisional_estimates: bool = False,
+    allow_provisional_news: bool = False,
 ) -> list[dict]:
     """One feature+target row per grid date for a single ticker (raw, pre-demean).
 
@@ -201,9 +190,7 @@ def build_ticker_rows(
     adj_close = [float(r["adj_close"]) if r["adj_close"] is not None else None for r in prices]
     # Raw as-traded close, for market cap only. Absent from frames cached before the
     # shares/close backfill, hence `.get`.
-    raw_close = [
-        float(r["close"]) if r.get("close") is not None else None for r in prices
-    ]
+    raw_close = as_traded_closes(prices)
     volume = [float(r.get("volume") or 0.0) for r in prices]
     # high/low/dividend have been stored since the first ingest and were never
     # selected until now; `.get` tolerates frames cached before they were added.
@@ -231,7 +218,7 @@ def build_ticker_rows(
     fund_avail = _fund_filing_mask(bar_dates, frame.fundamentals)    # (k,) bool
     sent = _build_sentiment_series(bar_dates, frame.sentiment)       # (k, 2)
     fund_ctx = _fundamental_context_asof(frame.fundamentals, bar_dates)
-    pit_shares = _shares_outstanding_asof(frame.fundamentals, bar_dates)
+    pit_shares = aligned_shares(frame.fundamentals, prices, bar_dates)
     # Same PIT lookup a year earlier — the denominator for net share issuance. Using
     # the as-of helper (rather than differencing filings) means the comparison is
     # "what was on file then" vs "what is on file now", which is what an investor
@@ -256,14 +243,16 @@ def build_ticker_rows(
     season_ctx = _seasonality_asof(adj_close, trade_dates, bar_positions)
     ins_ctx = _insider_context_asof(getattr(frame, "insiders", None) or [], bar_dates)
 
-    # Did this series END (acquired/delisted), or is it merely right-censored by the
-    # panel's end date? Only the first justifies a hold-to-last-trade exit price.
-    # `removed_at` guards against a live name with a transient ingestion gap.
-    terminal = bool(
-        getattr(frame, "removed_at", None) is not None
-        and grid
-        and (grid[-1] - trade_dates[-1]).days > _TERMINAL_GAP_DAYS
+    sectors = [_sector_on(getattr(frame, "sector_history", None), d,
+                         (frame.sector, frame.industry))[0] for d in bar_dates]
+    accounting = accounting_features(getattr(frame, "accounting_facts", None) or [], bar_dates, sectors)
+    fixed = fixed_estimate_features(
+        getattr(frame, "fixed_estimates", None) or [], bar_dates,
+        allow_provisional=allow_provisional_estimates,
     )
+    news = news_features(getattr(frame, "news", None) or [],
+                         getattr(frame, "news_coverage", None) or [], bar_dates,
+                         exploratory=allow_provisional_news)
 
     rows: list[dict] = []
     for j, (g, pos, _bd) in enumerate(entries):
@@ -313,9 +302,12 @@ def build_ticker_rows(
         # An analyst price target is a NOMINAL as-traded price, so it must be
         # compared against the raw close. Against adj_close the ratio silently
         # embeds every post-date split/dividend adjustment.
-        pt_ref = raw_close[pos] if raw_close[pos] is not None else adj_close[pos]
+        pt_ref = raw_close[pos]
+        # Historical PT basis is unverified on the legacy feed. Do not guess.
+        pt_verified = any(r.get("price_target_basis") == "as_traded"
+                          and _as_date(r["as_of_date"]) <= g for r in frame.estimates or [])
         feats["price_target_upside"] = (
-            ((pt - pt_ref) / pt_ref) if pt_ref and pt_ref > 0 and pt else 0.0
+            ((pt - pt_ref) / pt_ref) if pt_verified and pt_ref > 0 and pt else float("nan")
         )
         # Panel-level demean overwrites this in `prepare_panel`; until then leave
         # it equal to mom_12_1 so single-ticker callers see a finite value.
@@ -365,13 +357,19 @@ def build_ticker_rows(
         if not feats["est_available"]:
             for _name in ESTIMATE_SOURCED_FEATURES:
                 feats[_name] = float("nan")
-        _labels, returns, mask = compute_targets(adj_close, pos, terminal=terminal)
+        targets = documented_targets(prices, pos, getattr(frame, "security_events", None),
+                                     max(grid), dates=trade_dates)
+        feats.update(accounting[j])
+        feats.update(fixed[j])
+        feats.update(news[j])
         sector, industry = _sector_on(
             getattr(frame, "sector_history", None), g, (frame.sector, frame.industry)
         )
         row = {
             "date": g,
             "ticker_id": frame.ticker_id,
+            # Audit-only cohort; never part of a feature catalog.
+            "removed_cohort": getattr(frame, "removed_at", None) is not None,
             # Sector AS OF this row's date, not today's label — it drives both the
             # sector-relative target and the within-sector metric.
             "sector": sector,
@@ -379,10 +377,15 @@ def build_ticker_rows(
             # Tagged per row, filtered in prepare_panel: a name added to the index
             # in 2023 must not sit in the 2017 cross-section. None = unknown.
             "in_index": _in_index_on(getattr(frame, "membership", None), g),
+            "index_id": index_on(getattr(frame, "membership", None), g),
             **feats,
         }
         for h in HORIZONS:
-            row[f"r_{h}"] = returns[h]
-            row[f"mask_{h}"] = mask[h]
+            ret, valid, entry_date, label_end, status = targets[h]
+            row[f"r_{h}"] = ret
+            row[f"mask_{h}"] = valid
+            row[f"entry_{h}"] = entry_date
+            row[f"label_end_{h}"] = label_end
+            row[f"outcome_{h}"] = status
         rows.append(row)
     return rows

@@ -163,6 +163,10 @@ insert into price_history (
     volume, split_factor, dividend, source, ingested_at
 ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
 on conflict (ticker_id, trade_date) do update set
+    share_split_factor = case when price_history.split_factor is distinct from excluded.split_factor
+                              then null else price_history.share_split_factor end,
+    share_action_source = case when price_history.split_factor is distinct from excluded.split_factor
+                               then null else price_history.share_action_source end,
     open         = excluded.open,
     high         = excluded.high,
     low          = excluded.low,
@@ -279,6 +283,11 @@ async def _ingest_one(
     start: date | None = None,
 ) -> TickerResult:
     """Pull, optionally re-pull on drift, upsert."""
+    if await pool.fetchval(
+        "select exists(select 1 from price_history where ticker_id=$1 and source<>'yfinance')",
+        ticker_id,
+    ):
+        return TickerResult(ticker_id, symbol, 0, error="refusing mixed-source security history")
     try:
         df = await asyncio.to_thread(_yf_history, symbol, period=period, start=start)
     except Exception as exc:  # noqa: BLE001 — surface anything yfinance throws

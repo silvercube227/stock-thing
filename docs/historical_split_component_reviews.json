@@ -1,0 +1,59 @@
+{
+  "status": "event_components_only_not_full_history_certification",
+  "events": [
+    {
+      "symbol": "BTU.N^D16",
+      "ric": "BTU.N^D16",
+      "effective_trading_date": "2015-10-01",
+      "new_shares": 1,
+      "old_shares": 15,
+      "source": "https://www.sec.gov/Archives/edgar/data/1064728/000106472815000088/btu_8-kx20150930xpostxsplit.htm",
+      "review": "Issuer confirms 1-for-15 and first adjusted trading October 1."
+    },
+    {
+      "symbol": "DF.N^K19",
+      "ric": "DF.N^K19",
+      "effective_trading_date": "2013-08-27",
+      "new_shares": 1,
+      "old_shares": 2,
+      "source": "https://www.sec.gov/Archives/edgar/data/931336/000119312513335750/d583800dex991.htm",
+      "review": "Issuer announces 1-for-2 and August 27 adjusted trading."
+    },
+    {
+      "symbol": "DINO.N",
+      "ric": "DINO.N",
+      "effective_trading_date": "2011-09-01",
+      "new_shares": 2,
+      "old_shares": 1,
+      "source": "https://www.sec.gov/Archives/edgar/data/48039/000119312512086106/d269091d10k.htm",
+      "review": "HollyFrontier issuer reports 2-for-1 distributed August 31; LSEG step September 1. Full current-RIC predecessor continuity remains separately unverified."
+    },
+    {
+      "symbol": "LO.N^F15",
+      "ric": "LO.N^F15",
+      "effective_trading_date": "2013-01-16",
+      "new_shares": 3,
+      "old_shares": 1,
+      "source": "https://www.sec.gov/Archives/edgar/data/1424847/000119312513013900/d469153d8k.htm",
+      "review": "Issuer January 16 filing confirms 3-for-1, distribution beginning January 15; LSEG step January 16."
+    },
+    {
+      "symbol": "ODP.OQ^L25",
+      "ric": "ODP.OQ^L25",
+      "effective_trading_date": "2020-07-01",
+      "new_shares": 1,
+      "old_shares": 10,
+      "source": "https://www.sec.gov/Archives/edgar/data/800240/000119312520184552/d45006dex992.htm",
+      "review": "Issuer confirms 1-for-10 after June 30 close, July 1 adjusted trading, concurrent holding company reorganization. Split evidence alone does not certify security continuity."
+    },
+    {
+      "symbol": "SVU.N^J18",
+      "ric": "SVU.N^J18",
+      "effective_trading_date": "2017-08-02",
+      "new_shares": 1,
+      "old_shares": 7,
+      "source": "https://www.sec.gov/Archives/edgar/data/95521/000009552117000091/f17annualmeeting8-k.htm",
+      "review": "Issuer confirms 1-for-7 with August 2 adjusted trading."
+    }
+  ]
+}

@@ -388,7 +388,7 @@ async def amain(args: argparse.Namespace) -> int:
         ]
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await conn.execute("delete from index_membership")
+                await conn.execute("delete from index_membership where index_id = 'SPX'")
                 await conn.executemany(
                     """
                     insert into index_membership (ticker_id, valid_from, valid_to, source)
