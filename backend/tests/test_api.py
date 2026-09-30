@@ -323,3 +323,79 @@ def test_quotes_fallback_to_stored_close(client, monkeypatch) -> None:
     body = client.get("/quotes?symbols=MSFT").json()
     q = body["MSFT"]
     assert q["price"] == 50.0 and q["stale"] is True
+
+
+# =============================================================
+# Add-ticker queueing (hosted read-API cannot run the worker itself)
+# =============================================================
+
+
+def test_worker_capability_probe_reflects_installed_deps(monkeypatch) -> None:
+    """The hosted API (render.yaml) installs fastapi/asyncpg/yfinance only. Spawning
+    the worker there SUCCEEDS at Popen and then dies on ModuleNotFoundError with
+    stderr at DEVNULL — a silent hang. The probe is what prevents that."""
+    import importlib.util
+
+    from backend.api.routers import tickers as tickers_mod
+
+    real = importlib.util.find_spec
+    tickers_mod._worker_runs_here.cache_clear()
+    monkeypatch.setattr(
+        importlib.util, "find_spec",
+        lambda name, *a, **k: None if name in {"lightgbm", "torch", "pandas"} else real(name),
+    )
+    assert tickers_mod._worker_runs_here() is False
+
+    tickers_mod._worker_runs_here.cache_clear()
+    monkeypatch.undo()
+    # This repo's venv has the full ML stack, so the local API still spawns inline.
+    assert tickers_mod._worker_runs_here() is True
+    tickers_mod._worker_runs_here.cache_clear()
+
+
+def _status_row(status: str, age_seconds: float, metadata=None):
+    from datetime import datetime, timedelta, timezone
+
+    return {
+        "status": status,
+        "started_at": datetime.now(timezone.utc) - timedelta(seconds=age_seconds),
+        "error_message": None,
+        "metadata": metadata,
+    }
+
+
+def test_queued_job_reports_queued_and_is_not_killed_by_the_running_stale_guard(
+    client, store, monkeypatch
+) -> None:
+    """A queued job has NOT started — the 15-minute guard that catches a hard-killed
+    worker must not apply to it, or every web-hosted add would report a timeout while
+    the scoring machine was merely asleep."""
+    # 40 minutes old: well past _ADD_STALE_SECONDS (15 min), well inside
+    # _QUEUE_STALE_SECONDS (12 h).
+    row = _status_row("queued", 40 * 60)
+    monkeypatch.setattr(
+        type(client.app.dependency_overrides[get_pool]()), "fetchrow",
+        lambda self, sql, *a: _maybe_status(sql, row), raising=False,
+    )
+    r = client.get("/tickers/NEWCO/status")
+    assert r.status_code == 200
+    assert r.json()["status"] == "queued"
+    assert "scoring machine" in r.json()["message"]
+
+
+def test_queued_job_eventually_gives_up(client, monkeypatch) -> None:
+    from backend.api.routers import tickers as tickers_mod
+
+    row = _status_row("queued", tickers_mod._QUEUE_STALE_SECONDS + 60)
+    monkeypatch.setattr(
+        type(client.app.dependency_overrides[get_pool]()), "fetchrow",
+        lambda self, sql, *a: _maybe_status(sql, row), raising=False,
+    )
+    body = client.get("/tickers/NEWCO/status").json()
+    assert body["status"] == "failed"
+    assert "never picked up" in body["message"]
+
+
+async def _maybe_status(sql, row):
+    """Answer the status query with `row`; anything else falls back to None."""
+    return row if "from ingestion_runs" in " ".join(sql.split()) else None

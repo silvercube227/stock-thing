@@ -46,7 +46,9 @@ export interface AddTickerResponse {
 
 export interface TickerStatus {
   symbol: string;
-  // "running" | "ready" | "insufficient_history" | "failed" | "unknown"
+  // "queued" | "running" | "ready" | "insufficient_history" | "failed" | "unknown"
+  // "queued": the hosted read-API accepted the request but cannot run the scoring
+  // worker itself; the local machine drains the queue.
   status: string;
   message: string | null;
 }

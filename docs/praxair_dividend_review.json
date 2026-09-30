@@ -1,0 +1,18 @@
+{
+  "scope": "Resolve the four 2017 PX cash-amount discrepancies only; not full distribution or successor-price certification.",
+  "events": [
+    {
+      "symbol": "PX",
+      "source": "https://assets.linde.com/-/media/global/corporate/corporate/documents/investors/archive-praxair-quarterly-earnings/praxair-4q17-earnings-release-tables.pdf",
+      "document_date": "2018-01-25",
+      "evidence_location": "PDF page 9, Quarterly Financial Summary, cash dividends per share: all four 2017 quarters are 0.7875; annual total 3.15.",
+      "cash_per_quarter": "0.7875",
+      "ex_dates_agree_between_price_feeds": ["2017-03-03", "2017-06-05", "2017-09-07", "2017-12-06"],
+      "native_amount": "0.7875",
+      "legacy_amount": "0.788",
+      "decision": "Retain the exact native amount, corroborated by issuer reporting. Do not round the candidate to match Yahoo.",
+      "timing_scope": "Retrospective dividend-price normalization evidence, not a backdated financial predictor.",
+      "corroborating_first_quarter_declaration": "https://assets.linde.com/-/media/global/corporate/corporate/documents/investors/archive-praxair-quarterly-earnings/praxair-declares-dividend-increase-in-1q17.pdf"
+    }
+  ]
+}

@@ -8,10 +8,27 @@ load_frames so no DB is touched.
 from __future__ import annotations
 
 import asyncio
+import pickle
+import pytest
 from types import SimpleNamespace
 
 import backend.ml.dataset as ds
 from backend.ml.dataset import TickerFrame, load_frames_cached
+
+
+def test_add_ticker_reloads_legacy_cache(monkeypatch, tmp_path):
+    from backend.ml.gbm_inference import _load_scoring_universe
+
+    calls = _patch(monkeypatch, tmp_path)
+    with (tmp_path / 'frames_all.pkl').open('wb') as stream:
+        pickle.dump([_frame(999)], stream)
+    with pytest.raises(ds.IncompatibleFrameCache):
+        asyncio.run(load_frames_cached(None))
+    result = asyncio.run(_load_scoring_universe(None))
+    assert [f.ticker_id for f in result] == [1, 2]
+    assert calls['n'] == 1
+    assert asyncio.run(_load_scoring_universe(None)) == result
+    assert calls['n'] == 1
 
 
 def _frame(tid: int) -> TickerFrame:

@@ -1,0 +1,30 @@
+{
+  "scope": "Original CA/HAR documented cash outcomes, staged against native recovery candidates only; no database application before price basis checks.",
+  "events": [
+    {
+      "symbol": "CA",
+      "ticker_id": 712,
+      "ric": "CA.OQ^K18",
+      "isin": "US12673P1057",
+      "cik": "356028",
+      "source": "https://www.sec.gov/Archives/edgar/data/356028/000119312518317918/d631849d8k.htm",
+      "last_trade_date": "2018-11-02",
+      "effective_date": "2018-11-05",
+      "cash_per_share": 44.5,
+      "note": "Issuer 8-K Item3.01 states trading halted before Nov5 open. Nasdaq suspension notice uses Nov6; halt and administrative suspension differ. Native history ends Nov2."
+    },
+    {
+      "symbol": "HAR",
+      "ticker_id": 749,
+      "ric": "HAR.N^C17",
+      "isin": "US4130861093",
+      "cik": "800459",
+      "source": "https://www.sec.gov/Archives/edgar/data/800459/000119312517078968/d184457d8k.htm",
+      "last_trade_date": "2017-03-10",
+      "effective_date": "2017-03-13",
+      "legal_completion_date": "2017-03-10",
+      "cash_per_share": 112.0,
+      "note": "Issuer 8-K requests suspension before Mar13 open; native last trade Mar10. Legal completion and first nontradable session recorded separately."
+    }
+  ]
+}

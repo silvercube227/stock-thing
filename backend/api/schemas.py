@@ -151,7 +151,9 @@ class AddTickerResponse(BaseModel):
 
 class TickerStatus(BaseModel):
     symbol: str
-    # "running" | "ready" | "insufficient_history" | "failed" | "unknown"
+    # "queued" | "running" | "ready" | "insufficient_history" | "failed" | "unknown"
+    # "queued" = accepted by the hosted read-API, waiting for the local machine to
+    # drain it (the ML stack and the model artifact only exist there).
     status: str
     message: str | None = None
 

@@ -1,0 +1,135 @@
+{
+  "blocked": [],
+  "events": [
+    {
+      "applied": true,
+      "archived_source": ".research/terminal_sources/f59d6431b2e438421c585f754634bc7e4b70c47b0df7288001bc44e78b990fba.html",
+      "cik": "1122304",
+      "effective_date": "2018-11-28",
+      "note": "Per Share Merger Consideration: $145.00 in cash plus 0.8378 CVS shares.",
+      "source": "https://www.sec.gov/Archives/edgar/data/1122304/000112230418000178/form8-k.htm",
+      "source_sha256": "f59d6431b2e438421c585f754634bc7e4b70c47b0df7288001bc44e78b990fba",
+      "symbol": "AET",
+      "terms": {
+        "cash_per_share": 145.0,
+        "consideration_type": "successor",
+        "exchange_ratio": 0.8378,
+        "successor_symbol": "CVS"
+      },
+      "last_trade_date": "2018-11-28",
+      "ownership_close": "2018-11-28",
+      "session_review_status": "source_and_live_price_corroborated",
+      "application_artifact": ".research/verification/successor-events-three-applied.json"
+    },
+    {
+      "applied": true,
+      "archived_source": ".research/terminal_sources/14e4a9c76efce5308d0fe068464ee14b4c999eab7ab93357d2d8cfcade8c997f.html",
+      "cik": "1532063",
+      "effective_date": "2018-12-20",
+      "note": "Merger Consideration: 0.2434 New Cigna shares plus $48.75 in cash.",
+      "source": "https://www.sec.gov/Archives/edgar/data/1532063/000114036118045477/form8k.htm",
+      "source_sha256": "14e4a9c76efce5308d0fe068464ee14b4c999eab7ab93357d2d8cfcade8c997f",
+      "symbol": "ESRX",
+      "terms": {
+        "cash_per_share": 48.75,
+        "consideration_type": "successor",
+        "exchange_ratio": 0.2434,
+        "successor_symbol": "CI"
+      },
+      "last_trade_date": "2018-12-20",
+      "ownership_close": "2018-12-21",
+      "session_review_status": "source_and_live_price_corroborated",
+      "application_artifact": ".research/verification/successor-events-applied.json"
+    },
+    {
+      "applied": true,
+      "archived_source": ".research/terminal_sources/30166e01b12b7afe60d98c672ea1aef7ecf29b53ae096d8cf167a47a12c834f8.html",
+      "cik": "754737",
+      "effective_date": "2019-01-01",
+      "note": "All-stock: 0.6690 Dominion Energy shares per SCANA share. Item 2.01 gives January 1 legal completion; January 2 is the first following exchange session.",
+      "source": "https://www.sec.gov/Archives/edgar/data/754737/000119312519000643/d678624d8k.htm",
+      "source_sha256": "30166e01b12b7afe60d98c672ea1aef7ecf29b53ae096d8cf167a47a12c834f8",
+      "symbol": "SCG",
+      "terms": {
+        "cash_per_share": 0.0,
+        "consideration_type": "successor",
+        "exchange_ratio": 0.669,
+        "successor_symbol": "D"
+      },
+      "last_trade_date": "2018-12-31",
+      "ownership_close": "2019-01-02",
+      "session_review_status": "source_and_live_price_corroborated",
+      "application_artifact": ".research/verification/successor-events-applied.json"
+    },
+    {
+      "applied": true,
+      "archived_source": ".research/terminal_sources/ab8985a47b1d9c05b3a6f7884b80cb9fd4b7d5ea237b3b2fdc0843eedba6b84b.html",
+      "cik": "11199",
+      "effective_date": "2019-06-11",
+      "note": "All-stock: 5.1 Amcor ordinary shares per Bemis share.",
+      "source": "https://www.sec.gov/Archives/edgar/data/11199/000110465919034809/a19-11365_18k.htm",
+      "source_sha256": "ab8985a47b1d9c05b3a6f7884b80cb9fd4b7d5ea237b3b2fdc0843eedba6b84b",
+      "symbol": "BMS",
+      "terms": {
+        "cash_per_share": 0.0,
+        "consideration_type": "successor",
+        "exchange_ratio": 5.1,
+        "successor_symbol": "AMCR"
+      },
+      "last_trade_date": "2019-06-10",
+      "ownership_close": "2019-06-11",
+      "session_review_status": "source_and_live_price_corroborated",
+      "application_artifact": ".research/verification/successor-events-three-applied.json"
+    },
+    {
+      "applied": true,
+      "archived_source": ".research/terminal_sources/6d815f5b775f060a1ae254d2d403bb5910a3478977b4eceeb8d2990cdfd4cc9d.html",
+      "cik": "50104",
+      "effective_date": "2018-10-01",
+      "note": "Acquisition classification applied with unresolved_election consideration and null payoff. Exact proration remains unresolved; affected labels are unknown and counted by horizon/year. The stated election alternatives are source terms, not an assumed realized payoff.",
+      "source": "https://www.sec.gov/Archives/edgar/data/50104/000119312518289750/d632974d8k.htm",
+      "source_sha256": "6d815f5b775f060a1ae254d2d403bb5910a3478977b4eceeb8d2990cdfd4cc9d",
+      "symbol": "ANDV",
+      "terms": {
+        "cash_per_share": 152.27,
+        "consideration_type": "election",
+        "exchange_ratio": 1.87,
+        "successor_symbol": "MPC"
+      },
+      "last_trade_date": "2018-09-28",
+      "ownership_close": "2018-10-01",
+      "session_review_status": "source_and_live_price_corroborated",
+      "non_election_source": "https://www.sec.gov/Archives/edgar/data/1510295/000151029518000201/mpc8-knotes1018.htm",
+      "non_election_review": {
+        "stock_allocation_approximate": 0.87,
+        "cash_allocation_approximate": 0.13,
+        "precision": "approximately, not exact",
+        "policy": "non-election; do not optimize election using subsequent returns"
+      },
+      "application_status": "acquisition_classification_applied_payoff_unresolved",
+      "application_artifact": ".research/verification/andv-unresolved-applied.json"
+    },
+    {
+      "applied": true,
+      "symbol": "TWX",
+      "cik": "1105705",
+      "effective_date": "2018-06-14",
+      "source": "https://www.sec.gov/Archives/edgar/data/1105705/000095015718000694/form8-k.htm",
+      "note": "Items 2.01 and 3.01 confirm terms and suspension before June 15 opening. Raw filing archived and hashed; identity and ownership/price basis review pending.",
+      "terms": {
+        "cash_per_share": 53.75,
+        "consideration_type": "successor",
+        "exchange_ratio": 1.437,
+        "successor_symbol": "T"
+      },
+      "source_sha256": "0a1e0210253d111e84c744449a5fdcb5bc58de7ecef4456fd36b5bcaa58ca28c",
+      "archived_source": ".research/terminal_sources/0a1e0210253d111e84c744449a5fdcb5bc58de7ecef4456fd36b5bcaa58ca28c.html",
+      "last_trade_date": "2018-06-14",
+      "ownership_close": "2018-06-14",
+      "session_review_status": "source_and_live_price_corroborated",
+      "application_artifact": ".research/verification/successor-events-three-applied.json"
+    }
+  ],
+  "rule": "Reviewed completion filings establish stated terms. Events remain unapplied until exact security identity, ownership timing, raw source hashes and successor/target price bases are verified. ANDV needs documented non-election/proration treatment. Successor valuation engine now exists in backend/ml/terminal.py; live application is pending.",
+  "status": "partially_applied"
+}

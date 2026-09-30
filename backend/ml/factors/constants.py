@@ -10,7 +10,7 @@ from __future__ import annotations
 # Tabular factor columns the model trains on (order is informational only).
 PRICE_FEATURES = [
     "mom_1m", "mom_3m", "mom_6m", "mom_12_1",   # momentum (12_1 skips the last month)
-    "log_market_cap",                           # log(adj_close × shares_outstanding)
+    "log_market_cap",                           # log(raw close × as-reported PIT shares)
     "vol_20d", "vol_60d", "vol_120d",           # realized vol
     "dist_high_252", "dist_low_252",            # distance to 52w extremes
     "ma_gap_50", "ma_gap_200",                  # gap vs moving averages
@@ -104,6 +104,34 @@ KNIFE_FEATURES = ["knife_score"]
 # analysts → NEGATIVE expected return (short-selling constraint prevents full
 # arbitrage of disagreed-on names). Opt-in via --with-eps-dispersion.
 EPS_DISPERSION_FEATURES = ["eps_dispersion"]
+# Net share issuance (Pontiff-Woodgate 2008; Fama-French 2008 find it pervasive ACROSS
+# size groups, which is rare for an anomaly and the reason it is worth testing here).
+# net_issuance = shares_now / shares_1y_ago - 1, both point-in-time from the filing
+# cover page, so a buyback reads NEGATIVE and a raise reads positive. Needs no new
+# ingestion: `fundamentals.shares_outstanding` has been PIT since migration 011, and
+# no post-2010 large-cap test of this signal was located in the literature review —
+# it is genuinely open rather than a known null.
+ISSUANCE_FEATURES = ["net_issuance"]
+# Payout: trailing 12-month cash dividends over price. `price_history.dividend` has
+# been stored since the first ingest and never selected. Boudoukh et al. net payout
+# yield; the buyback leg needs the EDGAR expansion, so this is the dividend half.
+PAYOUT_FEATURES = ["dividend_yield_ttm"]
+# Range-based realized volatility (Parkinson 1980) from the stored high/low, which
+# were likewise never selected. Uses the intra-bar range rather than close-to-close,
+# giving roughly 5x the efficiency per observation — a lower-variance estimate of the
+# SAME quantity vol_20d/vol_60d already proxy, so this is a REPLACEMENT candidate for
+# the collinear close-to-close vol block, not an addition to it.
+RANGE_VOL_FEATURES = ["range_vol_20d", "range_vol_60d"]
+# Analyst BREADTH, the thread the post-audit program flagged as most promising:
+# coverage_chg_90d was the cleanest feature in the Stage-3 diagnostics (sec_ic +0.024,
+# sec_p 0.009, only 0.057 correlated with the book). These extend that idea using LSEG
+# columns already ingested but read by nothing — consensus REVENUE revisions (the
+# analogue of the promoted eps_est_rev_*), the change in the number of included EPS
+# estimates, coverage as a level, and coverage LOSS specifically.
+ANALYST_BREADTH_FEATURES = [
+    "revenue_est_rev_30d", "revenue_est_rev_90d",
+    "eps_num_est_chg_90d", "coverage_level", "coverage_drop_90d",
+]
 # Short interest (FINRA Reg SHO): days-to-cover ratio (short_interest /
 # avg_daily_volume). High DTC = crowded short = contrarian long candidate OR
 # further squeeze risk. PIT-safe on publication_date (~14d after settlement).
@@ -126,8 +154,19 @@ INSIDER_FEATURES = [
 SEASONALITY_FEATURES = [
     "seasonal_same_month_5y", "seasonal_other_month_5y", "seasonal_gap_5y",
 ]
+# FinBERT rolling news sentiment. NOT in FEATURE_COLS: yfinance only serves ~30 days
+# of headlines and there is no backfill, so sentiment_daily covers a few months while
+# the panel spans 2010+. The columns were ~98% zero in training yet non-zero at
+# inference — a train/serve skew where the model never had the chance to learn the
+# feature it was being served. Still computed on every row, so `--with-sentiment`
+# turns them back on the moment a real headline archive exists.
 SENTIMENT_FEATURES = ["sentiment_7d", "sentiment_14d"]
-FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES + SENTIMENT_FEATURES
+# Availability / staleness of the LSEG estimate snapshot, the analogue of
+# `fund_available` for the analyst feed. `analyst_estimates` starts in 2012-13, so
+# without this the promoted estimate packs are silently a coverage proxy on early
+# rows. est_staleness_days = calendar days since the newest observed snapshot.
+ESTIMATE_MISSING_FEATURES = ["est_available", "est_staleness_days"]
+FEATURE_COLS = PRICE_FEATURES + FUNDAMENTAL_FEATURES + FUNDAMENTAL_MISSING_FEATURES
 # EXPERIMENTAL_FEATURES: per-ticker features produced by build_ticker_rows (eligible for
 # `--feature-diagnostics` and `--with-*` packs). knife_score is excluded because it is a
 # PANEL-LEVEL feature computed by add_knife_score_feature AFTER cross-sectional normalization
@@ -137,7 +176,9 @@ EXPERIMENTAL_FEATURES = (
     + ANALYST_REVISION_FEATURES + ESTIMATE_SURPRISE_FEATURES + EPS_SURPRISE_FEATURES
     + FORWARD_VALUATION_FEATURES + REVISION_MOMENTUM_FEATURES + LOTTERY_FEATURES
     + MICROSTRUCTURE_FEATURES + EPS_DISPERSION_FEATURES + SHORT_INTEREST_FEATURES
-    + SEASONALITY_FEATURES + INSIDER_FEATURES
+    + SEASONALITY_FEATURES + INSIDER_FEATURES + SENTIMENT_FEATURES
+    + ESTIMATE_MISSING_FEATURES + ISSUANCE_FEATURES + PAYOUT_FEATURES
+    + RANGE_VOL_FEATURES + ANALYST_BREADTH_FEATURES
     # KNIFE_FEATURES intentionally excluded — panel-level, not in build_ticker_rows
 )
 # The industry-relative *normalization* sweep (which hurt in test 3); residual /
@@ -146,4 +187,31 @@ EXPERIMENTAL_FEATURES = (
 # carry.
 INDUSTRY_RELATIVE_FEATURES = (
     PRICE_FEATURES + FUNDAMENTAL_FEATURES + VALUATION_FEATURES + QUALITY_FEATURES
+)
+
+# ---------------------------------------------------------------------------
+# Source-gated features: columns that are only DEFINED when their upstream source
+# has an observation as of the row date. build_ticker_rows sets these to NaN when
+# the source is absent, instead of the historical sentinel 0.0.
+#
+# Why this matters: a sentinel 0.0 is then RANKED by rank_normalize_features, so a
+# name with no SEC filing lands at a real position in the cross-section — mid-pack
+# for a signed feature like revenue_growth, in a tail for a positive-only one like
+# earnings_yield. The imputation is silent, column-dependent and signal-bearing
+# (Bryzgalova-Lerner-Lettau-Pelger 2025; Freyberger et al. 2025: characteristic
+# missingness is systematic, not random). NaN lets LightGBM route missing values
+# natively and keeps them out of the ranking entirely.
+#
+# The availability FLAGS (`fund_available`, `est_available`) stay finite 0/1 — they
+# are the model's explicit handle on missingness. Partial-field gaps inside an
+# otherwise-present source (e.g. total_equity null on a filing that has revenue)
+# still fall back to 0.0; that is a documented follow-up, not this pass.
+FUNDAMENTAL_SOURCED_FEATURES = (
+    FUNDAMENTAL_FEATURES + VALUATION_FEATURES + QUALITY_FEATURES
+    + EARNINGS_REACTION_FEATURES
+)
+ESTIMATE_SOURCED_FEATURES = (
+    ANALYST_REVISION_FEATURES + FORWARD_VALUATION_FEATURES
+    + REVISION_MOMENTUM_FEATURES + EPS_DISPERSION_FEATURES
+    + ANALYST_BREADTH_FEATURES
 )

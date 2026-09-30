@@ -1,0 +1,696 @@
+{
+  "latest_reference_audit": {
+    "date": "2026-09-19",
+    "status": "scoped_cash_recovery_applied_shared_reference_incomplete",
+    "postcommit_receipt": ".research/verification/original-cash-applied-2026-09-19-v1.json",
+    "membership_intervals": 875,
+    "terminal_events": 13,
+    "registered_membership_intervals_applied_total": 146,
+    "registered_securities_without_prices": 147,
+    "fresh_snapshot_after_lifecycle_application": false,
+    "model_fits": 0,
+    "production_cache_refreshed": false,
+    "note": "CA/HAR native prices and cash outcomes passed exact rollback and postcommit readback. Prior snapshot and production cache predate these repairs; global reference remains incomplete.",
+    "prices_recovered": 4035,
+    "legacy_prices_archived": 2896
+  },
+  "accounting": {
+    "evidence": [
+      ".research/verification/database-post-backfill.json",
+      ".research/verification/foundations-audit.json",
+      ".research/verification/historical-accounting-backfill.json"
+    ],
+    "reason": "720-security SEC backfill and eight-case source replay completed. Feature-level monthly coverage audit completed on existing uncertified membership/sectors: 2022 nonfinancial accruals 80.25%, asset growth 98.79%, gross profitability 38.62%; financials unavailable. Original filing availability and historical sector/identity certification remain incomplete. Newly registered historical securities: 124 successful backfills, 32,221 facts and 3,290 filings; 18 have no unambiguous CIK and five SEC companyfacts are unavailable. Filing timing and historical sectors still require certification.",
+    "status": "incomplete",
+    "unknown_sector_policy": "Only a known nonfinancial GICS sector enables the registered accounting features. Missing, blank or unrecognized sectors emit NaN; financials remain excluded. This does not certify filing availability or historical sector coverage."
+  },
+  "analyst": {
+    "contributor_history": false,
+    "evidence": [
+      ".research/probes/2026-09-07-v2.json",
+      ".research/verification/fixed-estimate-endpoints-2026-09-19-v1.json",
+      ".research/verification/fixed-estimate-semantics-2026-09-19-v1.json",
+      ".research/verification/fixed-estimate-exploratory-2026-09-19-v1.json",
+      ".research/exploratory-analyst-2026-09-19-v1/manifest.json",
+      ".research/experiments-2026-09-19-v2/exploratory/analyst/screening/result.json",
+      ".research/experiments-2026-09-19-v2/exploratory/analyst/confirmation/result.json"
+    ],
+    "reason": "Certification remains incomplete. The user-authorized exploratory archive now contains 204,062 usable monthly observations across 796 securities, with CalcDate availability and fixed absolute fiscal targets. The 3M screen earned eight-seed confirmation, now complete and inconclusive: adjusted p=0.227 and slightly negative top-decile change despite positive paired IC. Vendor standardized fiscal ends, current adjusted USD basis and the unchanged 0.01 EPS cutoff remain disclosed limitations; they do not block exploratory execution.",
+    "status": "incomplete"
+  },
+  "historical_sectors": {
+    "evidence": [
+      ".research/probes/2026-09-07-v2.json",
+      ".research/probes/sector-index-history-live-2026-09-08.json",
+      ".research/probes/sector-index-history-replay-2026-09-08.json",
+      ".research/verification/sector-history-archive.json",
+      ".research/verification/sector-history-audit.json",
+      ".research/verification/sector-history-archive-v2.json",
+      ".research/verification/sector-history-audit-v2.json",
+      ".research/verification/sector-2018-anchor-reviewed.json",
+      ".research/verification/sector-single-anchor-probe.json",
+      "docs/sector_event_reviews.json",
+      ".research/verification/sector-selection-anchor-probe.json",
+      ".research/verification/sector-selection-anchor-audit.json",
+      ".research/verification/sector-conflict-probe.json",
+      ".research/verification/sector-selection-alias-audit.json",
+      "docs/sector_security_alias_reviews.json",
+      ".research/verification/sector-host-alias-audit.json"
+    ],
+    "reason": "Ordinary dated GICS fields remain unavailable. A new sector-index membership pilot reproduces Technology and Communication Services membership across the September 2018 reclassification exactly. The full-window archive, however, exposes unavailable 2010 direct snapshots, unresolved RIC aliases, missing events and inconsistent endpoints. Financials and Utilities match both 2018 snapshots; this does not certify their complete histories. The corrected .SPLRCR identity is verified as the Real Estate sector, but its reconstructed 2018 sets disagree with the snapshots. Across all eleven sectors, six fail event consistency, three disagree with historical snapshots, and two match the two 2018 checkpoints; none has certified full-window coverage. No historical sector rows have been applied.",
+    "status": "incomplete",
+    "overlap_probe": {
+      "evidence": ".research/verification/sector-overlap-audit.json",
+      "result": "Three smaller event windows exactly match the long-window records; three current sector chains match the dated endpoint sets. These probes do not recover the missing events or resolve the contradictions."
+    },
+    "historical_anchor_audit": {
+      "artifact": ".research/verification/sector-2018-anchor-reviewed.json",
+      "status": "eleven_sectors_reconstruct_from_2018_anchor",
+      "independent_checks": "All eleven reproduce August 2018 snapshots; Industrials also matches August 31 and September 1, 2016. Early 2011/2014 single-index snapshots remain unavailable.",
+      "parent_partition_artifact": ".research/verification/sector-parent-partition-audit.json",
+      "unresolved": "Exact-RIC sector sets do not partition parent membership. August 2018 has four missing parent identifiers and five extra sector identifiers. Do not equate the Praxair and Linde instruments or collapse Host Hotels identifiers without security evidence."
+    },
+    "selection_anchor_audit": {
+      "anchor": "2023-09-29",
+      "artifact": ".research/verification/sector-host-alias-audit.json",
+      "matched_2018_checkpoints": 9,
+      "mismatched_2018_checkpoints": 1,
+      "failed_event_reconstruction": 1,
+      "status": "not_certified",
+      "alias_review": "docs/sector_security_alias_reviews.json"
+    },
+    "identity_conflicts": {
+      "praxair_linde": "LSEG returns different ISINs and CIKs for PX.N^J18 and LIN.OQ. Do not merge.",
+      "host_hotels": "Resolved at the common-stock security level: exact RIC rows share ISIN US44107P1049/CUSIP 44107P104 and issuer CIK 0000314733. Blank-RIC issuer-context rows are not mapped. Duplicate venue observations are disclosed and counted once; event streams are not deduplicated by this set operation.",
+      "booking": "Present in snapshots on both sides of March 22, 2021 despite the leaver event; contradiction remains unresolved.",
+      "evidence": ".research/verification/sector-conflict-probe.json"
+    },
+    "praxair_interval_candidate": {
+      "status": "source_corroborated_not_applied",
+      "artifact": ".research/verification/praxair-separated-interval-candidate.json",
+      "replay": ".research/verification/praxair-separated-interval-replay.json",
+      "result": "Materials matches both 2018 snapshots when predecessor and successor are separated at 2018-10-31. The scoped price/membership/terminal repair is now applied WITHOUT these sector intervals; full dated-sector reconciliation/certification remains pending."
+    }
+  },
+  "macro": {
+    "evidence": [
+      "docs/macro_research_decision.md",
+      ".research/macro-realtime-candidate-v1/summary.json",
+      ".research/verification/macro-realtime-v2-rehearsal.json",
+      ".research/verification/macro-realtime-v2-applied.json",
+      ".research/verification/macro-realtime-v2-spotcheck.json",
+      ".research/verification/macro-realtime-v2-gap-spotcheck.json",
+      ".research/verification/macro-realtime-v2-coverage.json",
+      ".research/paired-coverage-macro-2026-09-08-v1/report.json",
+      ".research/paired-coverage-praxair-macro-2026-09-08-v1/report.json",
+      ".research/paired-coverage-praxair-applied-macro-2026-09-08-v1/report.json",
+      ".research/verification/praxair-reference-postcommit-v1.json",
+      ".research/verification/macro-revision-audit.json",
+      ".research/probes/2026-09-07-news-v2.json"
+    ],
+    "reason": "BAA10Y retained by user decision on 2026-09-08; extended longer-history sourcing is conditional on initial evidence (docs/macro_research_decision.md). The calendar-backdating bug is corrected: 13,936 actual value versions (6,963 DGS10; 6,973 BAA10Y) replayed from hashed source archives and applied after an exact rollback rehearsal, with complete database readback. Eight independent single-vintage snapshots match exactly. All 13,918 legacy rows are archived for recovery; 1,869 noncolliding rows remain stored but unverified. Both series have observed revisions. Features accept only alfred_realtime_v2, delay date-only availability by one day, and honor missing-value revisions. Readiness remains incomplete pending usable paired coverage and the corrected frozen reference. Calendar starts below are observed archive dates, not certified feature start dates.",
+    "series": {
+      "credit": "BAA10Y",
+      "rates": "DGS10"
+    },
+    "status": "incomplete",
+    "observed_vintage_calendar_from": {
+      "BAA10Y": "2014-01-27",
+      "DGS10": "2005-06-28"
+    }
+  },
+  "membership": {
+    "evidence": [
+      ".research/verification/praxair-reference-applied-v1.json",
+      ".research/verification/praxair-reference-postcommit-v1.json",
+      "docs/reference_gate_progress.md",
+      ".research/reference-praxair-candidate-2026-09-08-v1/praxair-review.json",
+      ".research/verification/praxair-reference-verification-v1.json",
+      ".research/verification/membership-archive.json",
+      ".research/verification/database-post-backfill.json",
+      "docs/membership_event_reviews.json",
+      ".research/verification/membership-reconciled.json",
+      ".research/verification/identity-archive.json",
+      ".research/verification/security-mapping-candidates-v2.json",
+      ".research/verification/identity-lifecycle-archive.json",
+      ".research/verification/security-mapping-lifecycle-v2.json",
+      ".research/verification/security-mapping-resolved.json",
+      ".research/verification/database-goal-audit.json",
+      ".research/verification/missing-security-inventory.json",
+      ".research/verification/missing-prices-backfill-live.json",
+      ".research/verification/historical-registration-applied.json",
+      ".research/verification/registered-historical-actions.json",
+      ".research/verification/historical-price-coverage.json",
+      ".research/verification/registered-historical-dividends.json",
+      ".research/verification/membership-lifecycle-applied-2026-09-18-v1.json",
+      ".research/verification/mrp-membership-snapshots-2026-09-18-v1.json",
+      ".research/verification/mrp-membership-events-2026-09-19-v1.json"
+    ],
+    "reason": "RIC reconstruction yields 876 intervals over 862 RICs. A second resolution pass (scripts/map_security_identity.py, 2026-09-07) adds issuer-CIK and class-preserving stem rules plus a lifecycle check on every candidate, over 969 archived securities: 662 resolved, 87 resolved with no stored price history, 30 reuse conflicts, 10 predecessor-splice conflicts, 18 ambiguous share-class/successor cases, 162 absent from the database. The 88 securities previously unmatched only because the retired RIC carries an empty source symbol now resolve by issuer. Conflicts and ambiguities are reported, never mapped; no dated mapping has been approved or written, and existing membership is unchanged. Independent goal audit: resolved status from issuer-only or ticker-stem matching is not security identity certification; all such mappings remain review candidates. The 969 count is source records, not necessarily distinct securities. Exact-RIC grouping confirms that 162 absent source rows represent 148 RICs: 147 wholly missing securities with one ISIN each and VAL.N^H20 with contradictory absent/candidate source rows. No missing security rows have yet been created. All 147 wholly unmatched RICs now have raw unadjusted venue-level OHLCV archives (233,108 price observations) and newly registered inactive research-only ticker records with internal LSEG:RIC symbols. None is promoted to the production universe. Adjustment/dividend coverage, original filings, dated sectors and membership attachment remain incomplete; the VAL conflict remains open. Corporate-action archive retrieval completed for all 147 registered RICs, returning 241 records with no failed batches. Action/date/dividend completeness is still unverified. Exact-session price coverage audit: 131/147 archived histories cover every reconstructed membership session; 16 histories miss 30 sessions in total, including 11 for MRP before the archived first price. These dates need membership/lifecycle source review, not fabricated prices. Dividend archive retrieval completed for all 147 RICs with 2,131 rows; empty rows, currency/type, action completeness and date semantics remain under review.",
+    "status": "incomplete",
+    "praxair_predecessor_gap": {
+      "ric": "PX.N^J18",
+      "cik": "884905",
+      "status": "scoped_reference_repair_applied_sectors_pending",
+      "evidence": ".research/verification/praxair-registration-readback.json",
+      "note": "Scoped repair applied after an exact rollback rehearsal: 2223 native prices, separate membership, documented terminal handling with 252 native-successor valuations. All 4194 raw LIN prices preserved; loader uses 1971 post-boundary prices. Issuer filings/accounting facts and sector records unchanged. No staged Materials intervals applied; missing dated sectors remain unknown. Global reference gates remain incomplete.",
+      "application": ".research/verification/praxair-reference-applied-v1.json",
+      "candidate": ".research/reference-praxair-candidate-2026-09-08-v1/praxair-review.json",
+      "ticker_id": 947
+    },
+    "registered_membership_application": {
+      "date": "2026-09-18",
+      "status": "143_scoped_intervals_applied_full_reference_incomplete",
+      "applied": ".research/verification/registered-membership-applied-2026-09-18-v1.json",
+      "rehearsal": ".research/verification/registered-membership-rehearsal-2026-09-18-v1.json",
+      "preimage": ".research/verification/registered-membership-preimage-2026-09-18-v1.json.gz",
+      "registered_securities_reviewed": 147,
+      "membership_intervals_applied": 143,
+      "unrelated_intervals_preserved": 729,
+      "policy": "Exact registered RIC/ISIN checked against exact security source row; parent membership independently replayed. Sessions outside archived lifecycle block the entire security. Missing issuer CIK remains missing. Research-only scope; no price, sector or terminal records written.",
+      "initial_blocked_rics": [
+        "CVH.N^E13",
+        "DTV.OQ^G15",
+        "GR.N^G12",
+        "MRP.N"
+      ],
+      "remaining_blocked_rics": [
+        "MRP.N"
+      ],
+      "followup": {
+        "applied": ".research/verification/membership-lifecycle-applied-2026-09-18-v1.json",
+        "review": "docs/membership_lifecycle_reviews.json",
+        "additional_intervals": 3,
+        "total_registered_intervals": 146,
+        "remaining_conflict": "MRP Jan21 join/Feb10 leave reproduces in short-window events but is absent from seven direct historical constituent snapshots. Primary notice confirms Feb10 SmallCap600 addition. No guessed parent endpoint."
+      }
+    },
+    "exact_identity_audit": {
+      "artifact": ".research/verification/security-mapping-exact-2026-09-18-v2.json",
+      "requested_rics": 862,
+      "counts": {
+        "absent_from_database": 1,
+        "blocked_multiple_ric_candidates": 2,
+        "history_conflict": 12,
+        "identity_candidate_no_history": 216,
+        "identity_candidate_requires_history_review": 552,
+        "issuer_only_requires_security_review": 8,
+        "reuse_conflict": 11,
+        "symbol_only_requires_issuer_review": 60
+      },
+      "policy": "Blank-RIC issuer-context rows are not securities. Exact stored RIC or class-preserving symbol plus issuer produces review candidates only. No issuer-only mapping; collisions block. VAL exact source row is Valaris, not a match to the unrelated context issuer. Sixty symbol-only issuer discrepancies remain review items, not new securities to register."
+    }
+  },
+  "news": {
+    "evidence": [
+      ".research/probes/2026-09-07-news-v2.json",
+      ".research/probes/news-desktop-2026-09-18-v5.json",
+      ".research/verification/news-review-plan-2026-09-19-v1.json",
+      ".research/verification/news-review-fetch-2026-09-19-v2.json",
+      ".research/verification/news-review-audit-2026-09-19-v1.json"
+    ],
+    "reason": "Workspace reachable. Frozen 60-window Reuters corpus: 13 imported, two empty, 45 rejected for creation/version timestamp inversions. Raw rejected responses preserved: 2,384 rows, 581 inversions (170 crossing dates). Do not substitute timestamps without source verification. Blinded 400-story human text review package exported, 200 development/200 locked validation, all11 sectors/three eras/58 available strata; gold labels blank and predictions not generated. Sample includes quarantined text for annotation only. Timing semantics, coverage, certified sampling metadata, pinned scorer and independent human acceptance remain incomplete.",
+    "status": "incomplete",
+    "annotation_package": {
+      "directory": ".news_cache/annotation-review/review-2026-09-19-v1",
+      "human_annotations_completed": 0,
+      "scorer_predictions_generated": false,
+      "sample_sha256": "baad06ef741959e8554d4edd8534f60f14b59d0027bd93ec7aaee41a59513c50",
+      "contains_quarantined_timestamps": true
+    }
+  },
+  "price_share_basis": {
+    "classified": 264,
+    "evidence": [
+      ".research/verification/praxair-reference-applied-v1.json",
+      ".research/verification/praxair-price-components-v1.json",
+      ".research/praxair-successor-basis-v1/report.json",
+      ".research/verification/praxair-reference-verification-v1.json",
+      "docs/praxair_dividend_review.json",
+      ".research/verification/praxair-dividend-source-archived.json",
+      ".research/verification/database-post-backfill.json",
+      ".research/verification/foundations-audit.json",
+      ".research/verification/share-actions-applied.json",
+      ".research/verification/share-actions-broad-applied.json",
+      ".research/verification/database-actions-final.json",
+      ".research/verification/corporate-actions-wide.json",
+      ".research/verification/share-actions-classified-applied.json",
+      ".research/verification/database-goal-audit.json",
+      ".research/verification/historical-dividend-review.json",
+      ".research/verification/missing-prices-adjusted.json",
+      ".research/verification/vendor-adjustment-reconciliation.json",
+      ".research/normalized-historical-candidate-v2/report.json",
+      ".research/normalized-historical-candidate-v2/source-parity.json",
+      ".research/verification/original-security-price-parity.json",
+      ".research/verification/price-source-exclusions-applied.json",
+      ".research/verification/historical-embedded-cash-review.json",
+      ".research/normalized-historical-candidate-v3/report.json",
+      ".research/normalized-historical-candidate-v3/source-parity.json",
+      ".research/original-security-normalized-candidate-v2/report.json",
+      ".research/original-security-normalized-candidate-v2/source-parity.json",
+      ".research/verification/original-cash-applied-2026-09-19-v1.json",
+      ".research/verification/original-cash-components-2026-09-19-v1.json",
+      ".research/verification/historical-total-return-audit-2026-09-19-v1.json",
+      ".research/verification/cash-disagreement-lseg-archive-2026-09-19-v1.json",
+      ".research/verification/cash-disagreement-issuer-sources-2026-09-19-v1.json",
+      ".research/verification/historical-action-components-2026-09-19-v1.json",
+      ".research/verification/historical-split-primary-sources-2026-09-19-v1.json",
+      ".research/verification/historical-split-corroboration-2026-09-19-v1.json",
+      "docs/historical_split_component_reviews.json"
+    ],
+    "reason": "As-traded reconstruction agrees with LSEG across 27 sampled Apple/NVIDIA/GE dates (maximum relative error < 6e-8). 264 of 310 recorded price adjustments now carry a source-corroborated share ratio. 179 came from the earlier reviewed pull; 85 were added 2026-09-07 by scripts/classify_share_actions.py under four named rules, each recorded per event: exact date and terms (7), pricing-only distribution where every action on the date is 'LSEG Pricing Only' so the parent share count is unchanged (36, maximum price disagreement 1.2%), declared terms matching exactly with the source dating the term change one to four days before the observed price step (39), and one share-changing action combined with price-only distributions where the ratio comes solely from the share-changing record (3). Every ratio comes from declared terms or from the adjustment type; none is inferred from the observed price, which is used only as a bounded sanity check. Two defects found and fixed while doing this: near-duplicate source records differing only in numeric formatting ('1.0/9' against '1.0/9.0') squared the adjustment factor, and one ticker scoped to the same RIC twice doubled every event on a date. The 46 unresolved adjustments emit NaN and are never guessed: 10 are off-index ETFs outside the research universe, the rest are share-class, successor and multi-distribution events needing individual source review. Their only effect is a NaN market cap from the event until the next as-reported share filing, a median of 60 days; 16 do not recover, but those are ETFs, multi-class issuers whose cover-page counts are already excluded, or events in the last eight months with no later filing yet. As-traded closes are unaffected, because they are reconstructed from the price factor, which is always present. Independent goal audit: the 27-date price sample does not certify every historical security or action coverage. Classification scoping consumes issuer-only candidate mappings and needs security-level review before broad certification. The offset implementation accepted future dates; now restricted to 1-4 days before the observed step. All 85 newly applied ratios replay under the restriction; LRCX, NKTR and AMCR offsets change from 0 to -1, -4 and -1 respectively with unchanged ratios. New-history dividend parsing review identifies 145 histories without parsing conflicts and two with five unresolved in-history events (FHN four in 2010; NBR June 3 2021). NBR issuer/exchange evidence identifies a warrant distribution, not a cash dividend; valuing that consideration remains required. Empty responses do not establish zero dividends. Normalization now rejects negative/nonfinite cash amounts. Vendor capital-action-adjusted OHLCV retrieval now covers all 147 new histories (233,108 observations), with exact date alignment to raw histories. Reconciliation detects 57 price-adjustment steps across 36 securities. FHN has steps on all four missing-cash event dates; share ratios still require declared terms. NBR has no adjusted-series step for its June 2021 warrant distribution, so vendor adjustment alone cannot certify total-return completeness. COV archive shows a purported 100-for-1 term event absent from the price-adjustment series; it cannot be applied automatically.",
+    "status": "incomplete",
+    "total_adjustments": 310,
+    "unresolved": 46,
+    "historical_price_candidate": {
+      "status": "transformation_verified_source_certification_incomplete",
+      "securities": 140,
+      "rows": 212061,
+      "excluded_securities": 7,
+      "database_writes": 0,
+      "missing_price_boundaries": [
+        {
+          "ric": "SIAL.OQ^K15",
+          "date": "2015-11-18"
+        }
+      ],
+      "pending": [
+        "CCEP, FERG and WIN coincident cash and capital adjustments",
+        "ASIX and WRK interior missing prices",
+        "FHN stock distributions",
+        "NBR warrant distribution",
+        "corporate-action and cash-dividend completeness",
+        "security continuity and historical sectors"
+      ]
+    },
+    "source_exclusions_2026_09_08": {
+      "status": "applied_after_rollback_rehearsal",
+      "securities": [
+        "COL",
+        "HAR"
+      ],
+      "reason": "All 1558 COL and 1044 HAR overlapping pre-retirement prices disagree with exact-RIC native histories. Retirement truncation had retained contaminated observations.",
+      "excluded_previously_loaded_rows": 2604,
+      "frame_cache_version": 7,
+      "receipt": ".research/verification/price-source-exclusions-applied.json",
+      "cache_verification": ".research/verification/frame-cache-v7-exclusions.json",
+      "raw_database_rows_retained_at_original_exclusion": 4340,
+      "subsequent_recovery": "HAR legacy rows are now archived in the cash-recovery preimage and replaced with exact-RIC native history; COL remains excluded."
+    },
+    "embedded_cash_review_2026_09_08": {
+      "explained_historical_events": 14,
+      "rule": "Declared USD special/extra cash must explain the exact-date vendor factor within relative tolerance 1e-5, with no reported coincident capital action. Subtract only that embedded cash from the separately applied dividends; no share ratio is inferred.",
+      "new_candidate_securities": 7,
+      "source_certification": false
+    },
+    "original_security_recovery_2026_09_08": {
+      "securities": [
+        "CA",
+        "COL",
+        "HAR",
+        "HOT"
+      ],
+      "rows": 7969,
+      "status": "CA_HAR_applied_COL_HOT_still_unapplied",
+      "hot_open_issue": "Stored 2016-09-21 dividend of 0.375 is absent from the native dividend archive. Resolve exact entitlement and merger-related successor dividend treatment before valuation.",
+      "artifact": ".research/original-security-normalized-candidate-v2/report.json",
+      "application": ".research/verification/original-cash-applied-2026-09-19-v1.json"
+    },
+    "praxair_candidate": {
+      "path": ".research/praxair-normalized-candidate",
+      "rows": 2223,
+      "cash_dividends": 35,
+      "missing_sessions": 0,
+      "compressed_bytes": 63962,
+      "status": "scoped_native_price_repair_applied_global_gate_incomplete",
+      "application": ".research/verification/praxair-reference-applied-v1.json",
+      "residual_policy": "Keep source-reconstructed returns. Two residuals exist in Yahoo's adjusted series against its own components; original 1e-6 comparison tolerance unchanged. All 35 predecessor and 4 successor cash dates reviewed; bounded corporate-action inventories reviewed. No share ratios inferred from price ratios."
+    },
+    "historical_transformation_replay": {
+      "artifact": ".research/verification/historical-normalization-parity-2026-09-18-v1.json",
+      "securities": 140,
+      "rows": 212061,
+      "max_relative_return_error": 4.440892098500626e-16,
+      "status": "transformation_verified_source_completeness_pending",
+      "applied": false
+    },
+    "original_cash_recovery": {
+      "receipt": ".research/verification/original-cash-applied-2026-09-19-v1.json",
+      "native_rows": 4035,
+      "legacy_rows_archived": 2896,
+      "daily_cash_returns_compared": 4033,
+      "cash_dates": 60,
+      "postcommit_verified": true,
+      "production_cache_refreshed": false
+    },
+    "historical_total_return_audit": {
+      "artifact": ".research/verification/historical-total-return-audit-2026-09-19-v1.json",
+      "status": "component_audit_not_source_certification",
+      "counts": {
+        "cash_returns_match_source_completeness_not_certified": 102,
+        "ordinary_cash_returns_match_other_components_require_review": 34,
+        "source_disagreement_requires_review": 4
+      },
+      "compared_returns": 211864,
+      "excluded_stale_source_rows": 16,
+      "missing_native_sessions": 16,
+      "securities_with_native_gaps": 7,
+      "gap_crossings_not_compared": 11,
+      "dividend_disagreement_histories": [
+        "BNI.N^B10",
+        "KTB.N",
+        "TFCF.OQ^C19",
+        "TFCFA.OQ^C19"
+      ],
+      "policy": "Different LSEG paths only. Ordinary-day agreement is insufficient to certify noncash distributions, identity continuity or capital-event completeness. Preserve gaps and independently documented cash.",
+      "issuer_cash_corroboration": ".research/verification/cash-disagreement-issuer-sources-2026-09-19-v1.json",
+      "remaining_cash_review": "KTB and March 2010 Fox cash existence corroborated; all eighteen Fox dates and BNI conditional-cash/terminal allocation remain open."
+    },
+    "historical_action_components": {
+      "artifact": ".research/verification/historical-action-components-2026-09-19-v1.json",
+      "counts": {
+        "capital_distribution_requires_review": 26,
+        "declared_split_return_corroborated": 6,
+        "special_cash_convention_requires_review": 14
+      },
+      "declared_actions_without_exact_price_step": 16,
+      "split_primary_corroboration": ".research/verification/historical-split-corroboration-2026-09-19-v1.json",
+      "securities_with_corroborated_split_events": [
+        "BTU.N^D16",
+        "DF.N^K19",
+        "DINO.N",
+        "LO.N^F15",
+        "ODP.OQ^L25",
+        "SVU.N^J18"
+      ],
+      "full_history_certified": false,
+      "special_cash_findings": "Twelve of fourteen dates are numerically compatible with deducting special cash from prior price and reinvesting only ordinary cash. AVP and MWV instead resemble counting special cash in both paths. These are diagnostics, not authoritative TR field semantics; no best-fit convention is accepted as certification.",
+      "identity_scope": "HollyFrontier/current DINO predecessor continuity and ODP concurrent holding-company reorganization remain separate security reviews."
+    }
+  },
+  "schema": {
+    "evidence": [
+      ".research/verification/praxair-reference-applied-v1.json",
+      ".research/verification/migration-017-applied.json",
+      ".research/verification/migration-018-applied.json",
+      ".research/verification/add-ticker-rls.json",
+      ".research/verification/migration-019-applied.json",
+      ".research/verification/add-ticker-rls-migration-019.json",
+      ".research/verification/add-ticker-rls-price-upsert.json",
+      ".research/verification/price-source-exclusions-applied.json"
+    ],
+    "reason": "Migrations 017, 018, 019 and 020 applied. Additive migration 021 and source exclusions applied after rollback rehearsal on 2026-09-08; raw prices remain unchanged and excluded sources do not reach frames. RLS remains enabled on seven research tables; add-ticker DB integration passed again after 019. Price adjustments and share-count ratios are stored separately.",
+    "status": "verified"
+  },
+  "terminal_outcomes": {
+    "praxair_applied": {
+      "artifact": ".research/verification/praxair-reference-applied-v1.json",
+      "exact_native_successor_valuations": 252,
+      "restored_daily_terminal_labels": {
+        "1M": 21,
+        "3M": 63,
+        "6M": 126,
+        "1Y": 252
+      },
+      "note": "Scoped documented outcome applied; wider universe terminal coverage remains incomplete."
+    },
+    "census": {
+      "documented": 1,
+      "early_ending_series": 17,
+      "needs_documented_proceeds": 6,
+      "reuse_tails": 4,
+      "stale_ingestion": 5
+    },
+    "evidence": [
+      ".research/reference-praxair-candidate-2026-09-08-v1/praxair-review.json",
+      ".research/verification/praxair-reference-verification-v1.json",
+      ".research/verification/database-post-backfill.json",
+      "docs/terminal_event_reviews.json",
+      ".research/verification/terminal-events-applied.json",
+      ".research/verification/security-mapping-lifecycle-v2.json",
+      ".research/verification/security-mapping-resolved.json",
+      ".research/verification/security-retirement-applied.json",
+      ".research/verification/database-goal-audit.json",
+      ".research/verification/terminal-price-bases.json",
+      ".research/verification/successor-label-preview.json",
+      ".research/verification/successor-events-applied.json",
+      ".research/verification/historical-pricing-service.json",
+      ".research/verification/successor-events-three-applied.json",
+      ".research/verification/andv-unresolved-applied.json",
+      ".research/verification/membership-lifecycle-applied-2026-09-18-v1.json",
+      "docs/membership_lifecycle_reviews.json",
+      "docs/original_cash_outcome_reviews.json",
+      ".research/verification/original-cash-sources-2026-09-19-v1.json",
+      ".research/verification/original-cash-candidate-2026-09-19-v1.json",
+      ".research/verification/original-cash-applied-2026-09-19-v1.json"
+    ],
+    "needs_proceeds": [
+      "ANDV"
+    ],
+    "reason": "Seven terminal classifications are now applied: EVHC documented cash; SCG, ESRX, AET, TWX and BMS documented successor consideration; ANDV a documented acquisition with unresolved election/proration and null payoff. The five successor deals have exact horizon values and live stored-label replay. ANDV has independently corroborated final nominal price, verified source identity, and live exclusion counts matching a rollback rehearsal; no approximate proration was converted to an observed return. The original six-acquisition list is now handled through five valued outcomes and one explicitly unknown outcome, as permitted by the plan. This does not certify terminal coverage for the expanded historical universe or resolve HOT/COL original-security outcomes; CA/HAR are now recovered with documented cash consideration. Retirement truncation is strict, and cache version 6 rejects stale pre-fix frames. Full historical reference readiness remains incomplete.",
+    "status": "incomplete",
+    "andv_handling": {
+      "status": "classified_acquisition_unknown_payoff",
+      "artifact": ".research/verification/andv-unresolved-applied.json",
+      "acquisition_excluded_daily_labels": {
+        "3M": 63,
+        "6M": 126,
+        "1Y": 252
+      },
+      "post_terminal_entries_excluded_per_horizon": 1,
+      "payoff_imputed": false
+    },
+    "lifecycle_repairs": {
+      "receipt": ".research/verification/membership-lifecycle-applied-2026-09-18-v1.json",
+      "cash_verified": [
+        "GR.N^G12"
+      ],
+      "successor_payoff_masked": [
+        "CVH.N^E13",
+        "DTV.OQ^G15"
+      ],
+      "cash_outcomes": 1,
+      "unknown_outcomes": 2,
+      "prices_written": 0,
+      "label_census": "Each 1M/3M/6M/1Y has 21/63/126/252 terminal-crossing candidate rows. GR observed; CVH/DTV masked. Candidate prices still unapplied."
+    },
+    "original_cash_candidates": {
+      "status": "applied_with_native_histories_after_exact_rollback",
+      "CA": 44.5,
+      "HAR": 112.0,
+      "receipt": ".research/verification/original-cash-candidate-2026-09-19-v1.json",
+      "policy": "Native histories and cash outcomes are applied and read back; wider terminal coverage remains incomplete.",
+      "ca_boundary": "Issuer8-K states halt before Nov5 2018 opening; last native trade Nov2. Nov6 Nasdaq administrative suspension is separate.",
+      "application": ".research/verification/original-cash-applied-2026-09-19-v1.json",
+      "live_labels_each": {
+        "1M": 21,
+        "3M": 63,
+        "6M": 126,
+        "1Y": 252
+      }
+    }
+  },
+  "universe": {
+    "evidence": [
+      ".research/verification/local-research-database-2026-09-18-v1.json"
+    ],
+    "reason": "Dedicated Docker PostgreSQL15.15 at 127.0.0.1:55432/stock_research initialized through migration022 with separate caches. Empty research database; no production user data copied. Historical sectors, corrected SPX reference, and expanded-universe ingestion remain pending.",
+    "status": "incomplete"
+  },
+  "prior_praxair_reference_audit": {
+    "status": "scoped_praxair_repair_verified_shared_reference_incomplete",
+    "postcommit_receipt": ".research/verification/praxair-reference-postcommit-v1.json",
+    "research_snapshot": ".research/reference-praxair-applied-research-2026-09-08-v1",
+    "production_snapshot": ".research/reference-praxair-applied-production-2026-09-08-v1",
+    "frame_cache_version": 8,
+    "paired_stress": ".research/paired-coverage-praxair-applied-stress-2026-09-08-v1/report.json",
+    "paired_macro": ".research/paired-coverage-praxair-applied-macro-2026-09-08-v1/report.json",
+    "paired_test_rows_each": 48673,
+    "eligible_folds_each": 107,
+    "unknown_sector_test_rows_each": 51,
+    "missing_size_test_rows_each": 2300,
+    "backend_tests_passed": 463,
+    "model_fits": 0
+  },
+  "prior_registered_membership_snapshot": {
+    "status": "scoped_membership_application_verified_shared_reference_incomplete",
+    "date": "2026-09-18",
+    "research_snapshot": ".research/reference-membership-applied-research-2026-09-18-v1",
+    "postcommit_receipt": ".research/verification/registered-membership-applied-2026-09-18-v1.json",
+    "snapshot_verification": ".research/verification/registered-membership-snapshot-verification-2026-09-18-v1.json",
+    "research_frames": 878,
+    "membership_intervals": 872,
+    "existing_intervals_preserved": 729,
+    "registered_membership_intervals_applied": 143,
+    "registered_securities_without_prices": 147,
+    "input_sha256": "fae84cce2085d92d5d571d491b2a6054ad308f8c94b02d0833e0a86dc0f0426a",
+    "backend_tests_passed": 484,
+    "postformat_targeted_tests_passed": 35,
+    "model_fits": 0,
+    "production_cache_refreshed": false,
+    "note": "Earlier paired-coverage results remain tied to their earlier snapshots; no fresh paired-performance claim."
+  },
+  "prior_lifecycle_reference_audit": {
+    "date": "2026-09-19",
+    "status": "scoped_lifecycle_application_verified_shared_reference_incomplete",
+    "postcommit_receipt": ".research/verification/membership-lifecycle-applied-2026-09-18-v1.json",
+    "membership_intervals": 875,
+    "terminal_events": 11,
+    "registered_membership_intervals_applied_total": 146,
+    "registered_securities_without_prices": 147,
+    "fresh_snapshot_after_lifecycle_application": false,
+    "model_fits": 0,
+    "production_cache_refreshed": false,
+    "note": "The prior 878-frame/872-interval snapshot predates the three lifecycle repairs. Terminal label census uses unapplied normalized prices and does not certify those histories."
+  },
+  "exploratory_execution": {
+    "policy": "docs/experiment_gate_status.md",
+    "status": "five_screens_and_one_confirmation_complete_no_supported_improvement",
+    "snapshot": ".research/exploratory-reference-2026-09-19-v2",
+    "input_sha256": "dd5c443d45d244e946f230f957380fe945e8fbbccf1593f325bb70abfc910eda",
+    "output": ".research/experiments-2026-09-19-v2/exploratory",
+    "source_certification_required": false,
+    "source_statuses_relabelled": false,
+    "usable_coverage_target": 0.95,
+    "combined_packs_frozen_before_results": [
+      "stress",
+      "macro"
+    ],
+    "production_promotion": false,
+    "usable_coverage_acceptable_reference": 0.9,
+    "coverage_is_exploratory_reporting_not_certification": true,
+    "prior_preflight": "v1 stopped before fitting; provisional database intervals overcounted SPX cohort",
+    "stress_result": ".research/experiments-2026-09-19-v2/exploratory/stress/screening/result.json",
+    "stress_delta_sector_ic": -0.005548727453827341,
+    "stress_confirmation_earned": false,
+    "usable_coverage_observed": 0.869582136569999,
+    "macro_delta_sector_ic": 0.0016651112602671168,
+    "macro_confirmation_earned": false,
+    "combined_delta_sector_ic": 0.00019032574289248687,
+    "combined_confirmation_earned": false,
+    "summary": ".research/experiments-2026-09-19-v2/exploratory/completed_screens-v2.json",
+    "results": {
+      "stress": {
+        "horizon": "6M",
+        "delta_sector_ic": -0.005548727453827341,
+        "ci_low": -0.023014804462074517,
+        "ci_high": 0.007158037463805803,
+        "folds": 107,
+        "paired_rows": 46927,
+        "intended_rows": 53965,
+        "usable_coverage": 0.869582136569999,
+        "confirmation_earned": false,
+        "input_sha256": "dd5c443d45d244e946f230f957380fe945e8fbbccf1593f325bb70abfc910eda",
+        "code": {
+          "implementation_sha256": "74a49861843a211b3a8de62c42ab03b2e9a12a399534f1de599c508cde3be13d",
+          "revision": "97a2d0042a8a0e5b5aebb8ef1578213bb8dae75e"
+        },
+        "exploratory": true
+      },
+      "macro": {
+        "horizon": "6M",
+        "delta_sector_ic": 0.0016651112602671168,
+        "ci_low": -0.010356753789923382,
+        "ci_high": 0.015171824539806433,
+        "folds": 107,
+        "paired_rows": 46927,
+        "intended_rows": 53965,
+        "usable_coverage": 0.869582136569999,
+        "confirmation_earned": false,
+        "input_sha256": "dd5c443d45d244e946f230f957380fe945e8fbbccf1593f325bb70abfc910eda",
+        "code": {
+          "implementation_sha256": "74a49861843a211b3a8de62c42ab03b2e9a12a399534f1de599c508cde3be13d",
+          "revision": "97a2d0042a8a0e5b5aebb8ef1578213bb8dae75e"
+        },
+        "exploratory": true
+      },
+      "accounting": {
+        "horizon": "1Y",
+        "delta_sector_ic": -0.016339908463789556,
+        "ci_low": -0.05175898666314659,
+        "ci_high": 0.00524345764435549,
+        "folds": 95,
+        "paired_rows": 41672,
+        "intended_rows": 47936,
+        "usable_coverage": 0.8693257676902537,
+        "confirmation_earned": false,
+        "input_sha256": "dd5c443d45d244e946f230f957380fe945e8fbbccf1593f325bb70abfc910eda",
+        "code": {
+          "implementation_sha256": "0aa8dbdced43f192b73c10442a39eba0b5b895196a3dc42e8645f254ffd8757b",
+          "revision": "97a2d0042a8a0e5b5aebb8ef1578213bb8dae75e"
+        },
+        "exploratory": true
+      },
+      "combined": {
+        "horizon": "6M",
+        "delta_sector_ic": 0.00019032574289248687,
+        "ci_low": -0.019543065640985416,
+        "ci_high": 0.01768734827231659,
+        "folds": 107,
+        "paired_rows": 46927,
+        "intended_rows": 53965,
+        "usable_coverage": 0.869582136569999,
+        "confirmation_earned": false,
+        "input_sha256": "dd5c443d45d244e946f230f957380fe945e8fbbccf1593f325bb70abfc910eda",
+        "code": {
+          "implementation_sha256": "0aa8dbdced43f192b73c10442a39eba0b5b895196a3dc42e8645f254ffd8757b",
+          "revision": "97a2d0042a8a0e5b5aebb8ef1578213bb8dae75e"
+        },
+        "exploratory": true
+      },
+      "analyst": {
+        "horizon": "3M",
+        "delta_sector_ic": 0.007169351204922905,
+        "ci_low": 0.0013868500937672238,
+        "ci_high": 0.013445773478100116,
+        "folds": 113,
+        "paired_rows": 49588,
+        "intended_rows": 56977,
+        "usable_coverage": 0.8703160924583604,
+        "confirmation_earned": true,
+        "input_sha256": "0f1ce8c6f5e93c361643b64cc2bd1765328bc0e63439d202dbfffc1acbf7c94d",
+        "code": {
+          "implementation_sha256": "383fcd2d6a23dc41463e0d786c612686dc9ab9fbad5f1ca2289b536c7d5b6d30",
+          "revision": "97a2d0042a8a0e5b5aebb8ef1578213bb8dae75e"
+        },
+        "exploratory": true,
+        "confirmation": {
+          "delta_sector_ic": 0.004595541751320199,
+          "ci_low": 0.0004588271771311834,
+          "ci_high": 0.008810512038458843,
+          "adjusted_p": 0.2274772522747725,
+          "size_neutral_delta": 0.004154192698094184,
+          "top_decile_delta": -0.00041032285102717263,
+          "numeric_verdict": "inconclusive",
+          "interpretation": "exploratory_only",
+          "n_seeds": 8
+        }
+      }
+    },
+    "running_processes": 0,
+    "analyst_execution": {
+      "status": "screen_passed_confirmation_inconclusive",
+      "snapshot": ".research/exploratory-analyst-2026-09-19-v1",
+      "input_sha256": "0f1ce8c6f5e93c361643b64cc2bd1765328bc0e63439d202dbfffc1acbf7c94d",
+      "observations": 204062,
+      "securities": 796,
+      "source_certified": false,
+      "screen_delta_sector_ic": 0.007169351204922905,
+      "screen_ci_low": 0.0013868500937672238,
+      "screen_ci_high": 0.013445773478100116,
+      "usable_coverage": 0.8703160924583604,
+      "confirmation_earned": true,
+      "confirmation": {
+        "delta_sector_ic": 0.004595541751320199,
+        "ci_low": 0.0004588271771311834,
+        "ci_high": 0.008810512038458843,
+        "adjusted_p": 0.2274772522747725,
+        "size_neutral_delta": 0.004154192698094184,
+        "top_decile_delta": -0.00041032285102717263,
+        "numeric_verdict": "inconclusive",
+        "interpretation": "exploratory_only",
+        "n_seeds": 8
+      }
+    }
+  }
+}

@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
+from datetime import date
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -56,12 +57,19 @@ from backend.ml.factors import (  # noqa: F401
     EARNINGS_REACTION_FEATURES,
     EPS_DISPERSION_FEATURES,
     EPS_SURPRISE_FEATURES,
+    ESTIMATE_MISSING_FEATURES,
+    ESTIMATE_SOURCED_FEATURES,
+    ANALYST_BREADTH_FEATURES,
+    ISSUANCE_FEATURES,
+    PAYOUT_FEATURES,
+    RANGE_VOL_FEATURES,
     ESTIMATE_SURPRISE_FEATURES,
     EXPERIMENTAL_FEATURES,
     FEATURE_COLS,
     FORWARD_VALUATION_FEATURES,
     FUNDAMENTAL_FEATURES,
     FUNDAMENTAL_MISSING_FEATURES,
+    FUNDAMENTAL_SOURCED_FEATURES,
     INDUSTRY_RELATIVE_FEATURES,
     INSIDER_FEATURES,
     KNIFE_FEATURES,
@@ -96,10 +104,27 @@ from backend.ml.model import HORIZONS
 
 @dataclass
 class LGBMConfig:
-    """Deliberately shallow + regularized: cross-sectional return signal is weak,
-    so the baseline should resist memorizing the train cross-sections."""
+    """Shallow + heavily regularized: cross-sectional return signal is weak, so the
+    model has to be stopped from memorizing the training cross-sections.
 
-    n_estimators: int = 300
+    That was always the intent, but it was never checked. `--fit-diagnostics`
+    (2026-09-06) measured in-sample SECB of +0.30/+0.24/+0.24 against out-of-sample
+    +0.004/-0.009/-0.009 — the model WAS memorizing, comprehensively. Two changes
+    followed, each passing its own pre-written criterion:
+
+      n_estimators 300 -> 150     the IC-vs-trees curve peaked at 200/50/100 by
+                                  horizon; 150 is the pooled peak and the only
+                                  candidate weakly better at EVERY horizon.
+      min_child_samples per H     see `overlap_aware_cfg` — 50 was calibrated against
+                                  the raw row count, which overlapping labels inflate.
+
+    Together they lifted SECB at all three horizons (3M +0.0037 -> +0.0069, 6M
+    -0.0034 -> +0.0037, 1Y -0.0111 -> -0.0047) and cut the 3M in-sample/out-of-sample
+    gap from +0.295 to +0.218. All still far below the detection floors — this bought
+    a better-specified model, not edge.
+    """
+
+    n_estimators: int = 150
     learning_rate: float = 0.03
     num_leaves: int = 15
     max_depth: int = 4
@@ -174,6 +199,27 @@ class HorizonSpec:
     # don't dominate the L2 split; scoring stays on unclipped realized returns. Only
     # valid for return-like target modes (asserted at fit time).
     winsorize_pct: float = 0.0
+    # Shrink ranks toward 0.5 on point-in-time high-vol dates. Only meaningful when
+    # smooth_span > 0 — see vol_gate_ranks for why it is inert on its own.
+    vol_gate: bool = False
+
+
+# Overlapping labels: a 6M row's label spans six months, so consecutive monthly rows
+# share five-sixths of their outcome window. The effective sample size is roughly
+# rows / H_months, meaning a leaf holding 50 raw rows holds only ~50/H INDEPENDENT
+# observations. `min_child_samples = 50` was calibrated against the raw count, so the
+# model was regularized against a sample it does not have — the overlap was corrected
+# in the metric (block bootstrap) but never in the fit. Scaling the leaf minimum by the
+# horizon restores the intended ~50 effective observations per leaf.
+_MIN_CHILD_SAMPLES_PER_EFFECTIVE_OBS = 50
+
+
+def overlap_aware_cfg(horizon: str, **kwargs) -> LGBMConfig:
+    """LGBMConfig whose leaf minimum counts EFFECTIVE, not raw, observations."""
+    months = max(1, round(HORIZON_TRADING_DAYS[horizon] / 21))
+    return LGBMConfig(
+        min_child_samples=_MIN_CHILD_SAMPLES_PER_EFFECTIVE_OBS * months, **kwargs
+    )
 
 
 # Per-horizon production training defaults. Update this dict — and only this dict
@@ -253,14 +299,17 @@ _BASELINE_PLUS_REVMOM = FEATURE_COLS + REVISION_MOMENTUM_FEATURES
 #     (6M rolling-60, 1Y smooth_span=4) compose unchanged — they act on the ranker's
 #     percentile ranks (monotone-invariant). Inference needs ZERO changes: fit_lgbm_model
 #     branches on lgb_cfg.objective, LGBMRanker.predict has the same signature.
-_LAMBDARANK_CFG = LGBMConfig(objective="lambdarank", lambdarank_truncation_level=100)
+_RANKER_KW = {"objective": "lambdarank", "lambdarank_truncation_level": 100}
 PRODUCTION_HORIZON_SPECS: dict[str, HorizonSpec] = {
     "1M": HorizonSpec(target_mode="rank"),
-    "3M": HorizonSpec(target_mode="sector_return", feature_cols=_BASELINE_PLUS_REVMOM,
+    "3M": HorizonSpec(target_mode="sector_return", lgb_cfg=overlap_aware_cfg("3M"),
+                      feature_cols=_BASELINE_PLUS_REVMOM,
                       smooth_span=3, knife_lambda=0.20),
-    "6M": HorizonSpec(target_mode="sector_grade", lgb_cfg=_LAMBDARANK_CFG,
+    "6M": HorizonSpec(target_mode="sector_grade",
+                      lgb_cfg=overlap_aware_cfg("6M", **_RANKER_KW),
                       feature_cols=_BASELINE_PLUS_SURPRISE, max_train_months=60),
-    "1Y": HorizonSpec(target_mode="sector_grade", lgb_cfg=_LAMBDARANK_CFG,
+    "1Y": HorizonSpec(target_mode="sector_grade",
+                      lgb_cfg=overlap_aware_cfg("1Y", **_RANKER_KW),
                       feature_cols=_BASELINE_PLUS_SURPRISE, smooth_span=4),
 }
 
@@ -275,6 +324,8 @@ def assemble_panel(
     grid: list,
     max_stale_days: int = 7,
     market_returns: dict | None = None,
+    allow_provisional_estimates: bool = False,
+    allow_provisional_news: bool = False,
 ):
     """Stack every ticker's rows into one tidy panel DataFrame (raw features)."""
     import pandas as pd
@@ -287,6 +338,8 @@ def assemble_panel(
                 grid,
                 max_stale_days=max_stale_days,
                 market_returns=market_returns,
+                allow_provisional_estimates=allow_provisional_estimates,
+                allow_provisional_news=allow_provisional_news,
             )
         )
     return pd.DataFrame(rows)
@@ -339,22 +392,56 @@ def rank_normalize_features(
     *,
     industry_relative: bool = False,
     min_group_size: int = 5,
+    exempt_ids: set | None = None,
 ):
     """Map each feature to its within-date cross-sectional rank in [-1, 1].
 
     Point-in-time safe (only same-date rows) and robust to the heavy tails in raw
     factor values. Single-name (or empty) dates collapse to 0.
+
+    MISSING VALUES STAY MISSING: a NaN feature is not ranked, so LightGBM routes it
+    natively instead of the old sentinel 0.0 landing at a real cross-sectional
+    position (see FUNDAMENTAL_SOURCED_FEATURES in factors/constants.py). The rank
+    denominator is the count of OBSERVED values on that date.
+
+    `exempt_ids` (production only) are names that must not DEFINE the distribution —
+    user-added off-index tickers, which include leveraged and thematic ETFs whose
+    momentum/vol would distort every index name's rank. They are still scored: their
+    own value is placed against the member distribution. The walk-forward never
+    passes this, so evaluation is unchanged.
     """
     out = panel.copy()
     g = out.groupby("date")
+    exempt = (
+        out["ticker_id"].isin(exempt_ids)
+        if exempt_ids and "ticker_id" in out.columns
+        else None
+    )
 
     def _norm(rank_s, count_s):
         denom = (count_s - 1).clip(lower=1)
-        return np.where(count_s > 1, (rank_s - 1) / denom * 2 - 1, 0.0)
+        scaled = (rank_s - 1) / denom * 2 - 1
+        return np.where(
+            np.isnan(np.asarray(rank_s, dtype=float)),
+            np.nan,
+            np.where(count_s > 1, scaled, 0.0),
+        )
 
     for c in cols:
-        r = g[c].rank(method="average")
-        n = g[c].transform("count")
+        if exempt is None or not bool(exempt.any()):
+            r = g[c].rank(method="average")
+            n = g[c].transform("count")
+        else:
+            # Members define the scale: rank them among themselves.
+            gm = out.assign(_m=out[c].where(~exempt)).groupby("date")["_m"]
+            r_mem, n = gm.rank(method="average"), gm.transform("count")
+            # An exempt row's position among members = (its rank among ALL rows)
+            # − (its rank among exempt rows): both count values at or below it, so
+            # the difference is the member count below it. Exact up to average-tie
+            # adjustment; clipped into [1, n_members] to share the member scale.
+            ge = out.assign(_e=out[c].where(exempt)).groupby("date")["_e"]
+            pos = (g[c].rank(method="average") - ge.rank(method="average")).clip(lower=1.0)
+            r = r_mem.where(~exempt, np.minimum(pos, n.clip(lower=1)))
         out[c] = _norm(r, n)
         if not industry_relative or c not in INDUSTRY_RELATIVE_FEATURES:
             continue
@@ -458,14 +545,24 @@ def apply_target_modes(
         # Since `valid` is already universe-demeaned, subtracting the within-
         # (date, sector) median of `valid` is mathematically identical to
         # subtracting the within-sector median of the raw returns — the cancel
-        # eats the universe median. Groups below the size threshold fall back
-        # to the universe-demeaned target.
-        if has_sector:
+        # eats the universe median.
+        #
+        # Rows whose sector is missing or too thin emit NaN and are DROPPED at fit
+        # time. They used to fall back to the universe-demeaned return, which pooled
+        # a differently-defined label into the same fit while `within_sector_ic`
+        # (min_group_size=10) excluded those very rows from the metric — the model
+        # was trained on a cohort it was never scored on. Making the target undefined
+        # aligns the two.
+        # A panel carrying NO sector labels at all has no sector dimension to be
+        # relative to, so it degrades to the universe-demeaned target rather than an
+        # all-NaN (untrainable) one. That is the `has_sector` guard's original job and
+        # it still applies to direct callers and to inference before migration 015.
+        if has_sector and out["sector"].notna().any():
             sec_grp = valid.groupby([out["date"], out["sector"]])
             sec_med = sec_grp.transform("median")
             sec_count = sec_grp.transform("count")
             use_sector = out["sector"].notna() & (sec_count >= sector_min_group_size)
-            out[f"y_{h}_sector_return"] = np.where(use_sector, valid - sec_med, valid)
+            out[f"y_{h}_sector_return"] = np.where(use_sector, valid - sec_med, np.nan)
         else:
             out[f"y_{h}_sector_return"] = valid
 
@@ -478,6 +575,16 @@ def apply_target_modes(
         # are dropped at fit time exactly like the other precomputed targets.
         sec_ret = pd.Series(out[f"y_{h}_sector_return"], index=out.index)
         sec_ret = sec_ret.where(out[m].astype(bool))  # NaN outside the horizon mask
+
+        # --- Sector-relative RANK target (Cakici-Zaremba 2025) ---
+        # Per-date percentile of the sector-relative return, in (0, 1]. Their finding
+        # is that TARGET preprocessing dominates feature preprocessing, that rank
+        # targets roughly triple predictive accuracy versus raw returns, and — the
+        # part that matters here — that the edge is specifically a LARGE-CAP
+        # phenomenon which reverses in micro caps. It is the continuous sibling of
+        # `sector_grade`: same ordering information, no qcut discretization, and it
+        # keeps an L2 fit (no ranker, so no 14x compute).
+        out[f"y_{h}_sector_rank"] = sec_ret.groupby(out["date"]).rank(pct=True)
 
         def _grade_bucket(s):
             if s.notna().sum() < n_grades:
@@ -548,17 +655,38 @@ def prepare_panel(
     industry_relative: bool = False,
     min_group_size: int = 5,
     n_grades: int = 5,
+    membership_filter: bool = False,
+    membership_exempt_ids: set | None = None,
+    log=lambda *_: None,
+    macro=None,
+    market_returns_override=None,
+    allow_provisional_estimates=False,
+    allow_provisional_news=False,
 ):
-    """Full pipeline: assemble → demean target → rank-normalize features → targets."""
-    market_returns = build_universe_return_map(frames)
+    """Full pipeline: assemble → demean target → rank-normalize features → targets.
+
+    `membership_filter` drops (date, ticker) rows where the ticker was not an index
+    member on that date. It runs BEFORE normalization on purpose: the per-date
+    feature ranks must be computed over the universe that actually existed, not one
+    padded with names the index had not yet promoted. `membership_exempt_ids` keeps
+    rows that never have membership by design (user-added off-index tickers).
+    """
+    market_returns = (market_returns_override if market_returns_override is not None
+                      else build_universe_return_map(frames))
     panel = assemble_panel(
         frames,
         grid,
         max_stale_days=max_stale_days,
         market_returns=market_returns,
+        allow_provisional_estimates=allow_provisional_estimates,
+        allow_provisional_news=allow_provisional_news,
     )
     if panel.empty:
         return panel
+    if membership_filter:
+        panel = apply_membership_filter(panel, membership_exempt_ids, log=log)
+        if panel.empty:
+            return panel
     medians = cross_sectional_medians(frames)
     panel = demean_cross_sectional(panel, medians)
     panel = add_industry_neutral_momentum(panel, min_group_size=min_group_size)
@@ -568,16 +696,30 @@ def prepare_panel(
     # knife_score is computed post-normalization from the [-1,1] inputs and is
     # already [0,1] within-date — exclude it from the normalization step.
     base_cols = rank_cols or FEATURE_COLS
-    norm_cols = [c for c in base_cols if c != "knife_score"]
+    from backend.ml.factors.long_horizon import MACRO_FEATURES, STRESS_FEATURES, TRANSFORMS
+    norm_cols = [c for c in base_cols if c != "knife_score" and c not in TRANSFORMS]
     panel = rank_normalize_features(
         panel,
         cols=norm_cols,
         industry_relative=industry_relative,
         min_group_size=min_group_size,
+        # Off-index names ride along in the panel (membership_exempt_ids) so they can
+        # be scored, but they must not shift the index cross-section's ranks.
+        exempt_ids=membership_exempt_ids,
     )
     # Add knife_score if requested (knife_score in base_cols means --with-knife-feature).
     if "knife_score" in base_cols:
         panel = add_knife_score_feature(panel)
+    if set(base_cols) & set(STRESS_FEATURES):
+        medians = panel.groupby("date")["vol_120d_raw"].median().sort_index()
+        flags = dict(zip(medians.index, vol_gate_flags(medians.tolist()), strict=True))
+        for col, momentum in zip(STRESS_FEATURES, ("mom_3m", "mom_12_1"), strict=True):
+            panel[col] = panel["date"].map(flags).astype(float) * panel[momentum]
+    if set(base_cols) & set(MACRO_FEATURES):
+        from backend.ml.factors.long_horizon import add_macro_features
+        if macro is None:
+            raise ValueError("macro features require a versioned macro snapshot")
+        panel = add_macro_features(panel, frames, macro, market_returns)
     market_horizon_returns = build_market_horizon_returns(market_returns, grid)
     panel = apply_target_modes(
         panel, n_buckets, market_horizon_returns=market_horizon_returns,
@@ -591,6 +733,38 @@ def prepare_panel(
 # =============================================================
 
 
+def apply_membership_filter(panel, exempt_ids: set | None = None, log=lambda *_: None):
+    """Keep only rows where the ticker was an index member on the row's date.
+
+    Without this the cross-sections are padded with names the index promoted LATER,
+    which selects on future success — the mirror image of survivorship bias. Rows
+    for `exempt_ids` (user-added off-index tickers) are kept: they are scored, never
+    trained on, and are excluded from training separately.
+
+    Raises if membership was never loaded, rather than silently emptying the panel.
+    Panels built by hand in tests have no `in_index` column and pass through.
+    """
+    if "in_index" not in panel.columns:
+        return panel
+
+    in_index = panel["in_index"]
+    if in_index.isna().all():
+        raise RuntimeError(
+            "membership filter requested but no index_membership data is loaded — "
+            "apply migration 012, run scripts.seed_index_membership, and rebuild the "
+            "frame cache with --refresh-cache"
+        )
+
+    # `in_index` is object dtype (True/False/None), so compare explicitly rather
+    # than fillna+astype, which pandas is deprecating for object columns.
+    keep = in_index.eq(True)
+    if exempt_ids:
+        keep = keep | panel["ticker_id"].isin(exempt_ids)
+    dropped = int((~keep).sum())
+    log(f"membership filter: kept {int(keep.sum()):,} rows, dropped {dropped:,}")
+    return panel[keep].reset_index(drop=True)
+
+
 def walk_forward_folds(grid_dates: list, min_train_months: int, embargo_steps: int):
     """Yield (test_date, train_cutoff_date) for an expanding-window sweep.
 
@@ -602,6 +776,30 @@ def walk_forward_folds(grid_dates: list, min_train_months: int, embargo_steps: i
     for i in range(min_train_months + embargo_steps, len(grid_dates)):
         folds.append((grid_dates[i], grid_dates[i - embargo_steps]))
     return folds
+
+
+def select_walk_forward_samples(panel, horizon, target_mode, test_date, cutoff,
+                                wf_cfg, label_realized_before=None, eval_index_ids=None):
+    """Shared pre-fit selection for the actual runner and coverage audits."""
+    mask, target = f'mask_{horizon}', _target_col(horizon, target_mode)
+    end, entry = f'label_end_{horizon}', f'entry_{horizon}'
+    train = panel[(panel['date'] <= cutoff) & panel[mask] & panel[target].notna()]
+    if end in train:
+        train = train[train[end].notna() & (train[end] < test_date)]
+    if wf_cfg.max_train_months is not None:
+        train_dates = sorted(train['date'].unique())
+        if len(train_dates) > wf_cfg.max_train_months:
+            train = train[train['date'] >= train_dates[-wf_cfg.max_train_months]]
+    test = panel[(panel['date'] == test_date) & panel[mask]]
+    if label_realized_before is not None:
+        if end not in test:
+            raise ValueError('actual label dates required for research selection')
+        test = test[test[end].notna() & (test[end] < label_realized_before)]
+    if eval_index_ids is not None:
+        test = test[test['index_id'].isin(eval_index_ids)]
+    if entry in test and (test[entry] <= test['date']).any():
+        raise ValueError('entry must follow the feature cutoff')
+    return train, test
 
 
 def fit_lgbm_model(
@@ -718,13 +916,47 @@ def fit_linear_model(
     from sklearn.linear_model import Ridge
 
     cols = feature_cols if feature_cols is not None else FEATURE_COLS
-    X = train_df[cols].to_numpy(dtype=float)
+    # Ridge has no native missing-value handling (LightGBM does). Features are
+    # within-date ranks in [-1, 1], so 0.0 is the neutral mid-rank — the least
+    # informative fill available and the one that keeps the design matrix finite.
+    X = np.nan_to_num(train_df[cols].to_numpy(dtype=float), nan=0.0)
     y = train_df[target_col].to_numpy(dtype=float)
     if shuffle:  # same no-signal null as the GBDT path
         y = y[np.random.default_rng(seed).permutation(len(y))]
     model = Ridge(alpha=alpha)
     model.fit(X, y)
     return model
+
+
+def forecast_combination_predict(
+    train_df, test_df, target_col: str, feature_cols: list[str] | None = None
+) -> np.ndarray:
+    """Equal-weight combination of per-feature univariate forecasts.
+
+    The canonical low-signal-to-noise benchmark: give each characteristic one vote,
+    signed by its association with the target in the TRAINING window only, and average.
+    There is nothing to overfit but N signs. Han-He-Rapach-Zhou (Review of Finance
+    2024) find exactly this kind of regularized-linear + forecast-combination scheme
+    beats random forests and deep nets on US cross-sectional out-of-sample accuracy,
+    so a GBDT that cannot clear it is buying complexity risk and nothing else.
+
+    Features arrive already mapped to within-date ranks in [-1, 1], so they are on a
+    common scale and can be averaged directly. NaN (source absent) contributes
+    nothing rather than a fabricated mid-rank.
+    """
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    y = train_df[target_col]
+    total = np.zeros(len(test_df), dtype=float)
+    used = np.zeros(len(test_df), dtype=float)
+    for c in cols:
+        rho = train_df[c].corr(y, method="spearman")
+        if rho != rho or rho == 0:
+            continue
+        col = test_df[c].to_numpy(dtype=float)
+        ok = np.isfinite(col)
+        total[ok] += float(np.sign(rho)) * col[ok]
+        used[ok] += 1.0
+    return np.divide(total, used, out=np.zeros_like(total), where=used > 0)
 
 
 def _rank01(a: np.ndarray) -> np.ndarray:
@@ -756,6 +988,50 @@ def blend_gbdt_linear(
     return (1.0 - weight) * _rank01(gbdt_pred) + weight * _rank01(linear_pred)
 
 
+def _fit_models(
+    train_df,
+    target_col: str,
+    cfg: LGBMConfig,
+    seed: int,
+    shuffle: bool,
+    feature_cols: list[str] | None = None,
+    n_seeds: int = 1,
+) -> list:
+    """Fit the per-fold seed ensemble. Split out from `_fit_predict` so the fold's
+    diagnostics (in-sample IC, tree curve, gain importances) can reuse the SAME fitted
+    models instead of paying for extra fits."""
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    return [
+        fit_lgbm_model(
+            train_df, target_col, cfg,
+            seed=seed if n_seeds == 1 else seed + s * 997,
+            shuffle=shuffle, feature_cols=cols,
+        )
+        for s in range(max(1, n_seeds))
+    ]
+
+
+def _predict_models(models: list, df, feature_cols: list[str] | None = None,
+                    num_iteration: int | None = None) -> np.ndarray:
+    """Ensemble prediction for one cross-section.
+
+    Multi-seed ensembles are averaged in RANK space, not raw-score space: LambdaRank
+    scores carry no fixed scale or offset across independently-seeded models, so a raw
+    mean is a scale-weighted vote in which the widest-range seed dominates. `_rank01`
+    is the same normalization `blend_gbdt_linear` and the target blend already use.
+    A single model is returned raw (rank-transforming it would be a monotone no-op).
+
+    `num_iteration` truncates each model to its first k trees — how the IC-vs-trees
+    curve is produced without refitting.
+    """
+    cols = feature_cols if feature_cols is not None else FEATURE_COLS
+    X = df[cols]
+    kw = {"num_iteration": num_iteration} if num_iteration else {}
+    if len(models) == 1:
+        return np.asarray(models[0].predict(X, **kw), dtype=float)
+    return np.mean([_rank01(np.asarray(m.predict(X, **kw), dtype=float)) for m in models], axis=0)
+
+
 def _fit_predict(
     train_df,
     test_df,
@@ -766,18 +1042,8 @@ def _fit_predict(
     feature_cols: list[str] | None = None,
     n_seeds: int = 1,
 ) -> np.ndarray:
-    cols = feature_cols if feature_cols is not None else FEATURE_COLS
-    if n_seeds == 1:
-        return fit_lgbm_model(
-            train_df, target_col, cfg, seed=seed, shuffle=shuffle, feature_cols=cols
-        ).predict(test_df[cols])
-    preds_all = np.stack([
-        fit_lgbm_model(
-            train_df, target_col, cfg, seed=seed + s * 997, shuffle=shuffle, feature_cols=cols
-        ).predict(test_df[cols])
-        for s in range(n_seeds)
-    ])
-    return preds_all.mean(axis=0)
+    models = _fit_models(train_df, target_col, cfg, seed, shuffle, feature_cols, n_seeds)
+    return _predict_models(models, test_df, feature_cols)
 
 
 def _target_col(horizon: str, target_mode: str) -> str:
@@ -850,14 +1116,37 @@ def within_sector_ic(
         "r": test_df[r_col].to_numpy(dtype=float),
         "grp": test_df[group_col].to_numpy(),
     })
-    ics = []
-    for _, grp in tmp.dropna(subset=["grp"]).groupby("grp"):
+    return float(np.mean(list(per_sector.values()))) if (
+        per_sector := within_sector_ic_breakdown(
+            preds, test_df, r_col, group_col=group_col, min_group_size=min_group_size
+        )
+    ) else float("nan")
+
+
+def within_sector_ic_breakdown(
+    preds, test_df, r_col: str, group_col: str = "sector", min_group_size: int = 10
+) -> dict[str, float]:
+    """Per-sector Spearman IC for one cross-section, keyed by sector.
+
+    `within_sector_ic` averages these into the SECB headline and discards the parts,
+    so a signal that lives entirely in one sector is indistinguishable from one spread
+    evenly across eleven. Returning the breakdown is what makes that checkable.
+    """
+    import pandas as pd
+
+    tmp = pd.DataFrame({
+        "pred": np.asarray(preds, dtype=float),
+        "r": test_df[r_col].to_numpy(dtype=float),
+        "grp": test_df[group_col].to_numpy(),
+    })
+    out: dict[str, float] = {}
+    for name, grp in tmp.dropna(subset=["grp"]).groupby("grp"):
         if grp.shape[0] < min_group_size:
             continue
         ic = grp["pred"].corr(grp["r"], method="spearman")
         if ic == ic:
-            ics.append(float(ic))
-    return float(np.mean(ics)) if ics else float("nan")
+            out[str(name)] = float(ic)
+    return out
 
 
 def ewma_rank_by_ticker(
@@ -892,6 +1181,110 @@ def ewma_rank_by_ticker(
             state[t] = raw_rank[i] if t not in state else alpha * raw_rank[i] + (1 - alpha) * state[t]
             sm[i] = state[t]
         out.append(sm)
+    return out
+
+
+def top_of_list_metrics(
+    preds, r: np.ndarray, k: int = 50, decile: float = 0.10
+) -> dict[str, float]:
+    """What the product actually ships: the top of one ranked cross-section.
+
+    SECB is an equal-weighted full-list Spearman averaged over eleven sectors, but the
+    dashboard serves `order by direction_prob desc`. A model can have a genuinely
+    useful top decile and a full-list IC of zero, or the reverse, and the headline
+    cannot tell those apart. Reported per fold so they can be block-bootstrapped like
+    IC (an equal-weighted decile spread is a return, not a correlation, so it is on a
+    scale a person can actually judge).
+
+      spread_decile — mean demeaned return of the top decile minus the bottom decile
+      top_decile_r  — mean demeaned return of the top decile alone (the long-only read)
+      precision_at_k — fraction of the top k that landed in the realized top quintile
+    """
+    p = np.asarray(preds, dtype=float)
+    y = np.asarray(r, dtype=float)
+    ok = np.isfinite(p) & np.isfinite(y)
+    p, y = p[ok], y[ok]
+    n = p.size
+    if n < 10:
+        return {"spread_decile": float("nan"), "top_decile_r": float("nan"),
+                "precision_at_k": float("nan")}
+    order = np.argsort(-p)                       # best-ranked first
+    m = max(1, int(round(decile * n)))
+    top_r, bot_r = float(y[order[:m]].mean()), float(y[order[-m:]].mean())
+    kk = min(k, n)
+    winners = set(np.argsort(-y)[: max(1, int(round(0.20 * n)))].tolist())
+    hit = sum(1 for i in order[:kk] if i in winners) / kk
+    return {"spread_decile": top_r - bot_r, "top_decile_r": top_r,
+            "precision_at_k": float(hit)}
+
+
+# Tree counts for the IC-vs-complexity curve. Read off ONE fit via
+# `predict(num_iteration=k)`, so the whole curve costs no extra training.
+TREE_CURVE_GRID = (25, 50, 100, 150, 200, 300, 400, 600)
+
+
+def _fold_fit_diagnostics(
+    models: list, train, test, cols: list[str], r_col: str,
+    tree_grid=TREE_CURVE_GRID, train_dates: int = 12,
+    sector_group_col: str | None = None,
+) -> dict:
+    """In-sample IC, an IC-vs-trees curve, and gain importances for one fold.
+
+    Answers the question the harness could not previously ask at all: is the model
+    over-fitting, under-fitting, or fitting nothing? Train-set IC was never computed,
+    so the in-sample/out-of-sample gap was unobservable, and `n_estimators=300` has
+    never been revisited since the file's first commit.
+
+    The curve reuses the fitted models via `num_iteration`; only the last `train_dates`
+    training cross-sections are scored in-sample, because pooling Spearman across dates
+    would mix cross-sections rather than measure per-date ranking skill.
+    """
+    import pandas as pd
+
+    def _score(preds, df) -> float:
+        """Score with the SAME metric as the headline, so the numbers are comparable.
+
+        Using universe IC here while the promotion bar is SECB would make the
+        over/under-fit gap and the complexity curve answer a different question than
+        the one being decided.
+        """
+        if sector_group_col and sector_group_col in df.columns:
+            return within_sector_ic(preds, df, r_col, group_col=sector_group_col)
+        ic = pd.Series(preds).corr(pd.Series(df[r_col].to_numpy(dtype=float)),
+                                   method="spearman")
+        return float(ic) if ic == ic else float("nan")
+
+    out: dict = {}
+    recent = sorted(train["date"].unique())[-train_dates:]
+    ics = []
+    for d in recent:
+        g = train[train["date"] == d]
+        if len(g) < 10:
+            continue
+        ic = _score(_predict_models(models, g, cols), g)
+        if ic == ic:
+            ics.append(float(ic))
+    out["ic_train"] = float(np.mean(ics)) if ics else float("nan")
+
+    n_trees = getattr(models[0], "n_estimators", None) or max(tree_grid)
+    curve = {}
+    for k in tree_grid:
+        if k > n_trees:
+            continue
+        ic = _score(_predict_models(models, test, cols, num_iteration=k), test)
+        if ic == ic:
+            curve[k] = float(ic)
+    out["tree_curve"] = curve
+
+    # `feature_importances_` is SPLIT COUNT by default, which rewards high-cardinality
+    # features rather than useful ones; gain is the decision-relevant quantity.
+    gains = np.zeros(len(cols), dtype=float)
+    for m in models:
+        g = np.asarray(m.booster_.feature_importance(importance_type="gain"), dtype=float)
+        total = g.sum()
+        if total > 0:
+            gains += g / total
+    out["importance"] = dict(zip(cols, (gains / max(len(models), 1)).tolist(), strict=True))
     return out
 
 
@@ -1001,6 +1394,64 @@ def knife_overlay_ranks(
     if knife is None:
         return model_p
     return _rank01((1.0 - lam) * model_p - lam * _rank01(knife))
+
+
+def vol_gate_flags(
+    vol_med: list[float | None], pct: float = 0.80, burn_in: int = 24
+) -> list[bool]:
+    """Per-date "is this a stress cross-section?", knowable at the time.
+
+    A date is gated when its cross-sectional median RAW realized vol exceeds the
+    `pct` quantile of the medians on all STRICTLY EARLIER dates. Expanding window,
+    so no future information; dates inside `burn_in` are never gated because a
+    quantile over a handful of points is noise. Missing medians are never gated and
+    do not enter the history.
+
+    Near-parameter-free on purpose. Generic factor-vol-timing does not replicate
+    (Cederburg et al. 2020); only own-vol scaling does (Barroso-Santa-Clara 2015),
+    and with ~5 stress episodes in the panel there is nothing here to tune against.
+    """
+    flags: list[bool] = []
+    history: list[float] = []
+    for i, v in enumerate(vol_med):
+        ok = v is not None and v == v
+        if ok and i >= burn_in and len(history) >= burn_in:
+            flags.append(bool(v > float(np.quantile(np.asarray(history), pct))))
+        else:
+            flags.append(False)
+        if ok:
+            history.append(float(v))
+    return flags
+
+
+def vol_gate_ranks(
+    model_ranks: np.ndarray, gated: bool, shrink: float = 0.5
+) -> np.ndarray:
+    """Shrink a cross-section's percentile ranks toward 0.5 when the date is gated.
+
+    ⚠️ This is a MONOTONE transform of the cross-section, so it leaves that date's
+    Spearman rank-IC exactly unchanged — there is no shrink factor that moves IC
+    toward zero (shrink=0 makes it undefined, not 0). It bites only where ranks are
+    compared ACROSS dates, i.e. composed with `ewma_rank_by_ticker`: halving the
+    spread of today's ranks halves their weight in the EWMA, so a gated date leans
+    on the pre-stress rank instead. A horizon with `smooth_span == 0` is therefore
+    provably unaffected, and 6M is excluded on that ground rather than by result.
+    """
+    ranks = np.asarray(model_ranks, dtype=float)
+    if not gated or shrink >= 1.0:
+        return ranks
+    return 0.5 + (ranks - 0.5) * float(shrink)
+
+
+def apply_vol_gate(
+    rank_series: list[np.ndarray], vol_med: list[float | None],
+    pct: float = 0.80, burn_in: int = 24, shrink: float = 0.5,
+) -> tuple[list[np.ndarray], list[bool]]:
+    """Walk-forward adapter: gate each fold's ranks, returning ranks + the flags."""
+    flags = vol_gate_flags(vol_med, pct=pct, burn_in=burn_in)
+    gated = [vol_gate_ranks(rk, g, shrink)
+             for rk, g in zip(rank_series, flags, strict=True)]
+    return gated, flags
 
 
 def apply_knife_overlay(records: list[dict], lam: float) -> list[np.ndarray]:
@@ -1174,6 +1625,8 @@ def regularization_sweep(
     seed: int = 1337,
     sector_group_col: str = "sector",
     compute_sector_ic: bool = True,
+    max_test_date=None,
+    min_test_date=None,
     log=lambda *_: None,
 ) -> list[dict]:
     """Compare LightGBM regularization configs at one horizon — each a FULL refit.
@@ -1191,6 +1644,7 @@ def regularization_sweep(
             panel, horizon, cfg, wf_cfg, seed=seed, shuffle=False,
             target_mode=target_mode, feature_cols=feature_cols, n_seeds=n_seeds,
             compute_sector_ic=compute_sector_ic, sector_group_col=sector_group_col,
+            max_test_date=max_test_date, min_test_date=min_test_date,
         )
         sec = res.get("sector_summary", {})
         boot = block_bootstrap_summary(
@@ -1313,7 +1767,14 @@ def walk_forward_ic(
     smooth_span: int = 0,
     knife_lambda: float = 0.0,
     winsorize_pct: float = 0.0,
+    max_test_date=None,
+    min_test_date=None,
+    vol_gate: bool = False,
+    fit_diagnostics: bool = False,
+    baselines: bool = False,
     return_records: bool = False,
+    eval_index_ids: tuple[str, ...] | None = None,
+    label_realized_before=None,
 ) -> dict:
     """Expanding-window walk-forward; return summary + per-fold rank-IC rows.
 
@@ -1327,12 +1788,19 @@ def walk_forward_ic(
     overlay composes first, then smoothing. The result always carries `rank_turnover`
     (mean |Δ rank| between consecutive dates) for the raw signal, and the transformed
     turnover (`turnover_smoothed`) when either post-step is on.
+
+    `max_test_date` / `min_test_date` restrict which fold TEST dates are scored;
+    the training window per fold is unchanged. This is how the frozen holdout is
+    enforced: selection runs pass `max_test_date = holdout_start - horizon` so
+    every selection label is fully realized before the holdout opens, and the
+    one-shot holdout run passes `min_test_date = holdout_start`. There is no
+    default -- truncation is always explicit.
     """
     import pandas as pd
 
     lgb_cfg = lgb_cfg or LGBMConfig()
     wf_cfg = wf_cfg or WalkForwardConfig()
-    r_col, m_col = f"r_{horizon}", f"mask_{horizon}"
+    r_col = f"r_{horizon}"
     t_col = _target_col(horizon, target_mode)
     # Winsorize the TRAINING label only (per-date quantile clip); scoring stays on
     # the unclipped realized return `r_col`. Precompute a clipped column once over
@@ -1353,22 +1821,29 @@ def walk_forward_ic(
 
     grid_dates = sorted(panel["date"].unique())
     folds = walk_forward_folds(grid_dates, wf_cfg.min_train_months, embargo_steps)
+    if max_test_date is not None or min_test_date is not None:
+        folds = [
+            (td, cut) for td, cut in folds
+            if (max_test_date is None or td <= max_test_date)
+            and (min_test_date is None or td >= min_test_date)
+        ]
+        log(f"test-date window: {len(folds)} folds kept "
+            f"[{min_test_date or '-'} .. {max_test_date or '-'}]")
 
     fold_rows: list[dict] = []
     records: list[dict] = []  # per-fold (ticker_ids, raw pred, realized r, sector) for smoothing/turnover
     for fi, (test_date, cutoff) in enumerate(folds):
-        train = panel[(panel["date"] <= cutoff) & panel[m_col] & panel[t_col].notna()]
-        if wf_cfg.max_train_months is not None:
-            lower_idx = max(0, grid_dates.index(cutoff) - wf_cfg.max_train_months)
-            train = train[train["date"] >= grid_dates[lower_idx]]
-        test = panel[(panel["date"] == test_date) & panel[m_col]]
+        end_col, entry_col = f"label_end_{horizon}", f"entry_{horizon}"
+        train, test = select_walk_forward_samples(
+            panel, horizon, target_mode, test_date, cutoff, wf_cfg,
+            label_realized_before, eval_index_ids)
         if test.shape[0] < wf_cfg.min_names or train.empty:
             continue
 
-        preds = _fit_predict(
-            train, test, fit_col, lgb_cfg, seed + fi, shuffle,
-            feature_cols=feature_cols, n_seeds=n_seeds,
-        )
+        cols_used = feature_cols if feature_cols is not None else FEATURE_COLS
+        models = _fit_models(train, fit_col, lgb_cfg, seed + fi, shuffle,
+                             feature_cols=feature_cols, n_seeds=n_seeds)
+        preds = _predict_models(models, test, feature_cols)
         if linear_blend > 0:
             # `test` is a single month-end cross-section here, so rank-blending is
             # well-defined. The null path shuffles both models identically.
@@ -1377,17 +1852,49 @@ def walk_forward_ic(
                 seed=seed + fi, shuffle=shuffle,
             )
             cols = feature_cols if feature_cols is not None else FEATURE_COLS
-            lin_pred = lin.predict(test[cols].to_numpy(dtype=float))
+            lin_pred = lin.predict(
+                np.nan_to_num(test[cols].to_numpy(dtype=float), nan=0.0)
+            )
             preds = blend_gbdt_linear(preds, lin_pred, linear_blend)
         ic = pd.Series(preds).corr(pd.Series(test[r_col].to_numpy(dtype=float)), method="spearman")
         if ic != ic:  # NaN (zero-variance cross-section)
             continue
         fold = {"date": test_date, "ic": float(ic), "n_test": int(test.shape[0]),
                 "n_train": int(train.shape[0])}
+        # Raw (pre-normalization) vol median: a regime proxy for --regime-report.
+        # The normalized vol_120d column cannot serve — a per-date median of
+        # within-date ranks is ~constant by construction.
+        if "vol_120d_raw" in test.columns:
+            fold["vol_raw_med"] = float(np.nanmedian(test["vol_120d_raw"].to_numpy(dtype=float)))
         if compute_sector_ic:
-            fold["sector_ic"] = within_sector_ic(
+            by_sector = within_sector_ic_breakdown(
                 preds, test, r_col, group_col=sector_group_col
             )
+            fold["sector_ic"] = float(np.mean(list(by_sector.values()))) if by_sector else float("nan")
+            fold["sector_ic_by_group"] = by_sector
+        # The top of the ranked list is what the product ships; SECB cannot see it.
+        fold.update(top_of_list_metrics(preds, test[r_col].to_numpy(dtype=float)))
+        if baselines:
+            # Same fold, same rows, same target — the only difference is the estimator.
+            realized = test[r_col].to_numpy(dtype=float)
+            ridge = fit_linear_model(train, fit_col, feature_cols=cols_used,
+                                     alpha=ridge_alpha, seed=seed + fi, shuffle=shuffle)
+            bench = {
+                "ridge": ridge.predict(
+                    np.nan_to_num(test[cols_used].to_numpy(dtype=float), nan=0.0)),
+                "combo": forecast_combination_predict(train, test, fit_col, cols_used),
+            }
+            for name, bp in bench.items():
+                fold[f"ic_{name}"] = float(
+                    pd.Series(bp).corr(pd.Series(realized), method="spearman"))
+                if compute_sector_ic:
+                    fold[f"sector_ic_{name}"] = within_sector_ic(
+                        bp, test, r_col, group_col=sector_group_col)
+        if fit_diagnostics:
+            fold.update(_fold_fit_diagnostics(
+                models, train, test, cols_used, r_col,
+                sector_group_col=sector_group_col if compute_sector_ic else None,
+            ))
         fold_rows.append(fold)
         risk = {
             key: test[col].to_numpy(dtype=float)
@@ -1401,7 +1908,12 @@ def walk_forward_ic(
             "pred": np.asarray(preds, dtype=float),
             "r": test[r_col].to_numpy(dtype=float),
             "sector": test[sector_group_col].to_numpy() if sector_group_col in test.columns else None,
+            # Rank-normalized size, for the partial-correlation size-neutral IC.
+            "size": (test["log_market_cap"].to_numpy(dtype=float)
+                     if "log_market_cap" in test.columns else None),
             "risk": risk,
+            **({"entry_date": test[entry_col].to_numpy(), "label_end": test[end_col].to_numpy()}
+               if entry_col in test and end_col in test else {}),
         })
         log(
             f"  fold {test_date}  ic {ic:+.4f}  "
@@ -1414,30 +1926,104 @@ def walk_forward_ic(
     # re-rank, so scoring on the transformed rank == scoring on its rank. lam/span = 0
     # are no-ops, so the default path keeps the raw per-fold IC scored in the loop.
     turnover_smoothed = None
-    if (knife_lambda > 0 or smooth_span > 0) and records:
+    n_gated = 0
+    if (knife_lambda > 0 or smooth_span > 0 or vol_gate) and records:
         ranks = apply_knife_overlay(records, knife_lambda)  # lam=0 → model ranks
+        if vol_gate:
+            # Must precede smoothing: the gate has no effect on a single date's
+            # rank-IC (monotone), it only changes how much that date contributes
+            # to the cross-date EWMA.
+            ranks, gate_flags = apply_vol_gate(
+                ranks, [f.get("vol_raw_med") for f in fold_rows]
+            )
+            n_gated = int(sum(gate_flags))
+            for fold, g in zip(fold_rows, gate_flags, strict=True):
+                fold["vol_gated"] = bool(g)
         if smooth_span > 0:
             ranks = ewma_rank_by_ticker(records, smooth_span, rank_series=ranks)
         for fold, rec, rk in zip(fold_rows, records, ranks, strict=True):
             fold["ic"] = float(pd.Series(rk).corr(pd.Series(rec["r"]), method="spearman"))
             if compute_sector_ic and rec["sector"] is not None:
                 sdf = pd.DataFrame({r_col: rec["r"], sector_group_col: rec["sector"]})
-                fold["sector_ic"] = within_sector_ic(rk, sdf, r_col, group_col=sector_group_col)
+                by_sector = within_sector_ic_breakdown(
+                    rk, sdf, r_col, group_col=sector_group_col
+                )
+                fold["sector_ic"] = (float(np.mean(list(by_sector.values())))
+                                     if by_sector else float("nan"))
+                fold["sector_ic_by_group"] = by_sector
+            # The overlays re-rank the cross-section, which is exactly what the
+            # product ships — so the top-of-list metrics have to be recomputed here,
+            # not left describing the pre-overlay model.
+            fold.update(top_of_list_metrics(rk, rec["r"]))
         turnover_smoothed = rank_turnover(records, rank_series=ranks)
+    else:
+        ranks = [rec["pred"].copy() for rec in records]
 
     result = {"summary": summarize([r["ic"] for r in fold_rows]), "folds": fold_rows}
     result["turnover_raw"] = rank_turnover(records)
     result["turnover_smoothed"] = turnover_smoothed
+    result["n_vol_gated"] = n_gated
+    if compute_sector_ic:
+        # Computed here, ahead of the diagnostics below, which score train and test
+        # with this same metric. sector_summary uses the naive across-fold ICIR —
+        # callers apply block_bootstrap_summary to sector_ic_values for an honest t.
+        s_ics = [r["sector_ic"] for r in fold_rows if r["sector_ic"] == r["sector_ic"]]
+        result["sector_summary"] = summarize(s_ics)
+        result["sector_ic_values"] = s_ics
+
+    # --- top of the ranked list (what the product ships) ---
+    def _col(name):
+        return [f[name] for f in fold_rows if f.get(name) == f.get(name)]
+    result["top_of_list"] = {
+        name: summarize(_col(name))
+        for name in ("spread_decile", "top_decile_r", "precision_at_k")
+    }
+    # --- per-sector IC: which sectors carry the headline average ---
+    if compute_sector_ic:
+        per_sector: dict[str, list[float]] = {}
+        for f in fold_rows:
+            for sec, v in (f.get("sector_ic_by_group") or {}).items():
+                per_sector.setdefault(sec, []).append(v)
+        result["sector_ic_by_group"] = {
+            sec: {"n_folds": len(v), "mean_ic": float(np.mean(v))}
+            for sec, v in sorted(per_sector.items())
+        }
+    # --- honest benchmarks: does the GBDT earn its complexity? ---
+    if baselines:
+        result["baselines"] = {
+            name: {
+                "universe": summarize(_col(f"ic_{name}")),
+                **({"sector": summarize(_col(f"sector_ic_{name}"))}
+                   if compute_sector_ic else {}),
+            }
+            for name in ("ridge", "combo")
+        }
+    # --- fit diagnostics: over/under-fit and the complexity curve ---
+    if fit_diagnostics and fold_rows:
+        curve: dict[int, list[float]] = {}
+        imp: dict[str, list[float]] = {}
+        for f in fold_rows:
+            for k, v in (f.get("tree_curve") or {}).items():
+                curve.setdefault(k, []).append(v)
+            for c, v in (f.get("importance") or {}).items():
+                imp.setdefault(c, []).append(v)
+        result["fit_diagnostics"] = {
+            "train": summarize(_col("ic_train")),
+            # Same metric on both sides: the train IC is SECB whenever the headline is,
+            # so comparing it against the universe summary would overstate the gap.
+            "test": result["sector_summary"] if compute_sector_ic else result["summary"],
+            "tree_curve": {k: float(np.mean(v)) for k, v in sorted(curve.items())},
+            "importance": dict(sorted(
+                ((c, float(np.mean(v))) for c, v in imp.items()),
+                key=lambda kv: -kv[1],
+            )),
+        }
     if return_records:
         # Raw per-fold (ticker_ids, pred, r, sector) so a caller can sweep smoothing
         # spans / turnover WITHOUT refitting (the fits dominate cost).
         result["records"] = records
-    if compute_sector_ic:
-        # sector_summary uses the same naive ICIR×√N formula as universe — caller
-        # should apply block_bootstrap_summary on sector_ic_values for honest t.
-        s_ics = [r["sector_ic"] for r in fold_rows if r["sector_ic"] == r["sector_ic"]]
-        result["sector_summary"] = summarize(s_ics)
-        result["sector_ic_values"] = s_ics
+        result["prediction_records"] = [dict(rec, pred=np.asarray(pred))
+                                        for rec, pred in zip(records, ranks, strict=True)]
     return result
 
 
@@ -1454,6 +2040,158 @@ def summarize(ics: list[float]) -> dict:
     t_stat = icir * math.sqrt(n) if std > 0 else float("nan")  # significance across folds
     return {"n_folds": n, "mean_ic": mean, "std_ic": std,
             "icir": icir, "t_stat": t_stat, "hit_rate": float((a > 0).mean())}
+
+
+def _partial_spearman(pred: np.ndarray, r: np.ndarray, size: np.ndarray) -> float:
+    """Spearman correlation between pred and r, holding size constant.
+
+    Closed form: rho(p,r|s) = (rho_pr - rho_ps*rho_rs) / sqrt((1-rho_ps^2)(1-rho_rs^2)).
+    Answers "does the signal rank names correctly among same-size peers?" — the
+    size premium is a documented risk premium, so IC that survives this is the
+    part not explained by a size tilt.
+    """
+    import pandas as pd
+
+    ok = np.isfinite(pred) & np.isfinite(r) & np.isfinite(size)
+    if ok.sum() < 10:
+        return float("nan")
+    p, y, s = pred[ok], r[ok], size[ok]
+    if len(set(s.tolist())) < 2 or len(set(p.tolist())) < 2 or len(set(y.tolist())) < 2:
+        return float("nan")
+
+    def rho(a, b):
+        return pd.Series(a).corr(pd.Series(b), method="spearman")
+
+    r_pr, r_ps, r_rs = rho(p, y), rho(p, s), rho(y, s)
+    if any(v != v for v in (r_pr, r_ps, r_rs)):
+        return float("nan")
+    denom = math.sqrt(max(0.0, (1 - r_ps ** 2) * (1 - r_rs ** 2)))
+    if denom <= 1e-12:
+        return float("nan")
+    return float((r_pr - r_ps * r_rs) / denom)
+
+
+def size_neutral_summary(
+    records: list[dict],
+    block_size: int,
+    reps: int = 2000,
+    min_group_size: int = 10,
+) -> dict:
+    """Universe and within-sector IC after partialling out size, per fold.
+
+    Post-hoc on the walk-forward's own predictions — no refits. The audit found
+    that dropping `log_market_cap` removed significance at every horizon, i.e. the
+    result was load-bearing on a size tilt; this quantifies what is left once size
+    is held constant.
+    """
+    import pandas as pd
+
+    uni: list[float] = []
+    sec: list[float] = []
+    for rec in records:
+        size = rec.get("size")
+        if size is None:
+            continue
+        pred = np.asarray(rec["pred"], dtype=float)
+        r = np.asarray(rec["r"], dtype=float)
+        size = np.asarray(size, dtype=float)
+        val = _partial_spearman(pred, r, size)
+        if val == val:
+            uni.append(val)
+
+        sectors = rec.get("sector")
+        if sectors is None:
+            continue
+        per_sector: list[float] = []
+        for group in pd.unique(pd.Series(sectors).dropna()):
+            m = np.asarray(pd.Series(sectors).to_numpy() == group)
+            if m.sum() < min_group_size:
+                continue
+            val_s = _partial_spearman(pred[m], r[m], size[m])
+            if val_s == val_s:
+                per_sector.append(val_s)
+        if per_sector:
+            sec.append(float(np.mean(per_sector)))
+
+    return {
+        "universe": {**summarize(uni),
+                     **block_bootstrap_summary(uni, block_size, reps=reps)},
+        "sector": {**summarize(sec),
+                   **block_bootstrap_summary(sec, block_size, reps=reps)},
+    }
+
+
+def regime_report(folds: list[dict], burn_in: int = 24) -> dict:
+    """Per-fold IC broken out by calendar year and by volatility regime.
+
+    The headline is a pooled mean over 2013-2026, which hides regime dependence —
+    especially for a size-tilted signal, where a mega-cap-led stretch and a
+    broadening stretch are different worlds. Pure function over existing fold rows.
+
+    Two vol-regime tables are returned. `by_vol_regime` cuts tertiles over the WHOLE
+    fold set — in-sample breakpoints, fine for describing the panel, useless as
+    evidence for a tradeable rule. `by_vol_regime_pit` cuts each fold against
+    quantiles of the folds strictly BEFORE it (expanding window, `burn_in` folds of
+    history required), so every bucket assignment was knowable at the time. A regime
+    claim that only survives the in-sample cut is not a claim.
+    """
+    from collections import defaultdict
+
+    rows = [f for f in folds if f.get("ic") == f.get("ic")]
+    by_year: dict[int, list[dict]] = defaultdict(list)
+    for f in rows:
+        by_year[f["date"].year].append(f)
+
+    def agg(items: list[dict]) -> dict:
+        ics = [f["ic"] for f in items]
+        secs = [f["sector_ic"] for f in items
+                if f.get("sector_ic") is not None and f["sector_ic"] == f["sector_ic"]]
+        return {
+            "n": len(items),
+            "mean_ic": float(np.mean(ics)) if ics else float("nan"),
+            "mean_sector_ic": float(np.mean(secs)) if secs else float("nan"),
+            "hit_rate": float(np.mean([1.0 if v > 0 else 0.0 for v in ics])) if ics else float("nan"),
+        }
+
+    years = {year: agg(items) for year, items in sorted(by_year.items())}
+
+    # Volatility regime: split folds into tertiles of the cross-sectional median
+    # of RAW realized vol on the fold date.
+    vol_rows = [f for f in rows if f.get("vol_raw_med") == f.get("vol_raw_med")
+                and f.get("vol_raw_med") is not None]
+    vol_rows.sort(key=lambda f: f["date"])
+    regimes: dict[str, dict] = {}
+    if len(vol_rows) >= 6:
+        vols = np.asarray([f["vol_raw_med"] for f in vol_rows], dtype=float)
+        lo, hi = np.quantile(vols, [1 / 3, 2 / 3])
+        buckets = {
+            "low_vol": [f for f in vol_rows if f["vol_raw_med"] <= lo],
+            "mid_vol": [f for f in vol_rows if lo < f["vol_raw_med"] <= hi],
+            "high_vol": [f for f in vol_rows if f["vol_raw_med"] > hi],
+        }
+        regimes = {name: agg(items) for name, items in buckets.items() if items}
+
+    # Same cut, but each fold is bucketed against the quantiles of the folds that
+    # PRECEDE it. Folds inside the burn-in have no usable history and are dropped
+    # rather than bucketed on a handful of observations.
+    pit_buckets: dict[str, list[dict]] = {"low_vol": [], "mid_vol": [], "high_vol": []}
+    for i, f in enumerate(vol_rows):
+        if i < burn_in:
+            continue
+        hist = np.asarray([g["vol_raw_med"] for g in vol_rows[:i]], dtype=float)
+        p_lo, p_hi = np.quantile(hist, [1 / 3, 2 / 3])
+        v = f["vol_raw_med"]
+        name = "low_vol" if v <= p_lo else ("mid_vol" if v <= p_hi else "high_vol")
+        pit_buckets[name].append(f)
+    regimes_pit = {name: agg(items) for name, items in pit_buckets.items() if items}
+
+    return {
+        "by_year": years,
+        "by_vol_regime": regimes,
+        "by_vol_regime_pit": regimes_pit,
+        "pit_burn_in": burn_in,
+        "pit_n_scored": sum(len(v) for v in pit_buckets.values()),
+    }
 
 
 def block_bootstrap_summary(
@@ -1476,6 +2214,7 @@ def block_bootstrap_summary(
             "mean_ic": float("nan"), "ci_low": float("nan"), "ci_high": float("nan"),
             "p_value": float("nan"), "effective_blocks": 0.0, "t_block": float("nan"),
             "se_block": float("nan"), "min_detect_ic": float("nan"),
+            "approx_95pct_threshold_ic": float("nan"),
         }
 
     block_size = max(1, min(int(block_size), n))
@@ -1494,6 +2233,7 @@ def block_bootstrap_summary(
             "effective_blocks": effective_blocks, "t_block": t_block,
             "se_block": se_block,
             "min_detect_ic": 1.96 * se_block if se_block == se_block else float("nan"),
+            "approx_95pct_threshold_ic": 1.96 * se_block,
         }
 
     rng = np.random.default_rng(seed)
@@ -1528,6 +2268,7 @@ def block_bootstrap_summary(
         "t_block": t_block,
         "se_block": se_block,
         "min_detect_ic": 1.96 * se_block if se_block == se_block else float("nan"),
+        "approx_95pct_threshold_ic": 1.96 * se_block,
     }
 
 
@@ -1592,15 +2333,10 @@ def _print_bootstrap(tag: str, s: dict) -> None:
 
 
 def _print_power(tag: str, s: dict) -> None:
-    """Statistical-power read: the smallest |mean IC| this block count can resolve.
-
-    For overlapping long-horizon labels (1Y) eff_blocks is small, so min_detect|IC|
-    is large — a non-significant result there may be a power ceiling, not a dead
-    signal. Read mean_ic against min_detect, not just against zero.
-    """
+    """Approximate significance threshold, not a power-calibrated detectable effect."""
     print(
         f"{tag:<5} eff_blocks={s['effective_blocks']:.1f}  se={s['se_block']:.4f}  "
-        f"min_detect|IC|@95%={s['min_detect_ic']:.4f}  "
+        f"approx_95pct_threshold_ic={s['approx_95pct_threshold_ic']:.4f}  "
         f"(observed mean_ic={s['mean_ic']:+.4f})"
     )
 
@@ -1645,6 +2381,21 @@ def _compose_feature_cols(args) -> list[str]:
         cols += list(SEASONALITY_FEATURES)
     if args.with_insider:
         cols += list(INSIDER_FEATURES)
+    if getattr(args, "with_sentiment", False):
+        cols += list(SENTIMENT_FEATURES)
+    if getattr(args, "with_estimate_missing", False):
+        cols += list(ESTIMATE_MISSING_FEATURES)
+    if getattr(args, "with_issuance", False):
+        cols += list(ISSUANCE_FEATURES)
+    if getattr(args, "with_analyst-breadth".replace("-", "_"), False):
+        cols += list(ANALYST_BREADTH_FEATURES)
+    if getattr(args, "with_payout", False):
+        cols += list(PAYOUT_FEATURES)
+    if getattr(args, "with_range_vol", False):
+        cols += list(RANGE_VOL_FEATURES)
+    if getattr(args, "research_pack", None):
+        from backend.ml.factors.long_horizon import PACKS
+        cols += PACKS[args.research_pack]
     # Ad-hoc single features (e.g. isolating one member of a pack for an ablation).
     if getattr(args, "extra_features", None):
         cols += [c.strip() for c in args.extra_features.split(",") if c.strip()]
@@ -1659,16 +2410,43 @@ def _compose_feature_cols(args) -> list[str]:
 
 
 async def run(args) -> None:
-    lgb_cfg = LGBMConfig(
-        objective=args.objective,
-        lambdarank_truncation_level=args.lambdarank_truncation,
+    # Start from the horizon's PRODUCTION hyperparameters, exactly as the training
+    # window does, so a re-validation measures the model that actually ships. Building
+    # a fresh LGBMConfig here instead was the same eval/prod split that hid the 6M
+    # rolling-60 window: the promoted per-horizon min_child_samples (150/300/600) would
+    # have been invisible to every sweep. Explicit flags still win.
+    spec_cfg = getattr(
+        PRODUCTION_HORIZON_SPECS.get(args.horizon, HorizonSpec()), "lgb_cfg", LGBMConfig()
     )
-    if args.subsample is not None:
-        lgb_cfg = replace(lgb_cfg, subsample=args.subsample)
-    if args.objective in _RANKING_OBJECTIVES:
+    overrides = {
+        k: v for k, v in (
+            ("objective", args.objective),
+            ("lambdarank_truncation_level", args.lambdarank_truncation),
+            ("subsample", args.subsample),
+            ("n_estimators", args.n_estimators),
+            ("min_child_samples", args.min_child_samples),
+        ) if v is not None
+    }
+    lgb_cfg = replace(spec_cfg, **overrides)
+    if overrides:
+        print("lgb_cfg overrides: " + ", ".join(f"{k}={v}" for k, v in overrides.items()))
+    # A ranking objective needs ordinal grades. If the objective came from the
+    # horizon's spec (6M/1Y ship lambdarank) but the caller deliberately chose a
+    # return-like target for an ablation, fall back to L2 rather than refusing —
+    # the target is the thing they asked for. An EXPLICIT --objective still errors.
+    if (lgb_cfg.objective in _RANKING_OBJECTIVES and args.target != "sector_grade"
+            and args.objective is None):
+        print(f"note: {args.horizon} ships objective={lgb_cfg.objective}, but "
+              f"--target {args.target} is not an ordinal grade — using regression. "
+              f"Pass --target sector_grade to measure the production objective.")
+        lgb_cfg = replace(lgb_cfg, objective="regression")
+    print(f"lgb_cfg: objective={lgb_cfg.objective} n_estimators={lgb_cfg.n_estimators} "
+          f"min_child_samples={lgb_cfg.min_child_samples} "
+          f"(base: production spec for {args.horizon})")
+    if lgb_cfg.objective in _RANKING_OBJECTIVES:
         if args.target != "sector_grade":
             raise SystemExit(
-                f"--objective {args.objective} requires --target sector_grade "
+                f"objective {lgb_cfg.objective} requires --target sector_grade "
                 f"(ordinal grade labels), got --target {args.target}"
             )
         if args.with_linear_blend > 0:
@@ -1676,10 +2454,30 @@ async def run(args) -> None:
                 "--with-linear-blend is unsupported with a ranking objective "
                 "(untested ranker+ridge combination; no production horizon blends)"
             )
+    # Default the rolling-window length to the horizon's PRODUCTION spec so a
+    # re-validation measures the model that actually ships (6M is max_train_months=60).
+    # Explicit --max-train-months wins; pass 0 to force an expanding window.
+    spec_window = getattr(
+        PRODUCTION_HORIZON_SPECS.get(args.horizon, HorizonSpec()), "max_train_months", None
+    )
+    if args.max_train_months is None:
+        max_train_months = spec_window
+        window_src = f"production spec for {args.horizon}"
+    elif args.max_train_months == 0:
+        max_train_months = None
+        window_src = "forced expanding (--max-train-months 0)"
+    else:
+        max_train_months = args.max_train_months
+        window_src = "--max-train-months"
     wf_cfg = WalkForwardConfig(
         min_train_months=args.min_train_months,
-        max_train_months=args.max_train_months,
+        max_train_months=max_train_months,
         min_names=args.min_names,
+    )
+    print(
+        f"training window: "
+        f"{'expanding' if max_train_months is None else f'rolling {max_train_months} months'}"
+        f"  ({window_src})"
     )
     feature_cols = _compose_feature_cols(args)
     extras = [c for c in feature_cols if c not in FEATURE_COLS]
@@ -1704,6 +2502,8 @@ async def run(args) -> None:
             rank_cols=feature_cols,
             industry_relative=args.industry_relative,
             n_grades=args.rank_grades,
+            membership_filter=args.membership_filter,
+            log=print,
         )
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
@@ -1716,21 +2516,56 @@ async def run(args) -> None:
         if args.feature_diagnostics:
             # Default the candidates to the packs the user opted into (everything beyond
             # the production FEATURE_COLS). No model fits — just panel statistics.
-            candidates = [c for c in feature_cols if c not in FEATURE_COLS]
+            # --diagnose-features overrides that so an IN-BOOK feature can be vetted
+            # too (e.g. re-checking fund_available after the survivorship backfill).
+            if args.diagnose_features:
+                candidates = [c.strip() for c in args.diagnose_features.split(",") if c.strip()]
+                missing = [c for c in candidates if c not in panel.columns]
+                if missing:
+                    raise SystemExit(f"--diagnose-features: not in the panel: {missing}")
+            else:
+                candidates = [c for c in feature_cols if c not in FEATURE_COLS]
             if not candidates:
                 raise SystemExit("--feature-diagnostics needs candidate features; "
-                                 "add a pack, e.g. --with-microstructure")
+                                 "add a pack (e.g. --with-microstructure) or name them "
+                                 "with --diagnose-features")
             block_size = args.block_size or max(
                 1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
             )
+            # Vetting a candidate is a SELECTION decision, so it has to respect the
+            # frozen holdout exactly like the fold list does. This branch returns
+            # before walk_forward_ic ever runs, so the window is applied here.
+            diag_panel = panel
+            if args.max_test_date is not None or args.min_test_date is not None:
+                keep = np.ones(len(diag_panel), dtype=bool)
+                dates = diag_panel["date"].to_numpy()
+                if args.max_test_date is not None:
+                    keep &= np.asarray([d <= args.max_test_date for d in dates])
+                if args.min_test_date is not None:
+                    keep &= np.asarray([d >= args.min_test_date for d in dates])
+                diag_panel = diag_panel[keep]
+                print(f"diagnostics date window: {len(diag_panel):,} of {len(panel):,} rows")
             print(f"\n[feature diagnostics] {args.horizon}: decorrelation vs the book + "
                   f"standalone within-{args.neutralize_by} IC (block={block_size}); "
                   f"consolidation control = efficiency_ratio_120d:")
             print(f"  {'feature':>24} {'|corr|bk':>9} {'|corr|ER':>9} {'sec_ic':>8} "
                   f"{'sec_t':>7} {'sec_p':>8} {'ic_side':>8} {'ic_mid':>8} {'ic_trend':>8} "
                   f"  top correlates")
+            # The book has to be the horizon's ACTUAL production feature list, not
+            # bare FEATURE_COLS: the promoted per-horizon packs (coverage_chg_90d at
+            # 3M, revenue_surprise at 6M/1Y) are part of what a candidate must be
+            # decorrelated FROM. Comparing against the base 19 only would let a
+            # near-duplicate of an already-promoted feature pass the gate — the
+            # decorrelation illusion that killed E2 and E6 after the fits were spent.
+            prod_spec = PRODUCTION_HORIZON_SPECS.get(args.horizon, HorizonSpec())
+            book = [
+                c for c in (prod_spec.feature_cols or list(FEATURE_COLS))
+                if c not in set(candidates)
+            ]
+            print(f"decorrelation book: {len(book)} columns "
+                  f"(production feature list for {args.horizon})")
             for row in feature_diagnostics(
-                panel, args.horizon, candidates,
+                diag_panel, args.horizon, candidates, existing_cols=book,
                 sector_group_col=args.neutralize_by,
                 min_names=args.min_names,
                 block_size=block_size,
@@ -1764,14 +2599,22 @@ async def run(args) -> None:
                                smooth_span=args.smooth_span,
                                knife_lambda=args.knife_lambda,
                                winsorize_pct=args.winsorize_target,
-                               return_records=knife_grid is not None or blend_grid is not None)
+                               max_test_date=args.max_test_date,
+                               min_test_date=args.min_test_date,
+                               vol_gate=args.vol_gate,
+                               fit_diagnostics=args.fit_diagnostics,
+                               baselines=args.baselines,
+                               return_records=(knife_grid is not None
+                                               or blend_grid is not None
+                                               or args.size_neutral_ic))
         block_size = args.block_size or max(
             1, math.ceil(HORIZON_TRADING_DAYS[args.horizon] / 21)
         )
         smooth_tag = f", smooth_span={args.smooth_span}" if args.smooth_span > 0 else ""
         knife_tag = f", knife_lambda={args.knife_lambda}" if args.knife_lambda > 0 else ""
         wins_tag = f", winsorize={args.winsorize_target}" if args.winsorize_target > 0 else ""
-        obj_tag = f", objective={args.objective}" if args.objective != "regression" else ""
+        obj_tag = (f", objective={lgb_cfg.objective}"
+                   if lgb_cfg.objective != "regression" else "")
         print(f"\n--- {args.horizon} cross-sectional rank-IC "
               f"(expanding walk-forward, target={args.target}{obj_tag}{smooth_tag}{knife_tag}{wins_tag}) ---")
         if knife_grid is not None and real.get("records"):
@@ -1800,6 +2643,8 @@ async def run(args) -> None:
                                   feature_cols=feature_cols, n_seeds=args.n_seeds,
                                   compute_sector_ic=args.sector_neutral_ic,
                                   sector_group_col=args.neutralize_by,
+                                  max_test_date=args.max_test_date,
+                                  min_test_date=args.min_test_date,
                                   return_records=True)
             print(f"  {'w':>5} {'mean_ic':>8} {'sec_ic':>8} {'sec_t':>7} "
                   f"{'sec_p':>8} {'turnover':>9}")
@@ -1842,6 +2687,8 @@ async def run(args) -> None:
                 reps=args.block_bootstrap_reps, seed=args.seed,
                 sector_group_col=args.neutralize_by,
                 compute_sector_ic=args.sector_neutral_ic,
+                max_test_date=args.max_test_date,
+                min_test_date=args.min_test_date,
                 log=print if args.verbose else (lambda *_: None),
             ):
                 print(f"  {row['name']:>13} {row['mean_ic']:>+8.4f} "
@@ -1873,6 +2720,55 @@ async def run(args) -> None:
                 _print_bootstrap("SECB", sec_boot)
                 _print_power("SECB", sec_boot)
 
+        # SIZE-NEUTRAL: the size premium is a known risk premium, not alpha. This is
+        # what survives once size is held constant within each cross-section.
+        if args.size_neutral_ic:
+            if not real.get("records"):
+                print("[size-neutral] no fold records available")
+            else:
+                sn = size_neutral_summary(
+                    real["records"], block_size=block_size,
+                    reps=args.block_bootstrap_reps or 2000,
+                )
+                print("\n[SIZE-NEUTRAL] partial Spearman IC holding log_market_cap constant:")
+                _print_summary("SN-U", sn["universe"])
+                _print_bootstrap("SN-U", sn["universe"])
+                if sn["sector"]["n_folds"]:
+                    _print_summary("SN-S", sn["sector"])
+                    _print_bootstrap("SN-S", sn["sector"])
+                    _print_power("SN-S", sn["sector"])
+                print("  (SN-S is the honest read: within-sector selection net of the "
+                      "size tilt.)")
+
+        # REGIME: a pooled mean hides regime dependence, which a size-tilted signal
+        # is especially prone to.
+        if args.vol_gate:
+            n_f = max(1, len(real["folds"]))
+            print(f"[vol-gate] fired on {real['n_vol_gated']}/{len(real['folds'])} fold(s) "
+                  f"({real['n_vol_gated'] / n_f:.0%})"
+                  + ("" if args.smooth_span else
+                     "  -- NOTE: smooth_span=0, so this is inert by construction"))
+        if args.regime_report:
+            rep = regime_report(real["folds"])
+            print("\n[REGIME] per-calendar-year:")
+            print(f"  {'year':<6} {'n':>4} {'mean_ic':>9} {'sector_ic':>10} {'hit':>6}")
+            for year, agg in rep["by_year"].items():
+                print(f"  {year:<6} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
+                      f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
+            if rep["by_vol_regime"]:
+                print("  by realized-vol regime (IN-SAMPLE tertiles of the cross-sectional "
+                      "median — descriptive only):")
+                for name, agg in rep["by_vol_regime"].items():
+                    print(f"  {name:<9} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
+                          f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
+            if rep["by_vol_regime_pit"]:
+                print(f"  by realized-vol regime (PIT expanding tertiles, burn-in "
+                      f"{rep['pit_burn_in']}, {rep['pit_n_scored']} folds scored — "
+                      f"this is the one that counts):")
+                for name, agg in rep["by_vol_regime_pit"].items():
+                    print(f"  {name:<9} {agg['n']:>4} {agg['mean_ic']:>9.4f} "
+                          f"{agg['mean_sector_ic']:>10.4f} {agg['hit_rate']:>6.2f}")
+
         # DIAGNOSTIC: universe IC includes sector rotation; high here + flat SECB
         # ⇒ the edge is sector timing, not stock selection (does NOT clear the bar).
         print("[diagnostic] universe IC (incl. sector rotation):")
@@ -1886,6 +2782,62 @@ async def run(args) -> None:
             )
             _print_bootstrap("BOOT", boot)
 
+        tol = real.get("top_of_list") or {}
+        if tol:
+            print("\n[TOP OF LIST] what the product actually ships "
+                  "(SECB is a full-list average and cannot see this):")
+            print(f"  {'metric':<16} {'mean':>9} {'std':>8} {'hit':>6}  n={tol['spread_decile']['n_folds']}")
+            for name, label in (("spread_decile", "decile spread"),
+                                ("top_decile_r", "top decile ret"),
+                                ("precision_at_k", "precision@50")):
+                s = tol[name]
+                print(f"  {label:<16} {s['mean_ic']:>+9.4f} {s['std_ic']:>8.4f} {s['hit_rate']:>6.2f}")
+            spread = [f["spread_decile"] for f in real["folds"]
+                      if f.get("spread_decile") == f.get("spread_decile")]
+            if spread:
+                b = block_bootstrap_summary(spread, block_size=block_size,
+                                            reps=args.block_bootstrap_reps, seed=args.seed)
+                print(f"  decile spread  block={block_size}  t_block={b['t_block']:+.2f}  "
+                      f"p={b['p_value']:.4f}  ci95=[{b['ci_low']:+.4f}, {b['ci_high']:+.4f}]")
+
+        by_sec = real.get("sector_ic_by_group") or {}
+        if by_sec:
+            print("\n[BY SECTOR] the parts SECB averages away "
+                  "(a signal living in one sector reads the same as one spread evenly):")
+            for sec, s in sorted(by_sec.items(), key=lambda kv: -kv[1]["mean_ic"]):
+                print(f"  {sec:<26} n={s['n_folds']:>4}  mean_ic={s['mean_ic']:>+.4f}")
+
+        bl = real.get("baselines")
+        if bl:
+            key = "sector" if args.sector_neutral_ic else "universe"
+            gbdt = (real["sector_summary"] if args.sector_neutral_ic
+                    else real["summary"])["mean_ic"]
+            print(f"\n[BASELINES] same folds, same target — is the GBDT earning its "
+                  f"complexity? ({'SECB' if args.sector_neutral_ic else 'universe'} IC)")
+            print(f"  {'estimator':<22} {'mean_ic':>9} {'icir':>7} {'hit':>6}")
+            print(f"  {'GBDT (headline)':<22} {gbdt:>+9.4f}")
+            for name, label in (("ridge", "ridge"),
+                                ("combo", "forecast combination")):
+                s = bl[name][key]
+                print(f"  {label:<22} {s['mean_ic']:>+9.4f} {s['icir']:>7.3f} "
+                      f"{s['hit_rate']:>6.2f}   (delta vs GBDT {gbdt - s['mean_ic']:+.4f})")
+
+        fd = real.get("fit_diagnostics")
+        if fd:
+            tr, te = fd["train"]["mean_ic"], fd["test"]["mean_ic"]
+            print(f"\n[FIT] in-sample IC {tr:+.4f}  vs  out-of-sample {te:+.4f}  "
+                  f"(gap {tr - te:+.4f})")
+            if fd["tree_curve"]:
+                print("  IC vs trees (same fits, truncated via num_iteration):")
+                print("   " + "  ".join(f"{k}:{v:+.4f}" for k, v in fd["tree_curve"].items()))
+                best = max(fd["tree_curve"].items(), key=lambda kv: kv[1])
+                print(f"   peak at {best[0]} trees (IC {best[1]:+.4f}); "
+                      f"production uses {lgb_cfg.n_estimators}")
+            top = list(fd["importance"].items())[:15]
+            print("  top gain importances:")
+            for c, v in top:
+                print(f"   {c:<28} {v:.4f}")
+
         if args.null_reps > 0:
             print(f"\nrunning {args.null_reps} shuffle-null reps ...")
             null_means, null_sec_means = [], []
@@ -1893,13 +2845,21 @@ async def run(args) -> None:
                 res = walk_forward_ic(panel, args.horizon, lgb_cfg, wf_cfg,
                                       seed=args.seed + 1000 * (rep + 1), shuffle=True,
                                       target_mode=args.target, feature_cols=feature_cols,
+                                      # Must match the real run: a null built from a
+                                      # 1-seed estimator has a wider sampling
+                                      # distribution than an 8-seed real statistic,
+                                      # so the z-band would compare unlike things.
+                                      n_seeds=args.n_seeds,
                                       compute_sector_ic=args.sector_neutral_ic,
                                       sector_group_col=args.neutralize_by,
                                       linear_blend=args.with_linear_blend,
                                       ridge_alpha=args.ridge_alpha,
                                       smooth_span=args.smooth_span,
                                       knife_lambda=args.knife_lambda,
-                                      winsorize_pct=args.winsorize_target)
+                                      winsorize_pct=args.winsorize_target,
+                                      max_test_date=args.max_test_date,
+                                      min_test_date=args.min_test_date,
+                                      vol_gate=args.vol_gate)
                 m = res["summary"]["mean_ic"]
                 null_means.append(m)
                 if args.sector_neutral_ic and "sector_summary" in res:
@@ -1921,6 +2881,14 @@ async def run(args) -> None:
             _verdict("verdict(univ)", real["summary"]["mean_ic"], null_means)
 
 
+def _iso_date(raw: str) -> date:
+    """argparse type for YYYY-MM-DD; panel grid dates are datetime.date."""
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {raw!r}") from exc
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Cross-sectional LightGBM walk-forward baseline")
     p.add_argument(
@@ -1929,12 +2897,24 @@ def main() -> None:
     )
     p.add_argument("--min-train-months", type=int, default=36)
     p.add_argument("--max-train-months", type=int, default=None,
-                   help="rolling window length in months (default: expanding)")
+                   help="rolling training-window length in monthly grid dates. Default "
+                        "(omitted) = the horizon's PRODUCTION_HORIZON_SPECS window, so a "
+                        "re-validation measures the deployed model (6M ships rolling-60). "
+                        "Pass 0 to force an expanding window.")
     p.add_argument("--min-names", type=int, default=30, help="skip thinner test cross-sections")
+    p.add_argument("--max-test-date", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+                   help="score only folds whose TEST date is on or before this. Frozen-holdout "
+                        "discipline: research/selection runs must stop far enough back that every "
+                        "label is realized before the holdout opens (holdout 2024-01 => 3M "
+                        "2023-09-30, 6M 2023-06-30, 1Y 2022-12-31). Training is unaffected.")
+    p.add_argument("--min-test-date", type=_iso_date, default=None, metavar="YYYY-MM-DD",
+                   help="score only folds whose TEST date is on or after this. Used ONCE per "
+                        "finalized config for the frozen holdout run (--min-test-date 2024-01-01); "
+                        "that run is a sign/sanity check, not a significance test.")
     p.add_argument("--target", default="return",
                    choices=["return", "rank", "quantile", "sector_return",
                             "sector_return_vol", "beta_resid", "beta_sector_resid",
-                            "sector_grade"],
+                            "sector_grade", "sector_rank"],
                    help="training target transform (scoring is always vs realized "
                         "universe-demeaned return; sector_return / beta_resid / "
                         "beta_sector_resid are alpha-residual modes; "
@@ -1942,7 +2922,9 @@ def main() -> None:
                         "floored at the per-date 20th pct — homoskedasticizes label "
                         "noise and shrinks high-vol labels, goal A + B lever; "
                         "sector_grade = per-date qcut of sector_return into ordinal "
-                        "grades for a --objective lambdarank fit)")
+                        "grades for a --objective lambdarank fit; sector_rank = the "
+                        "continuous per-date percentile of sector_return, the "
+                        "Cakici-Zaremba rank target, which keeps an L2 fit)")
     p.add_argument(
         "--n-buckets", type=int, default=5,
         help="equal-count buckets for --target quantile",
@@ -1977,19 +2959,21 @@ def main() -> None:
                         "cross-section toward names that are NOT both high-vol and "
                         "downtrending; composes ahead of --smooth-span. Suppresses "
                         "'falling knife' picks at the top and lowers turnover.")
-    p.add_argument("--objective", default="regression",
+    p.add_argument("--objective", default=None,
                    choices=["regression", "lambdarank", "rank_xendcg"],
-                   help="LightGBM training objective. 'regression' = pointwise L2 "
-                        "(default). 'lambdarank'/'rank_xendcg' switch to LGBMRanker "
-                        "(learning-to-rank, aligned with rank-IC scoring); require "
+                   help="LightGBM training objective. Default: the horizon's "
+                        "production objective (6M/1Y ship lambdarank). 'regression' = "
+                        "pointwise L2; 'lambdarank'/'rank_xendcg' switch to LGBMRanker "
+                        "(learning-to-rank, aligned with rank-IC scoring) and require "
                         "--target sector_grade (ordinal grades + per-date query group)")
     p.add_argument("--rank-grades", type=int, default=5, metavar="K",
                    help="number of ordinal grades for --target sector_grade (per-date "
                         "qcut buckets); default 5 matches the quantile-bucket convention")
-    p.add_argument("--lambdarank-truncation", type=int, default=500, metavar="N",
+    p.add_argument("--lambdarank-truncation", type=int, default=None, metavar="N",
                    help="LambdaRank list-truncation level (pairs beyond rank N are "
-                        "ignored in the gradient); default 500 >= cross-section size "
-                        "for full-list ranking. Lower focuses the loss on the top.")
+                        "ignored in the gradient). Default: the horizon's production "
+                        "value (100, the top of the list the product ships). Pass "
+                        ">= the cross-section size for full-list ranking.")
     p.add_argument("--subsample", type=float, default=None, metavar="F",
                    help="row-bagging fraction override (default: LGBMConfig 0.8). "
                         "Used to smoke the bagging x pairwise-gradient interaction "
@@ -2090,11 +3074,90 @@ def main() -> None:
                         "calendar-month return persistence: seasonal_same/other/gap_5y). "
                         "Expect signal at 3M; 1Y is a wash (forward window spans all "
                         "12 months). PIT-safe (completed months strictly before the bar).")
+    p.add_argument("--diagnose-features", default=None, metavar="c1,c2,...",
+                   help="run --feature-diagnostics on these exact columns instead of "
+                        "the opted-in packs. Needed to vet a feature that is already "
+                        "in the book, e.g. --diagnose-features fund_available,log_market_cap.")
+    p.add_argument("--size-neutral-ic", action="store_true",
+                   help="also report IC with log_market_cap partialled out (partial "
+                        "Spearman, post-hoc on the same folds — no refits). The size "
+                        "premium is a documented RISK premium; what survives this is "
+                        "the part not explained by a size tilt.")
+    p.add_argument("--vol-gate", action="store_true",
+                   help="shrink ranks toward 0.5 on PIT high-vol dates (expanding 80th "
+                        "pctile of the cross-sectional median raw vol, 24-fold burn-in). "
+                        "Composes BEFORE smoothing; provably inert without it, so 6M "
+                        "(smooth_span=0) is unaffected by construction.")
+    p.add_argument("--regime-report", action="store_true",
+                   help="break per-fold IC out by calendar year and by realized-vol "
+                        "tertile. A pooled mean hides regime dependence.")
+    p.add_argument("--membership-filter", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="restrict each cross-section to point-in-time index members "
+                        "(index_membership, migration 012). ON by default: without it "
+                        "a name promoted into the index in 2023 still appears in the "
+                        "2017 cross-sections, which selects on future index promotion. "
+                        "Use --no-membership-filter to measure that bias.")
+    p.add_argument("--with-sentiment", action="store_true",
+                   help="add the FinBERT rolling news sentiment pack (sentiment_7d/"
+                        "sentiment_14d). OFF by default: yfinance serves only ~30 days "
+                        "of headlines, so the columns are ~98%% zero across the panel "
+                        "and cannot be validated. Turn on once a headline archive is "
+                        "backfilled.")
+    p.add_argument("--n-estimators", type=int, default=None, metavar="N",
+                   help="boosting rounds (default: LGBMConfig's 300). Use with "
+                        "--fit-diagnostics to read the IC-vs-trees curve first; a "
+                        "fixed learning rate and no early stopping mean the first N "
+                        "trees of a 300-tree fit ARE the N-tree fit, so the curve and "
+                        "a refit agree.")
+    p.add_argument("--min-child-samples", type=int, default=None, metavar="N",
+                   help="minimum rows per leaf (default 50). The default is calibrated "
+                        "against the RAW row count, but overlapping labels mean the "
+                        "effective sample size is roughly rows/H — so the model is "
+                        "regularized against a sample it does not have.")
+    p.add_argument("--baselines", action="store_true",
+                   help="score a ridge and an equal-weight forecast combination on the "
+                        "SAME folds as the GBDT. Han-He-Rapach-Zhou (RoF 2024) find "
+                        "regularized-linear + combination beats RF/DNN on US "
+                        "cross-sectional OOS accuracy, so a GBDT that cannot clear "
+                        "these is buying complexity risk and nothing else.")
+    p.add_argument("--fit-diagnostics", action="store_true",
+                   help="report in-sample vs out-of-sample IC, an IC-vs-number-of-trees "
+                        "curve (read off the same fits via num_iteration, so no extra "
+                        "training), and gain-based feature importances averaged over "
+                        "folds. Answers whether the model is over- or under-fitting — "
+                        "train IC was never computed, so that gap was unobservable.")
+    p.add_argument("--with-issuance", action="store_true",
+                   help="add net share issuance (shares now vs shares a year ago, both "
+                        "point-in-time from the filing cover page). Pontiff-Woodgate; "
+                        "Fama-French 2008 find it pervasive across size groups. Needs "
+                        "no new ingestion.")
+    p.add_argument("--with-analyst-breadth", action="store_true",
+                   help="add the analyst-breadth pack (consensus revenue revisions, "
+                        "EPS estimate-count change, coverage level, coverage LOSS). "
+                        "Extends coverage_chg_90d, the cleanest feature in the "
+                        "post-audit diagnostics, using LSEG columns already ingested.")
+    p.add_argument("--with-payout", action="store_true",
+                   help="add trailing-12m dividend yield, from price_history.dividend "
+                        "(stored since the first ingest, never selected until now).")
+    p.add_argument("--with-range-vol", action="store_true",
+                   help="add Parkinson high/low range volatility (20d/60d). A "
+                        "lower-variance estimate of what vol_20d/vol_60d already "
+                        "proxy, so treat it as a REPLACEMENT for the close-to-close "
+                        "vol block rather than an addition.")
+    p.add_argument("--with-estimate-missing", action="store_true",
+                   help="add the LSEG availability pack (est_available, "
+                        "est_staleness_days) — the analyst-feed analogue of "
+                        "fund_available. Opt-in: analyst_estimates starts in 2012-13, "
+                        "so these flag the rows where the promoted estimate packs are "
+                        "NaN rather than observed.")
     p.add_argument("--extra-features", default=None, metavar="c1,c2,...",
                    help="append these ad-hoc feature columns to the active list "
                         "(isolate one member of a pack for a targeted ablation, e.g. "
                         "--extra-features sales_to_price). Columns must be produced by "
                         "build_ticker_rows.")
+    p.add_argument("--research-pack", choices=("analyst", "news", "accounting", "stress", "macro"),
+                   help="registered pack diagnostics; use scripts.signal_research for matched fits")
     p.add_argument("--industry-relative", action="store_true",
                    help="rank-normalize price/fundamental/valuation/quality "
                         "features within (date, industry) instead of universe-wide")

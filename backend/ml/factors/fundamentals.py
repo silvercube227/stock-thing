@@ -66,6 +66,37 @@ def _ttm_net_income_asof(fund_rows: list[dict], as_of_dates: list) -> list[float
     return out
 
 
+def _shares_outstanding_asof(
+    fund_rows: list[dict], as_of_dates: list, with_filed_at: bool = False
+) -> list:
+    """Most recent as-reported share count on file for each as-of date.
+
+    Point-in-time on `filed_at`, like every other fundamental field. Returns None
+    where no filing carrying a share count exists yet, so the caller can fall back
+    rather than treat "unknown" as zero.
+
+    Rows predating the shares backfill have no `shares_outstanding` key at all
+    (older cached frames), hence the `.get`.
+    """
+    annotated = [
+        (_as_date(r["filed_at"]), float(r["shares_outstanding"]))
+        for r in sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))
+        if r.get("shares_outstanding") is not None
+    ]
+    if not annotated:
+        return [(None, None)] * len(as_of_dates) if with_filed_at else [None] * len(as_of_dates)
+
+    filed_ats = [f for f, _ in annotated]
+    out: list = []
+    for d in as_of_dates:
+        idx = bisect.bisect_right(filed_ats, d) - 1
+        hit = annotated[idx] if idx >= 0 else (None, None)
+        # `with_filed_at` lets a caller tell WHICH filing answered the lookup — net
+        # issuance needs that to avoid comparing a filing against itself.
+        out.append((hit[1], hit[0]) if with_filed_at else (hit[1] if idx >= 0 else None))
+    return out
+
+
 def _fundamental_context_asof(fund_rows: list[dict], as_of_dates: list) -> dict[str, list[float]]:
     """Point-in-time valuation + quality snapshots for each as-of date."""
     rows_sorted = sorted(fund_rows, key=lambda r: _as_date(r["filed_at"]))

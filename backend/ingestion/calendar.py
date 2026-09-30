@@ -44,6 +44,7 @@ def expected_bar_count(start: date, end: date) -> int:
     return len(trading_days_between(start, end))
 
 
+@lru_cache(maxsize=65536)
 def shift_trading_days(d: date, n: int) -> date | None:
     """Return the date that is `n` trading days after `d` (n>=0).
 

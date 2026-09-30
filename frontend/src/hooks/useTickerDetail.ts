@@ -10,10 +10,13 @@ import {
 } from "@/lib/api";
 
 // Prediction availability for this ticker: "ready" once it has scored rows,
-// "running" while a user-added ticker is still being ingested/scored, or a
-// terminal "insufficient_history" / "failed" outcome.
+// "queued"/"running" while a user-added ticker is waiting for or undergoing
+// ingestion+scoring, or a terminal "insufficient_history" / "failed" outcome.
+// "queued" means the hosted API took the request but the scoring machine (which
+// owns the ML stack and the model artifact) has not picked it up yet.
 export type PredStatus =
   | "ready"
+  | "queued"
   | "running"
   | "insufficient_history"
   | "failed"
@@ -74,9 +77,11 @@ export function useTickerDetail(symbol: string, lookback = "1y") {
     };
   }, [symbol, loadDetail]);
 
-  // While a scoring job is running, poll until it resolves, then refetch detail.
+  // While a scoring job is queued or running, poll until it resolves, then refetch
+  // detail. A queued job can wait a while (the scoring machine may be asleep), so it
+  // has to keep polling rather than being treated as terminal.
   useEffect(() => {
-    if (predStatus !== "running") return;
+    if (predStatus !== "running" && predStatus !== "queued") return;
     let cancelled = false;
     const id = setInterval(async () => {
       try {
@@ -85,7 +90,9 @@ export function useTickerDetail(symbol: string, lookback = "1y") {
         if (s.status === "ready") {
           await loadDetail();
           if (!cancelled) setPredStatus("ready");
-        } else if (s.status !== "running") {
+        } else if (s.status === "queued" || s.status === "running") {
+          setPredStatus(s.status); // still in flight — keep polling
+        } else {
           setPredStatus(s.status as PredStatus); // insufficient_history | failed
         }
       } catch {

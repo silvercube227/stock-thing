@@ -32,6 +32,14 @@ create table if not exists tickers (
     removed_at      timestamptz,
     embedding_idx        integer not null unique default nextval('ticker_embedding_seq'),
     shares_outstanding   bigint,                     -- current shares; with adj_close gives historical market cap
+    price_source_exclusions jsonb not null default '{}'::jsonb
+        check (jsonb_typeof(price_source_exclusions) = 'object'),
+    price_history_start date,
+    price_history_start_source jsonb,
+    constraint tickers_price_history_start_evidence check (
+        (price_history_start is null and price_history_start_source is null) or
+        (price_history_start is not null and price_history_start_source is not null
+         and jsonb_typeof(price_history_start_source)='object')),
     created_at      timestamptz not null default now(),
     updated_at      timestamptz not null default now()
 );
@@ -39,6 +47,26 @@ create table if not exists tickers (
 create unique index if not exists tickers_active_symbol_uniq
     on tickers (symbol) where active = true;
 create index if not exists tickers_cik_idx on tickers (cik) where cik is not null;
+
+-- =============================================================
+-- index_membership  (point-in-time S&P 500 membership)
+-- =============================================================
+-- One row per contiguous membership interval; re-added names get multiple rows.
+-- valid_to is EXCLUSIVE (member while valid_from <= d < valid_to); null = current.
+-- Without this the panel selects on future index promotion: a name added in 2023
+-- would otherwise appear in the 2017 cross-sections. See migration 012 for the
+-- `source` provenance values and the pre-2016 coverage gap.
+create table if not exists index_membership (
+    ticker_id   bigint not null references tickers(ticker_id) on delete restrict,
+    valid_from  date not null,              -- inclusive
+    valid_to    date,                       -- exclusive; null = still a member
+    source      text not null default 'wikipedia_changes',
+    ingested_at timestamptz not null default now(),
+    primary key (ticker_id, valid_from)
+);
+
+create index if not exists index_membership_valid_to_idx
+    on index_membership (valid_to);
 
 -- =============================================================
 -- price_history
@@ -77,6 +105,8 @@ create table if not exists fundamentals (
     total_debt          numeric,
     total_equity        numeric,
     fcf                 numeric,
+    shares_outstanding  bigint,                  -- as-reported cover-page count (migration 011);
+                                                 -- with raw close gives historical market cap
     ingested_at         timestamptz not null default now(),
     primary key (ticker_id, accession_number)
 );
@@ -245,6 +275,10 @@ create table if not exists predictions (
                                                  -- below-trend/near-52w-low (transparency only,
                                                  -- does not affect direction_prob)
     cold_start          boolean not null default false,
+    smooth_state        numeric,                 -- raw EWMA state behind direction_prob
+                                                 -- (migration 014); advanced monthly so
+                                                 -- production smoothing matches the
+                                                 -- walk-forward that set smooth_span
     created_at          timestamptz not null default now(),
     primary key (ticker_id, model_version_id, as_of_date, horizon)
 );
@@ -264,7 +298,11 @@ create table if not exists ingestion_runs (
     started_at      timestamptz not null default now(),
     finished_at     timestamptz,
     status          text not null default 'running'
-                    check (status in ('running', 'success', 'partial', 'failed', 'skipped')),
+                    check (status in ('queued', 'running', 'success', 'partial',
+                                      'failed', 'skipped')),
+                                                 -- 'queued' = accepted by the hosted
+                                                 -- read-API, waiting for the local
+                                                 -- machine to drain it (migration 016)
     rows_inserted   integer,
     rows_updated    integer,
     error_message   text,
@@ -293,3 +331,91 @@ drop trigger if exists portfolio_holdings_set_updated_at on portfolio_holdings;
 create trigger portfolio_holdings_set_updated_at
     before update on portfolio_holdings
     for each row execute function set_updated_at();
+
+
+-- Migration 017: long-horizon research metadata
+-- Research metadata. Existing rows deliberately remain unknown until verified/backfilled.
+alter table tickers add column if not exists ric text;
+alter table tickers add column if not exists research_only boolean not null default false;
+alter table price_history add column if not exists price_basis text;
+alter table fundamentals add column if not exists shares_measured_at date;
+alter table fundamentals add column if not exists shares_concept text;
+alter table fundamentals add column if not exists shares_kind text;
+alter table fundamentals add column if not exists shares_basis text;
+alter table index_membership add column if not exists index_id text not null default 'SPX';
+alter table index_membership drop constraint if exists index_membership_pkey;
+alter table index_membership add primary key (ticker_id, index_id, valid_from);
+
+create table if not exists security_identifiers (
+    ticker_id bigint not null references tickers(ticker_id),
+    identifier_type text not null, identifier text not null,
+    valid_from date not null, valid_to date, source text not null,
+    primary key (ticker_id, identifier_type, identifier, valid_from),
+    check (valid_to is null or valid_to > valid_from)
+);
+create table if not exists security_events (
+    ticker_id bigint not null references tickers(ticker_id),
+    effective_date date not null,
+    event_type text not null check (event_type in ('acquisition', 'bankruptcy',
+        'liquidation', 'security_replacement', 'trading_termination', 'unresolved_gap')),
+    consideration_type text, cash_value double precision, proceeds_basis text,
+    horizon_values jsonb, source text not null, verified boolean not null default false,
+    primary key (ticker_id, effective_date)
+);
+-- Original filing spans, including YTD flows; later accessions never overwrite earlier ones.
+create table if not exists accounting_facts (
+    ticker_id bigint not null references tickers(ticker_id), accession_number text not null,
+    filed_at date not null, period_start date, period_end date not null,
+    metric text not null, value double precision not null, source_concept text not null,
+    span_start date generated always as (coalesce(period_start, period_end)) stored,
+    primary key (ticker_id, accession_number, metric, span_start, period_end, source_concept),
+    check (period_end <= filed_at)
+);
+create table if not exists fixed_estimates (
+    ticker_id bigint not null references tickers(ticker_id), as_of_date date not null,
+    fiscal_period_end date not null, contributor_id text not null default 'consensus',
+    eps double precision not null, adjustment_basis text not null,
+    source text not null, verified boolean not null default false,
+    primary key (ticker_id, as_of_date, fiscal_period_end, contributor_id)
+);
+create table if not exists macro_vintages (
+    series_id text not null, obs_date date not null, available_from date not null,
+    vintage_date date not null, value double precision, source text not null,
+    verified boolean not null default false,
+    primary key (series_id, obs_date, vintage_date),
+    check (available_from >= obs_date)
+);
+create table if not exists research_news_daily (
+    ticker_id bigint not null references tickers(ticker_id), score_date date not null,
+    scorer_revision text not null, n_events integer not null,
+    sentiment_sum double precision, n_negative integer not null,
+    guidance_up integer not null, guidance_down integer not null,
+    operating_n integer not null, operating_sentiment_sum double precision,
+    primary key (ticker_id, score_date, scorer_revision)
+);
+create table if not exists research_news_coverage (
+    ticker_id bigint not null references tickers(ticker_id),
+    start_date date not null, end_date date not null, status text not null,
+    source text not null, primary key (ticker_id, start_date, end_date),
+    check (status in ('complete', 'empty', 'partial', 'error'))
+);
+
+-- Migration 018: research inputs are accessible only through backend DB roles.
+alter table security_identifiers enable row level security;
+alter table security_events enable row level security;
+alter table accounting_facts enable row level security;
+alter table fixed_estimates enable row level security;
+alter table macro_vintages enable row level security;
+alter table research_news_daily enable row level security;
+alter table research_news_coverage enable row level security;
+revoke all on table security_identifiers, security_events, accounting_facts,
+    fixed_estimates, macro_vintages, research_news_daily, research_news_coverage
+    from public, anon, authenticated;
+
+-- Migration 019: distinguish security share counts from price-only adjustments.
+alter table price_history add column if not exists share_split_factor numeric;
+alter table price_history add column if not exists share_action_source text;
+comment on column price_history.share_split_factor is
+    'Verified new/old shares of this security; pricing-only distributions use 1.';
+comment on column price_history.split_factor is
+    'Source price adjustment ratio, potentially including pricing-only distributions.';

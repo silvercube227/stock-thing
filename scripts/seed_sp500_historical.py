@@ -39,12 +39,20 @@ def normalize_symbol(raw: str) -> str:
     return raw.strip().upper().replace(".", "-")
 
 
-def parse_removed_tickers(html: str, since: date) -> list[dict]:
-    """Extract [{symbol, name, removed_at}] from the Wikipedia changes table.
+_EMPTY_CELL = ("", "—", "-", "–")
+
+
+def parse_change_rows(html: str) -> list[dict]:
+    """Every index change event, keeping BOTH sides of each row.
 
     The changes table is the second wikitable on the S&P 500 page. Rows have
     six columns: Date | Added Ticker | Added Name | Removed Ticker | Removed Name | Reason.
-    A row with an empty removed-ticker cell means only an addition occurred; skip it.
+    Either side may be empty (an addition-only or removal-only event).
+
+    Returns [{date, added_symbol, added_name, removed_symbol, removed_name}] sorted
+    ascending by date. The additions are what `scripts/seed_index_membership.py`
+    needs to reconstruct point-in-time membership; this seed script only consumes
+    the removals (see `parse_removed_tickers`).
     """
     soup = bs4.BeautifulSoup(html, "html.parser")
     tables = soup.find_all("table", class_="wikitable")
@@ -52,13 +60,18 @@ def parse_removed_tickers(html: str, since: date) -> list[dict]:
         raise ValueError("could not find historical changes table (expected >=2 wikitables)")
     changes_table = tables[1]
 
+    def cell_text(cells, idx: str | int) -> str | None:
+        if idx >= len(cells):
+            return None
+        text = cells[idx].get_text(strip=True)
+        return None if not text or text in _EMPTY_CELL else text
+
     out: list[dict] = []
     for tr in changes_table.find_all("tr"):
         cells = tr.find_all("td")
         if len(cells) < 4:
             continue  # header or malformed row
 
-        # Date is always the first cell.
         raw_date = cells[0].get_text(strip=True)
         change_date: date | None = None
         for fmt in ("%B %d, %Y", "%Y-%m-%d", "%b %d, %Y"):
@@ -67,23 +80,34 @@ def parse_removed_tickers(html: str, since: date) -> list[dict]:
                 break
             except ValueError:
                 continue
-        if change_date is None or change_date < since:
+        if change_date is None:
             continue
 
-        # Column layout: 0=date, 1=added ticker, 2=added name, 3=removed ticker, 4=removed name
-        removed_symbol = normalize_symbol(cells[3].get_text(strip=True))
-        # Empty or dash means this row is an addition-only event.
-        if not removed_symbol or removed_symbol in ("", "—", "-", "–"):
-            continue
-        removed_name = cells[4].get_text(strip=True) if len(cells) > 4 else None
-
+        added_raw = cell_text(cells, 1)
+        removed_raw = cell_text(cells, 3)
         out.append({
-            "symbol": removed_symbol,
-            "name": removed_name or None,
-            "removed_at": change_date,
+            "date": change_date,
+            "added_symbol": normalize_symbol(added_raw) if added_raw else None,
+            "added_name": cell_text(cells, 2),
+            "removed_symbol": normalize_symbol(removed_raw) if removed_raw else None,
+            "removed_name": cell_text(cells, 4),
         })
 
+    out.sort(key=lambda r: r["date"])
     return out
+
+
+def parse_removed_tickers(html: str, since: date) -> list[dict]:
+    """Extract [{symbol, name, removed_at}] for removals on or after `since`."""
+    return [
+        {
+            "symbol": row["removed_symbol"],
+            "name": row["removed_name"],
+            "removed_at": row["date"],
+        }
+        for row in parse_change_rows(html)
+        if row["removed_symbol"] and row["date"] >= since
+    ]
 
 
 async def fetch_wiki_html() -> str:

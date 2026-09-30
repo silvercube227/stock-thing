@@ -339,3 +339,72 @@ def test_zscored_returns_have_near_zero_mean() -> None:
     result = build_sample(1, sample_end, prices, [], [])
     assert result is not None
     assert abs(float(np.mean(result[:, COL_LOG_RETURN]))) < 0.01
+
+
+# =============================================================
+# Point-in-time market cap (log_market_cap input)
+# =============================================================
+
+
+def test_shares_outstanding_asof_uses_latest_filing_on_or_before():
+    from datetime import date as _date
+
+    from backend.ml.factors.fundamentals import _shares_outstanding_asof
+
+    rows = [
+        {"filed_at": _date(2020, 2, 1), "shares_outstanding": 1_000},
+        {"filed_at": _date(2020, 8, 1), "shares_outstanding": 900},
+    ]
+    out = _shares_outstanding_asof(
+        rows,
+        [_date(2020, 1, 1), _date(2020, 2, 1), _date(2020, 5, 1), _date(2020, 9, 1)],
+    )
+    assert out[0] is None      # nothing filed yet
+    assert out[1] == 1_000     # same-day filing is visible
+    assert out[2] == 1_000     # forward-filled between filings
+    assert out[3] == 900       # picks up the buyback
+
+
+def test_shares_outstanding_asof_skips_rows_without_a_count():
+    from datetime import date as _date
+
+    from backend.ml.factors.fundamentals import _shares_outstanding_asof
+
+    rows = [
+        {"filed_at": _date(2020, 2, 1), "shares_outstanding": 1_000},
+        {"filed_at": _date(2020, 8, 1), "shares_outstanding": None},
+        {"filed_at": _date(2020, 9, 1)},  # pre-backfill cached row: key absent
+    ]
+    out = _shares_outstanding_asof(rows, [_date(2020, 10, 1)])
+    assert out[0] == 1_000
+
+
+def test_market_cap_prefers_raw_close_times_pit_shares():
+    """Back-adjusted close embeds every split/dividend AFTER the bar, so using it
+    for a market-cap LEVEL is future information. Raw close x as-reported shares
+    is the point-in-time cap."""
+    from backend.ml.factors.assembly import _market_cap_at
+
+    cap = _market_cap_at(
+        raw_close=[100.0], adj_close=[82.0], pos=0,
+        pit_shares=1_000.0, static_shares=2_000,
+    )
+    assert cap == 100_000.0  # raw x PIT, not adj x static
+
+
+def test_market_cap_refuses_current_share_fallback():
+    """Current shares cannot establish historical market capitalization."""
+    from backend.ml.factors.assembly import _market_cap_at
+
+    cap = _market_cap_at(
+        raw_close=[100.0], adj_close=[82.0], pos=0,
+        pit_shares=None, static_shares=2_000,
+    )
+    assert np.isnan(cap)
+
+
+def test_market_cap_is_missing_when_nothing_is_available():
+    from backend.ml.factors.assembly import _market_cap_at
+
+    assert np.isnan(_market_cap_at([None], [None], 0, None, None))
+    assert np.isnan(_market_cap_at([0.0], [0.0], 0, 5.0, 5))

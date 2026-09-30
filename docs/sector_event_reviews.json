@@ -1,0 +1,38 @@
+{
+  "index": ".SPLRCI",
+  "continuity": [
+    {
+      "date": "2016-09-01",
+      "security_id": "HON.OQ",
+      "reason": "LSEG sector snapshots for August 31 and September 1 have identical constituent sets including Honeywell. The same-day join/leaver pair preserves existing Industrials membership; it must not create a new member or erase a membership interval. This review is scoped only to this sector-index event.",
+      "evidence": [
+        {
+          "artifact": ".research/sector-history-archive/15faa8fae146e1510aed51edf9352d915b67899b849e392386507550cc1265fc.json.gz",
+          "sha256": "15faa8fae146e1510aed51edf9352d915b67899b849e392386507550cc1265fc",
+          "request": {
+            "fields": [
+              "TR.IndexConstituentRIC"
+            ],
+            "parameters": {
+              "SDate": "2016-08-31"
+            },
+            "universe": ".SPLRCI"
+          }
+        },
+        {
+          "artifact": ".research/sector-history-archive/172c026367cae1b6a9b827038d534e70f5093b2fdafedaf7c8f7f670e6e19699.json.gz",
+          "sha256": "172c026367cae1b6a9b827038d534e70f5093b2fdafedaf7c8f7f670e6e19699",
+          "request": {
+            "fields": [
+              "TR.IndexConstituentRIC"
+            ],
+            "parameters": {
+              "SDate": "2016-09-01"
+            },
+            "universe": ".SPLRCI"
+          }
+        }
+      ]
+    }
+  ]
+}

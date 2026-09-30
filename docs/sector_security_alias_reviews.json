@@ -1,0 +1,79 @@
+{
+  "scope": "sector_membership_identity_only",
+  "aliases": [
+    {
+      "rics": [
+        "BKR.N",
+        "BKR.OQ"
+      ],
+      "security_id": "ISIN:US05722G1004",
+      "isin": "US05722G1004",
+      "cusip": "05722G100",
+      "cik": "0001701605",
+      "listing_transfer_date": "2021-12-07",
+      "evidence": {
+        "artifact": ".research/sector-history-archive/f79f4efdb8aab59943a983490a6e5a4127ff6e2acac0acba88eae39594918e83.json.gz",
+        "request": {
+          "fields": [
+            "TR.RIC",
+            "TR.ISIN",
+            "TR.CUSIP",
+            "TR.CIKNumber",
+            "TR.CommonName"
+          ],
+          "parameters": {},
+          "universe": [
+            "BKR.N",
+            "BKR.OQ",
+            "PX.N^J18",
+            "LIN.OQ",
+            "HST.N",
+            "HST.OQ"
+          ]
+        },
+        "rows": 8,
+        "sha256": "f79f4efdb8aab59943a983490a6e5a4127ff6e2acac0acba88eae39594918e83",
+        "status": "observed_requires_semantics_review"
+      },
+      "transfer_source": "https://www.nasdaqtrader.com/TraderNews.aspx?id=dtn2021-48",
+      "note": "Canonicalizes the identified share class in index-source records, which may use a later RIC for an earlier observation. Does not assert that either RIC was the tradable identifier outside its historical validity or authorize combining price histories."
+    },
+    {
+      "rics": [
+        "HST.N",
+        "HST.OQ"
+      ],
+      "security_id": "ISIN:US44107P1049",
+      "isin": "US44107P1049",
+      "cusip": "44107P104",
+      "cik": "0000314733",
+      "listing_transfer_date": "2020-11-02",
+      "evidence": {
+        "artifact": ".research/sector-history-archive/f79f4efdb8aab59943a983490a6e5a4127ff6e2acac0acba88eae39594918e83.json.gz",
+        "request": {
+          "fields": [
+            "TR.RIC",
+            "TR.ISIN",
+            "TR.CUSIP",
+            "TR.CIKNumber",
+            "TR.CommonName"
+          ],
+          "parameters": {},
+          "universe": [
+            "BKR.N",
+            "BKR.OQ",
+            "PX.N^J18",
+            "LIN.OQ",
+            "HST.N",
+            "HST.OQ"
+          ]
+        },
+        "rows": 8,
+        "sha256": "f79f4efdb8aab59943a983490a6e5a4127ff6e2acac0acba88eae39594918e83",
+        "status": "observed_requires_semantics_review"
+      },
+      "transfer_source": "https://ir.hosthotels.com/news-releases/news-release-details/host-hotels-resorts-announces-transfer-nasdaq-stock-market",
+      "note": "Both exact RIC rows identify the same common-stock ISIN/CUSIP. Additional issuer-context rows have blank RIC/ISIN/CUSIP and are not securities; they neither authorize issuer merging nor create extra share classes. This review is limited to sector-membership identity."
+    }
+  ]
+}

@@ -29,7 +29,7 @@ import asyncio
 import hashlib
 import json
 import pickle
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
 
@@ -38,6 +38,7 @@ import numpy as np
 from backend.config import get_settings
 from backend.ingestion.db import pool_context
 from backend.ml.dataset import (
+    IncompatibleFrameCache,
     build_calendar_grid,
     load_frames,
     load_frames_cached,
@@ -52,8 +53,11 @@ from backend.ml.gbm_baseline import (
     blend_gbdt_linear,
     fit_linear_model,
     fit_lgbm_model,
+    _rank01,
     knife_overlay_ranks,
     knife_tier,
+    vol_gate_flags,
+    vol_gate_ranks,
     prepare_panel,
     winsorize_by_date,
 )
@@ -73,6 +77,22 @@ def _target_col(horizon: str, target_mode: str) -> str:
 def _spec_feature_cols(spec: HorizonSpec) -> list[str]:
     """Per-horizon feature list — falls back to production FEATURE_COLS."""
     return spec.feature_cols if spec.feature_cols is not None else list(FEATURE_COLS)
+
+
+def _membership_available(frames) -> bool:
+    """True when index_membership was actually loaded for at least one frame.
+
+    The daily pipeline must not hard-fail if migration 012 or the membership seed
+    hasn't been run, so inference degrades to an unfiltered panel with a loud
+    warning — unlike the research CLI, which raises.
+    """
+    available = any(getattr(f, "membership", None) is not None for f in frames)
+    if not available:
+        print(
+            "WARNING: no index_membership data — scoring on an UNFILTERED panel. "
+            "Apply migration 012 and run `python -m scripts.seed_index_membership`."
+        )
+    return available
 
 
 def _sha256(path: Path) -> str:
@@ -116,6 +136,8 @@ def fit_horizon_models(
             & panel[m_col].astype(bool)
             & panel[t_col].notna()
         ]
+        if f"label_end_{h}" in train:
+            train = train[train[f"label_end_{h}"].notna() & (train[f"label_end_{h}"] < as_of)]
         if exclude_ids:
             train = train[~train["ticker_id"].isin(exclude_ids)]
         if spec.max_train_months is not None:
@@ -186,12 +208,23 @@ def score_current_cross_section(
         raise ValueError(f"no active ticker rows available for as_of={as_of}")
 
     if isinstance(specs, dict):
-        iter_pairs = [(h, _spec_feature_cols(s), getattr(s, "knife_lambda", 0.0))
+        iter_pairs = [(h, _spec_feature_cols(s), getattr(s, "knife_lambda", 0.0),
+                       getattr(s, "vol_gate", False))
                       for h, s in specs.items()]
     else:
-        iter_pairs = [(h, list(FEATURE_COLS), 0.0) for h in specs]
+        iter_pairs = [(h, list(FEATURE_COLS), 0.0, False) for h in specs]
 
     import pandas as pd
+
+    # Is `as_of` a point-in-time stress cross-section? The gate compares this date's
+    # cross-sectional median raw vol against the expanding 80th percentile of every
+    # EARLIER grid date, which the panel already carries (prepare_panel stashes
+    # `vol_120d_raw` before rank-normalization) — no extra state, no new table.
+    vol_gated = False
+    if "vol_120d_raw" in panel.columns:
+        med = (panel[panel["date"] <= as_of]
+               .groupby("date")["vol_120d_raw"].median().sort_index())
+        vol_gated = bool(vol_gate_flags(list(med.to_numpy(dtype=float)))[-1]) if len(med) else False
 
     # Risk features for the falling-knife overlay (one cross-section), read from the
     # rank-normalized panel; reused across horizons since they're horizon-agnostic.
@@ -211,7 +244,7 @@ def score_current_cross_section(
 
     rows: list[dict] = []
     n = len(current)
-    for h, cols, knife_lambda in iter_pairs:
+    for h, cols, knife_lambda, spec_vol_gate in iter_pairs:
         # Predictions are mapped to within-cross-section percentile rank in [0, 1]
         # before storage. The previous "clip to [0,1]" path worked for `rank`-mode
         # training where preds were already roughly in that range, but a
@@ -222,14 +255,21 @@ def score_current_cross_section(
         # cross-sections collapse to 0.5.
         model_or_list = models[h]
         if isinstance(model_or_list, list):
+            # Rank-average, matching gbm_baseline._fit_predict: LambdaRank scores are
+            # not on a common scale across seeds, so a raw mean lets the seed with the
+            # widest score range dominate the ensemble.
             preds = np.mean(
-                [np.asarray(m.predict(current[cols]), dtype=float) for m in model_or_list], axis=0
+                [_rank01(np.asarray(m.predict(current[cols]), dtype=float))
+                 for m in model_or_list], axis=0
             )
         else:
             preds = np.asarray(model_or_list.predict(current[cols]), dtype=float)
         if h in linear_models:
             ridge, weight = linear_models[h]
-            lin_pred = np.asarray(ridge.predict(current[cols].to_numpy(dtype=float)), dtype=float)
+            lin_pred = np.asarray(
+                ridge.predict(np.nan_to_num(current[cols].to_numpy(dtype=float), nan=0.0)),
+                dtype=float,
+            )
             preds = blend_gbdt_linear(preds, lin_pred, weight)
         if n > 1:
             ranks_raw = pd.Series(preds).rank(method="average").to_numpy()
@@ -238,6 +278,11 @@ def score_current_cross_section(
             # out of the top before the rank is stored / smoothed. No-op when
             # knife_lambda=0 or the risk features are absent.
             ranks = knife_overlay_ranks(ranks, knife_risk, knife_lambda)
+            # Stress gate: shrink toward 0.5 so this date carries less weight in the
+            # cross-date EWMA below. Inert unless the horizon smooths (see
+            # vol_gate_ranks) — must therefore run BEFORE apply_rank_smoothing.
+            if spec_vol_gate:
+                ranks = vol_gate_ranks(ranks, vol_gated)
         else:
             ranks = np.full_like(preds, 0.5, dtype=float)
         for ticker_id, rank in zip(current["ticker_id"].to_numpy(), ranks, strict=True):
@@ -295,19 +340,28 @@ def apply_cross_horizon_shrink(
 def apply_rank_smoothing(
     prediction_rows: list[dict],
     specs: dict,
-    prior_ranks: dict[tuple[int, str], list[float]],
+    prior_state: dict[tuple[int, str], float],
+    advance: bool = True,
 ) -> list[dict]:
-    """EWMA-smooth each name's percentile rank toward its most recent stored rank.
+    """EWMA-smooth each name's percentile rank, matching `ewma_rank_by_ticker` exactly.
 
-    For horizons whose `HorizonSpec.smooth_span > 0` (3M/1Y in production), blend the
-    current `relative_rank` with the name's last stored (already-smoothed) rank using
-    `alpha = 2/(span+1)`, then re-rank within the horizon to a clean percentile so the
-    stored value stays a uniform [0,1] rank. This is the online one-step form of the
-    walk-forward's `ewma_rank_by_ticker`: the previously stored rank is the carried
-    state. Names with no prior keep their raw rank; single-name horizons are skipped.
+    For horizons whose `HorizonSpec.smooth_span > 0` (3M/1Y in production):
 
-    `prior_ranks` maps (ticker_id, horizon) -> [most-recent-first stored ranks]; only
-    the newest (index 0) is used. Mutates and returns `prediction_rows`.
+        blended = alpha * rank_now + (1 - alpha) * state      (alpha = 2/(span+1))
+        state  <- blended                                      (when `advance`)
+        stored  = rank01(blended)
+
+    The carried state is the RAW blended value, exactly as in the walk-forward. The
+    previous implementation blended against `direction_prob`, the re-ranked percentile;
+    re-ranking re-inflates the prior's dispersion every step, so production smoothed
+    harder than the folds that promoted spans 3 and 4. A name with no state seeds from
+    its own rank, which is what `ewma_rank_by_ticker` does on first appearance.
+
+    `advance` is False on intra-month runs. The spans were fitted on a MONTHLY fold
+    grid while inference fires Fridays as well as month-starts, so advancing on every
+    run would apply ~4-5x the validated amount of smoothing. Intra-month runs still
+    blend against the month's anchor state (the ranking stays stable within the month),
+    they just do not move it. Mutates and returns `prediction_rows`.
     """
     if not isinstance(specs, dict):
         return prediction_rows
@@ -323,13 +377,16 @@ def apply_rank_smoothing(
             continue
         alpha = 2.0 / (span + 1.0)
         blended = np.array([
-            alpha * r["relative_rank"] + (1.0 - alpha) * prior_ranks[(r["ticker_id"], h)][0]
-            if prior_ranks.get((r["ticker_id"], h)) else r["relative_rank"]
+            alpha * r["relative_rank"] + (1.0 - alpha) * prior_state[(r["ticker_id"], h)]
+            if prior_state.get((r["ticker_id"], h)) is not None else r["relative_rank"]
             for r in rows
         ], dtype=float)
         ranks = (pd.Series(blended).rank(method="average").to_numpy() - 1.0) / (len(rows) - 1)
-        for r, rank in zip(rows, ranks, strict=True):
+        for r, rank, state in zip(rows, ranks, blended, strict=True):
             r["relative_rank"] = float(rank)
+            # Only an advancing run persists state; otherwise leave it null so the
+            # month's anchor keeps its place.
+            r["smooth_state"] = float(state) if advance else None
     return prediction_rows
 
 
@@ -378,6 +435,40 @@ async def fetch_prior_ranks(
     return out
 
 
+async def fetch_prior_smooth_state(
+    pool, ticker_ids, horizons, before: date
+) -> dict[tuple[int, str], float]:
+    """Newest stored EWMA state per (ticker_id, horizon), strictly before `before`.
+
+    Only advancing runs write `smooth_state`, so the newest non-null row is the most
+    recent monthly anchor — which is exactly the state the monthly walk-forward would
+    be carrying at this point.
+    """
+    rows = await pool.fetch(
+        """
+        select distinct on (ticker_id, horizon)
+               ticker_id, horizon, smooth_state
+          from predictions
+         where horizon = any($1::text[]) and ticker_id = any($2::bigint[])
+           and as_of_date < $3 and smooth_state is not null
+         order by ticker_id, horizon, as_of_date desc, created_at desc
+        """,
+        list(horizons),
+        [int(t) for t in ticker_ids],
+        before,
+    )
+    return {(int(r["ticker_id"]), r["horizon"]): float(r["smooth_state"]) for r in rows}
+
+
+async def latest_smooth_state_date(pool, horizons) -> date | None:
+    """Most recent as_of_date that advanced the smoothing state (None if never)."""
+    return await pool.fetchval(
+        "select max(as_of_date) from predictions "
+        " where horizon = any($1::text[]) and smooth_state is not null",
+        list(horizons),
+    )
+
+
 def save_bundle(path: Path, bundle: dict) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
@@ -410,6 +501,7 @@ def _specs_from_serialized(serialized: dict) -> dict[str, HorizonSpec]:
             knife_lambda=d.get("knife_lambda", 0.0),
             max_train_months=d.get("max_train_months", None),
             winsorize_pct=d.get("winsorize_pct", 0.0),
+            vol_gate=d.get("vol_gate", False),
         )
     return out
 
@@ -421,14 +513,15 @@ async def upsert_predictions(
         """
         insert into predictions (
             ticker_id, model_version_id, as_of_date, horizon, direction_prob,
-            predicted_return, confidence, risk_flag, cold_start
-        ) values ($1,$2,$3,$4,$5,$6,$7,$8,false)
+            predicted_return, confidence, risk_flag, cold_start, smooth_state
+        ) values ($1,$2,$3,$4,$5,$6,$7,$8,false,$9)
         on conflict (ticker_id, model_version_id, as_of_date, horizon) do update set
             direction_prob   = excluded.direction_prob,
             predicted_return = excluded.predicted_return,
             confidence       = excluded.confidence,
             risk_flag        = excluded.risk_flag,
             cold_start       = excluded.cold_start,
+            smooth_state     = excluded.smooth_state,
             created_at       = now()
         """,
         [
@@ -441,6 +534,7 @@ async def upsert_predictions(
                 None,
                 r["confidence"],
                 r.get("risk_flag", "none"),
+                r.get("smooth_state"),
             )
             for r in prediction_rows
         ],
@@ -459,6 +553,7 @@ def _serialize_spec(spec: HorizonSpec) -> dict:
         "knife_lambda": getattr(spec, "knife_lambda", 0.0),
         "max_train_months": getattr(spec, "max_train_months", None),
         "winsorize_pct": getattr(spec, "winsorize_pct", 0.0),
+        "vol_gate": getattr(spec, "vol_gate", False),
     }
 
 
@@ -477,15 +572,10 @@ def build_specs_from_args(args) -> dict[str, HorizonSpec]:
     for h in args.horizons:
         spec = PRODUCTION_HORIZON_SPECS.get(h, HorizonSpec())
         if args.target is not None:
-            spec = HorizonSpec(
-                target_mode=args.target,
-                lgb_cfg=spec.lgb_cfg,
-                feature_cols=spec.feature_cols,
-                linear_blend=spec.linear_blend,
-                ridge_alpha=spec.ridge_alpha,
-                smooth_span=spec.smooth_span,
-                max_train_months=spec.max_train_months,
-            )
+            # `replace` so a --target override cannot silently drop a promoted field.
+            # The hand-listed constructor omitted knife_lambda / winsorize_pct /
+            # vol_gate, so any --target run shipped 3M without its knife overlay.
+            spec = replace(spec, target_mode=args.target)
         base[h] = spec
     return base
 
@@ -523,7 +613,15 @@ async def run(args) -> None:
         # promoted packs (e.g. revenue_surprise on 6M/1Y) are normalized exactly as
         # they were during the walk-forward validation that promoted them.
         rank_cols = sorted({c for s in specs.values() for c in _spec_feature_cols(s)})
-        panel = prepare_panel(frames, grid, n_buckets=args.n_buckets, rank_cols=rank_cols)
+        # Train on point-in-time index members only, matching the walk-forward that
+        # promoted these specs. User-added names are exempt so they stay in the panel
+        # and get scored at `as_of`; `exclude_ids` below still keeps them out of the fit.
+        panel = prepare_panel(
+            frames, grid, n_buckets=args.n_buckets, rank_cols=rank_cols,
+            membership_filter=_membership_available(frames),
+            membership_exempt_ids=user_added_ids,
+            log=print,
+        )
         if panel.empty:
             raise SystemExit("empty panel (not enough history?)")
 
@@ -538,7 +636,19 @@ async def run(args) -> None:
         # priors once here and reuse them for the confidence/stability metric below.
         ticker_ids = sorted({r["ticker_id"] for r in prediction_rows})
         prior = await fetch_prior_ranks(pool, ticker_ids, horizons, as_of)
-        prediction_rows = apply_rank_smoothing(prediction_rows, specs, prior)
+        # Advance the EWMA state once per calendar month. The spans were validated on
+        # a monthly fold grid; inference also runs every Friday, so advancing on each
+        # run would compound ~4-5x the smoothing that was measured.
+        state = await fetch_prior_smooth_state(pool, ticker_ids, horizons, as_of)
+        last_state = await latest_smooth_state_date(pool, horizons)
+        advance = last_state is None or (last_state.year, last_state.month) < (
+            as_of.year, as_of.month
+        )
+        print(
+            f"smoothing: state anchor={last_state or 'none'} "
+            f"({'advancing' if advance else 'holding'} for {as_of:%Y-%m})"
+        )
+        prediction_rows = apply_rank_smoothing(prediction_rows, specs, state, advance=advance)
         if args.shrink_1y_toward_6m > 0 and {"6M", "1Y"} <= set(horizons):
             prediction_rows = apply_cross_horizon_shrink(
                 prediction_rows, source="6M", target="1Y",
@@ -676,6 +786,15 @@ async def _resolve_production_model(pool) -> tuple[str, str]:
     return str(row["model_version_id"]), str(row["weights_path"])
 
 
+async def _load_scoring_universe(pool):
+    try:
+        return await load_frames_cached(pool)
+    except IncompatibleFrameCache:
+        # User-facing add-ticker jobs have no --refresh-cache control. Reload
+        # the schema-compatible inputs; never fabricate missing metadata.
+        return await load_frames_cached(pool, refresh=True)
+
+
 async def score_single_ticker(pool, symbol: str) -> dict:
     """Score ONE already-ingested ticker against the current S&P cross-section.
 
@@ -718,7 +837,7 @@ async def score_single_ticker(pool, symbol: str) -> dict:
     # DB-efficient load: reuse the cached universe (no full-universe re-pull) and
     # fetch only the new ticker fresh, then splice it in (dropping any stale copy
     # already in the cache).
-    universe = await load_frames_cached(pool)
+    universe = await _load_scoring_universe(pool)
     new_frames = await load_frames(pool, symbols=[symbol])
     if not new_frames:
         raise SystemExit(f"no frame data for {symbol} — ingestion incomplete")
@@ -727,7 +846,13 @@ async def score_single_ticker(pool, symbol: str) -> dict:
     grid = build_calendar_grid(frames)
     grid = sorted(set(grid + [as_of]))
     rank_cols = sorted({c for s in specs.values() for c in _spec_feature_cols(s)})
-    panel = prepare_panel(frames, grid, n_buckets=5, rank_cols=rank_cols)
+    # The scored ticker is off-index by definition here, so exempt it from the
+    # membership filter — otherwise the name we were asked to score is dropped.
+    panel = prepare_panel(
+        frames, grid, n_buckets=5, rank_cols=rank_cols,
+        membership_filter=_membership_available(frames),
+        membership_exempt_ids={new_id},
+    )
 
     # Rank against the S&P cross-section ONLY (+ this ticker), so the percentile
     # means "vs the S&P" — not vs other off-index names a user happens to have added.
@@ -751,7 +876,10 @@ async def score_single_ticker(pool, symbol: str) -> dict:
     # scored ids; one indexed query on a user-initiated add — cost is negligible.
     all_ids = sorted({r["ticker_id"] for r in prediction_rows})
     prior = await fetch_prior_ranks(pool, all_ids, horizons, as_of)
-    apply_rank_smoothing(prediction_rows, specs, prior)
+    # A user-initiated add must never advance the shared monthly anchor — it would
+    # apply an extra smoothing step to every name in the cross-section.
+    state = await fetch_prior_smooth_state(pool, all_ids, horizons, as_of)
+    apply_rank_smoothing(prediction_rows, specs, state, advance=False)
     for r in mine:
         series = prior.get((new_id, r["horizon"]), []) + [r["relative_rank"]]
         r["confidence"] = rank_stability(series)
@@ -789,8 +917,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--n-seeds", type=int, default=8,
                    help="seed-ensemble size: fit this many models per horizon and "
-                        "average their raw predictions before rank-transforming "
-                        "(default 8; reduces seed variance at low compute cost)")
+                        "rank-average their predictions (default 8; reduces seed "
+                        "variance at low compute cost)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--score-ticker", metavar="SYMBOL",
                    help="score ONE already-ingested ticker against the current S&P "

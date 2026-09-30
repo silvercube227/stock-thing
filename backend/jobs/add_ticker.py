@@ -188,9 +188,41 @@ async def _finish(
     )
 
 
+async def _ingest_ticker(pool: asyncpg.Pool, ticker_id: int, symbol: str, metadata: dict) -> None:
+    """Idempotent ingest of one ticker's prices + fundamentals + sentiment."""
+    await ingest_full_history(pool, tickers=[(ticker_id, symbol)], start_date=date(2010, 1, 1))
+    if metadata["cik"]:
+        await ingest_fundamentals(pool, tickers=[(ticker_id, symbol, metadata["cik"])])
+    await ingest_sentiment(pool, tickers=[(ticker_id, symbol)])
+
+
+async def _record_terminal(
+    run_id: int, status: str, *,
+    error: str | None = None, rows: int | None = None, metadata: dict | None = None,
+) -> None:
+    """Write the run's terminal status on a FRESH short-lived pool.
+
+    The failure we're recording is often a dropped Supabase connection, which also
+    poisons the ingest pool — writing the status on that same pool would raise too,
+    stranding the run at `running`. The UI misreads a stuck `running` as a scoring
+    hang ("remove and re-add"), so guaranteeing a terminal write is what makes the
+    error honest (and re-adds effective). Best-effort: the status endpoint's
+    stale-run guard is the last-resort backstop if even this write can't land.
+    """
+    try:
+        async with pool_context(command_timeout=60, max_size=2) as p:
+            await _finish(p, run_id, status, error=error, rows=rows, metadata=metadata)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def run_add(symbol: str, run_id: int | None) -> int:
     symbol = symbol.upper().strip()
-    async with pool_context(command_timeout=300) as pool:
+    meta: dict = {"symbol": symbol}
+    # Small pool: the API's uvicorn and the score subprocess each hold their own
+    # connections, so a fat worker pool adds free-tier connection pressure — the very
+    # thing that drops the ingest mid-pull.
+    async with pool_context(command_timeout=300, max_size=2) as pool:
         if run_id is None:
             run_id = int(
                 await pool.fetchval(
@@ -198,46 +230,116 @@ async def run_add(symbol: str, run_id: int | None) -> int:
                     f"add_ticker:{symbol}",
                 )
             )
-        meta: dict = {"symbol": symbol}
         try:
             metadata = await _resolve_metadata(pool, symbol)
             ticker_id = await _upsert_ticker(pool, symbol, metadata)
             meta["ticker_id"] = ticker_id
             meta["sector"] = metadata["sector"]
 
-            await ingest_full_history(pool, tickers=[(ticker_id, symbol)], start_date=date(2010, 1, 1))
-            if metadata["cik"]:
-                await ingest_fundamentals(pool, tickers=[(ticker_id, symbol, metadata["cik"])])
-            await ingest_sentiment(pool, tickers=[(ticker_id, symbol)])
+            # Bounded retries: a transient pooler drop self-heals — asyncpg replaces
+            # the dead connection and every ingest step is an idempotent upsert.
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    await _ingest_ticker(pool, ticker_id, symbol, metadata)
+                    last_exc = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    await asyncio.sleep(2 * (attempt + 1))
+            if last_exc is not None:
+                raise last_exc
 
             rc, output, outcome = await _score_subprocess(symbol)
             if rc != 0 or outcome is None:
                 meta["outcome"] = "failed"
-                await _finish(pool, run_id, "failed",
-                              error=f"scoring exit {rc}\n{output[-1500:]}", metadata=meta)
+                await _record_terminal(run_id, "failed",
+                                       error=f"scoring exit {rc}\n{output[-1500:]}", metadata=meta)
                 return 1
             if outcome["status"] == "insufficient_history":
                 meta["outcome"] = "insufficient_history"
-                await _finish(pool, run_id, "success", rows=0, metadata=meta)
+                await _record_terminal(run_id, "success", rows=0, metadata=meta)
                 return 0
             meta["outcome"] = "scored"
             meta["ranks"] = outcome.get("ranks")
-            await _finish(pool, run_id, "success",
-                          rows=len(outcome.get("ranks", {})), metadata=meta)
+            await _record_terminal(run_id, "success",
+                                   rows=len(outcome.get("ranks", {})), metadata=meta)
             return 0
         except Exception:
             meta["outcome"] = "failed"
-            await _finish(pool, run_id, "failed", error=traceback.format_exc(), metadata=meta)
+            await _record_terminal(run_id, "failed", error=traceback.format_exc(), metadata=meta)
             return 1
+
+
+async def claim_queued(pool: asyncpg.Pool, limit: int) -> list[tuple[int, str]]:
+    """Atomically claim up to `limit` queued add-ticker jobs, oldest first.
+
+    `for update skip locked` inside the same statement that flips the status makes a
+    double-drain (two launchd firings overlapping, or a manual run beside the agent)
+    safe: a row can only ever be claimed once.
+    """
+    rows = await pool.fetch(
+        """
+        with claimed as (
+            select run_id from ingestion_runs
+             where status = 'queued' and job_name like 'add_ticker:%'
+             order by started_at
+             limit $1
+             for update skip locked
+        )
+        update ingestion_runs r
+           set status = 'running', started_at = now()
+          from claimed
+         where r.run_id = claimed.run_id
+        returning r.run_id, r.job_name
+        """,
+        limit,
+    )
+    return [(int(r["run_id"]), r["job_name"].split(":", 1)[1]) for r in rows]
+
+
+async def drain(limit: int) -> int:
+    """Run every queued add-ticker job. Entry point for the local drain agent.
+
+    The hosted read-API cannot execute the worker (no pandas/lightgbm/torch, no model
+    artifact), so it records the request as 'queued' instead of spawning a process that
+    would die silently. This is the consumer that makes those requests actually happen.
+    """
+    async with pool_context(command_timeout=300, max_size=2) as pool:
+        jobs = await claim_queued(pool, limit)
+    if not jobs:
+        return 0
+    print(f"draining {len(jobs)} queued add-ticker job(s): "
+          f"{', '.join(s for _, s in jobs)}")
+    worst = 0
+    for run_id, symbol in jobs:
+        # Sequential on purpose: each job ingests prices and then shells out to a
+        # LightGBM scoring subprocess, and this shares a laptop with the daily pipeline.
+        rc = await run_add(symbol, run_id)
+        print(f"  {symbol}: rc={rc}")
+        worst = max(worst, rc)
+    return worst
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Ingest + score a single user-added ticker")
-    p.add_argument("--symbol", required=True)
+    p.add_argument("--symbol", help="symbol to add (omit with --drain)")
     p.add_argument("--run-id", type=int, default=None,
                    help="existing ingestion_runs row to update (the API creates it); "
                         "a new row is created when omitted")
+    p.add_argument("--drain", action="store_true",
+                   help="run every add-ticker job the hosted API left 'queued', "
+                        "instead of adding one symbol. This is what the local drain "
+                        "agent runs; safe to run concurrently with itself.")
+    p.add_argument("--limit", type=int, default=5,
+                   help="max queued jobs to claim in one --drain pass (default 5)")
     args = p.parse_args()
+    if args.drain:
+        if args.symbol:
+            p.error("--drain takes no --symbol")
+        return asyncio.run(drain(args.limit))
+    if not args.symbol:
+        p.error("--symbol is required unless --drain is given")
     return asyncio.run(run_add(args.symbol, args.run_id))
 
 

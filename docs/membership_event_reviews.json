@@ -1,0 +1,15 @@
+{
+  "window_start": "2010-01-01",
+  "observed_on": "2026-09-07",
+  "zero_duration": [
+    {
+      "date": "2016-12-02",
+      "security_id": "EVHC.N^L16",
+      "reason": "The old Envision security's same-day join/leave has no trading-session membership. S&P announced AmSurg's addition after the December 1 close and its replacement by the post-merger Envision corporation. Preserve the separate successor EVHC.N^J18 join; do not merge these securities or cancel other same-day events. This session-level interpretation is based on the cited primary notices.",
+      "evidence": [
+        "https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20161129-444551/444551_midamericaam5pzza4wing6.pdf?force_download=true",
+        "https://www.nasdaqtrader.com/TraderNews.aspx?id=ETA2016-309"
+      ]
+    }
+  ]
+}
